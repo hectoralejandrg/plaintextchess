@@ -1,0 +1,52 @@
+# Shared build configuration (applies to both iOS and Android builds)
+# Specs:
+#   - openspec/specs/shared/cross-platform-requirements.md
+#   - openspec/specs/shared/build-coordination.md
+schema_version: 1
+
+# Rust targets used by ANY platform build must be declared here.
+toolchain:
+  rust:
+    channel: stable
+    targets:
+      - aarch64-apple-ios
+      - aarch64-linux-android
+      - x86_64-linux-android
+  uniffi:
+    version: "0.28.0"
+
+# Environment variables honored by all build scripts (same semantics on every platform).
+environment:
+  variables:
+    BUILD_ENVIRONMENT: production   # allowed: development, staging, production
+    PLATFORM_TARGET: ios            # allowed: ios, android (set per build script)
+    BUILD_TYPE: release             # allowed: debug, release
+
+# Performance targets mirrored in the platform specifications.
+performance_targets:
+  ios:
+    clean_build_minutes: 5
+    build_memory_gb: 2
+    artifact_size_mb: 100
+  android:
+    clean_build_minutes: 8
+    build_memory_gb: 4
+    artifact_size_mb: 200
+  coordinated:
+    total_build_minutes: 15
+
+# Baseline compatibility. Changes here MUST update both platform specs.
+compatibility:
+  ios_min_version: "15.0"
+  android_min_sdk: 24
+
+# Files that must exist for any coordinated build to start.
+validation:
+  required_files:
+    - openspec/specs/ios/build-specification.md
+    - openspec/specs/android/build-specification.md
+    - openspec/specs/shared/cross-platform-requirements.md
+    - openspec/specs/shared/build-coordination.md
+    - config/ios-build.yaml
+    - config/android-build.yaml
+    - core/Cargo.toml

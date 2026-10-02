@@ -1,0 +1,114 @@
+# Build validation pipeline (per openspec/specs/shared/build-coordination.md)
+#
+# Jobs:
+#   validate      - runs the spec/config/script validation test scripts
+#   build-ios     - builds the iOS XCFramework (Rust -> aarch64-apple-ios)
+#   build-android - builds the Android JNI libraries (Rust -> aarch64 + x86_64)
+#   quality       - collects build metrics from all jobs and reports them
+#
+# The build scripts write metrics to target/build-metrics/<platform>-last.json;
+# the quality job publishes them as a report artifact.
+
+name: build-validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate specs, config, and scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate iOS build setup
+        run: ./tests/validate-ios-build.sh
+      - name: Validate Android build setup
+        run: ./tests/validate-android-build.sh
+      - name: Validate cross-platform consistency
+        run: ./tests/validate-cross-platform.sh
+
+  build-ios:
+    name: Build iOS XCFramework
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - name: Run iOS build
+        run: ./scripts/build-ios.sh
+      - name: Verify artifacts
+        run: ./tests/validate-ios-build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-xcframework
+          path: |
+            ios/Frameworks/AppCore.xcframework
+            target/build-metrics/ios-last.json
+
+  build-android:
+    name: Build Android JNI libraries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - name: Run Android build
+        run: ./scripts/build-android.sh
+      - name: Verify artifacts
+        run: ./tests/validate-android-build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-jnilibs
+          path: |
+            android/app/src/main/jniLibs
+            target/build-metrics/android-last.json
+
+  quality:
+    name: Build quality report
+    runs-on: ubuntu-latest
+    needs: [validate, build-ios, build-android]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-xcframework
+          path: artifacts/ios
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-jnilibs
+          path: artifacts/android
+      - name: Report build metrics
+        run: |
+          set -uo pipefail
+          echo "## Build quality report"
+          for f in artifacts/ios/target/build-metrics/ios-last.json \
+                   artifacts/android/target/build-metrics/android-last.json; do
+            if [ -f "$f" ]; then
+              echo "### $(basename "$(dirname "$(dirname "$f")")")"
+              cat "$f"
+            else
+              echo "### missing: $f (upstream job did not complete)"
+            fi
+          done
+          # Fail if any recorded platform build failed
+          for f in artifacts/ios/target/build-metrics/ios-last.json \
+                   artifacts/android/target/build-metrics/android-last.json; do
+            if [ -f "$f" ] && grep -q '"status": "failed"' "$f"; then
+              echo "::error::Build metrics record a failed build: $f"
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-quality-report
+          path: artifacts

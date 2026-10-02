@@ -1,0 +1,40 @@
+# iOS build configuration
+# Spec: openspec/specs/ios/build-specification.md
+# Shared defaults: config/shared-build.yaml
+schema_version: 1
+platform: ios
+
+# Rust targets for iOS (must also appear in config/shared-build.yaml)
+build_targets:
+  - aarch64-apple-ios
+
+deployment:
+  min_ios_version: "15.0"
+  architectures:
+    - arm64
+  xcframework_path: ios/Frameworks/AppCore.xcframework
+
+binding:
+  language: swift
+  out_dir: target/uniffi/ios
+  source: core/src/lib.rs
+
+environments:
+  development:
+    build_type: debug
+  staging:
+    build_type: release
+  production:
+    build_type: release
+
+# Validation rules enforced by scripts/build-ios.sh and tests/validate-ios-build.sh
+validation:
+  required_files:
+    - openspec/specs/ios/build-specification.md
+    - config/ios-build.yaml
+    - config/shared-build.yaml
+    - core/Cargo.toml
+  performance:
+    clean_build_minutes: 5
+    build_memory_gb: 2
+    artifact_size_mb: 100

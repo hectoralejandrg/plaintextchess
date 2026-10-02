@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# Generated FFI artifacts - NEVER commit
+# Single producers: scripts/build-ios.sh / scripts/build-android.sh.
+# App pre-build phases regenerate them when missing, so a fresh clone
+# builds everything from Rust sources only.
+# ---------------------------------------------------------------------------
+
+# Root target/: UniFFI bindings (target/uniffi/{ios,android}) + build metrics
+target/
+
+# Rust build output (core crate)
+core/target/
+
+# iOS XCFramework (AppCore.xcframework, device + simulator slices)
+ios/Frameworks/
+
+# Android native libs (libapp_core.so per ABI)
+android/app/src/main/jniLibs/
+
+# ---------------------------------------------------------------------------
+# Build tooling caches / outputs
+# ---------------------------------------------------------------------------
+
+# Gradle (wrapper dists, local state, build outputs)
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk
+*.aab
+
+# Xcode (per-user data; DerivedData lives outside the repo)
+ios/**/xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+DerivedData/
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Node (OpenSpec CLI)
+node_modules/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+*.swp

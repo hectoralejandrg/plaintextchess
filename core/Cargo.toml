@@ -1,0 +1,19 @@
+[package]
+name = "app-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+shakmaty = "0.8.1"
+glicko2 = "0.2.0"
+uniffi = { version = "0.28.0", features = ["cli"] }
+
+[build-dependencies]
+uniffi = { version = "0.28.0", features = ["build"] }
+
+[dev-dependencies]
+anyhow = "1.0.0"
+tracing = "0.1.40"

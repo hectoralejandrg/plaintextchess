@@ -1,0 +1,12 @@
+{
+  "projectName": "app-core-monorepo",
+  "version": "0.1.0",
+  "description": "Cross-platform mobile template: Rust core with UniFFI bindings and iOS/Android apps (sample demo: chess)",
+  "tools": [
+    "cursor",
+    "github-copilot",
+    "claude"
+  ],
+  "languages": ["rust", "swift", "kotlin"],
+  "created": "2026-09-30"
+}

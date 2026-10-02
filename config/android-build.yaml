@@ -1,0 +1,43 @@
+# Android build configuration
+# Spec: openspec/specs/android/build-specification.md
+# Shared defaults: config/shared-build.yaml
+schema_version: 1
+platform: android
+
+# Rust targets for Android (must also appear in config/shared-build.yaml)
+build_targets:
+  - aarch64-linux-android
+  - x86_64-linux-android
+
+abis:
+  - arm64-v8a
+  - x86_64
+
+deployment:
+  min_sdk: 24
+  jni_libs_path: android/app/src/main/jniLibs
+
+binding:
+  language: kotlin
+  out_dir: target/uniffi/android
+  source: core/src/lib.rs
+
+environments:
+  development:
+    build_type: debug
+  staging:
+    build_type: release
+  production:
+    build_type: release
+
+# Validation rules enforced by scripts/build-android.sh and tests/validate-android-build.sh
+validation:
+  required_files:
+    - openspec/specs/android/build-specification.md
+    - config/android-build.yaml
+    - config/shared-build.yaml
+    - core/Cargo.toml
+  performance:
+    clean_build_minutes: 8
+    build_memory_gb: 4
+    artifact_size_mb: 200
