@@ -1,4 +1,4 @@
-// Root build file for the MyApp Android app.
+// Root build file for the PlainTextChess Android app.
 // Pinned toolchain: Gradle 8.7 (wrapper), AGP 8.5.2, Kotlin 1.9.24.
 // The Compose compiler (1.5.14, targets Kotlin 1.9.24) is enabled per
 // module via android.composeOptions - 1.x releases are not Gradle plugins.

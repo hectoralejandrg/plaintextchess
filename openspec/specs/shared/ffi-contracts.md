@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document defines the contracts and specifications for Foreign Function Interface (FFI) between the Rust core (`app-core`) and the platform-specific applications (Android Kotlin and iOS Swift).
+This document defines the contracts and specifications for Foreign Function Interface (FFI) between the Rust core (`chess-core`) and the platform-specific applications (Android Kotlin and iOS Swift).
 
 ## Core Principles
 
@@ -78,10 +78,10 @@ pub mod core {
 
 ### Interface Definition
 ```kotlin
-// android/app/src/main/java/com/example/chess/ffi/AppCore.kt
-package com.example.android.ffi
+// android/app/src/main/java/com/example/chess/ffi/ChessCore.kt
+package com.hectoralejandrg.plaintextchess.ffi
 
-interface AppCore {
+interface ChessCore {
     // Board State
     fun getBoardState(): String
     fun getValidMoves(square: String): List<String>
@@ -103,21 +103,21 @@ interface AppCore {
 
 ### Implementation (JNI/JVM)
 ```kotlin
-// android/app/src/main/java/com/example/chess/ffi/AppCoreImpl.kt
-package com.example.android.ffi
+// android/app/src/main/java/com/example/chess/ffi/ChessCoreImpl.kt
+package com.hectoralejandrg.plaintextchess.ffi
 
-class AppCoreImpl : AppCore {
+class ChessCoreImpl : ChessCore {
     override fun getBoardState(): String {
-        return AppCoreNative.getBoardState()
+        return ChessCoreNative.getBoardState()
     }
     
     override fun getValidMoves(square: String): List<String> {
-        return AppCoreNative.getValidMoves(square)
+        return ChessCoreNative.getValidMoves(square)
     }
     
     override fun playMove(uciMove: String): Result<Unit, ChessError> {
         return try {
-            AppCoreNative.playMove(uciMove)
+            ChessCoreNative.playMove(uciMove)
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(ChessError("Move failed: ${e.message}"))
@@ -130,7 +130,7 @@ class AppCoreImpl : AppCore {
 
 ### Native Interface (Kotlin/Native)
 ```kotlin
-// android/app/src/main/cpp/app_core.h
+// android/app/src/main/cpp/chess_core.h
 #ifndef CHESS_CORE_H
 #define CHESS_CORE_H
 
@@ -159,10 +159,10 @@ int play_move(const char* uci_move);
 
 ### Protocol Definition
 ```swift
-// ios/app-core/AppCore.swift
+// ios/chess-core/ChessCore.swift
 import Foundation
 
-protocol AppCore: AnyObject {
+protocol ChessCore: AnyObject {
     // Board State
     func getBoardState() -> String
     func getValidMoves(forSquare square: String) -> [String]
@@ -184,14 +184,14 @@ protocol AppCore: AnyObject {
 
 ### Implementation (Swift Package)
 ```swift
-// ios/app-core/Sources/AppCoreImpl.swift
+// ios/chess-core/Sources/ChessCoreImpl.swift
 import Foundation
 
-class AppCoreImpl: AppCore {
-    private let native: AppCoreNative
+class ChessCoreImpl: ChessCore {
+    private let native: ChessCoreNative
     
     init() {
-        self.native = AppCoreNative()
+        self.native = ChessCoreNative()
     }
     
     func getBoardState() -> String {
@@ -212,15 +212,15 @@ class AppCoreImpl: AppCore {
 
 ### C Interface (Swift C Interop)
 ```swift
-// ios/app-core/Sources/AppCoreCInterop.swift
+// ios/chess-core/Sources/ChessCoreCInterop.swift
 import Foundation
 
-struct AppCoreC {
+struct ChessCoreC {
     let native: OpaquePointer?
     
     init?() {
         // Load the dynamic library
-        let libraryPath = "../Frameworks/AppCore.xcframework/ios-aarch64/AppCore.framework/AppCore"
+        let libraryPath = "../Frameworks/ChessCore.xcframework/ios-aarch64/ChessCore.framework/ChessCore"
         let library = dlopen(libraryPath, RTLD_NOW)
         guard let library = library else {
             return nil
@@ -372,11 +372,11 @@ enum ChessError: Error, LocalizedError {
 ### iOS
 ```swift
 // XCFramework
-// Frameworks/AppCore.xcframework/
+// Frameworks/ChessCore.xcframework/
 //   ├── ios-aarch64/
-//   │   ├── AppCore.framework/
-//   │   │   ├── Headers/AppCore.h
-//   │   │   └── Libraries/libAppCore.a
+//   │   ├── ChessCore.framework/
+//   │   │   ├── Headers/ChessCore.h
+//   │   │   └── Libraries/libChessCore.a
 //   └── ... other platforms
 ```
 
@@ -391,8 +391,8 @@ dependencies {
     implementation("com.google.android.material:material:1.10.0")
     
     // Native library (jniLibs folder names use AGP NDK ABI tags)
-    implementation(files("src/main/jniLibs/arm64-v8a/libapp_core.so"))
-    implementation(files("src/main/jniLibs/x86_64/libapp_core.so"))
+    implementation(files("src/main/jniLibs/arm64-v8a/libchess_core.so"))
+    implementation(files("src/main/jniLibs/x86_64/libchess_core.so"))
 }
 ```
 
@@ -459,7 +459,7 @@ func migrateOldAPI() {
 ### FFI Documentation
 - **Rust**: `src/ffi/README.md`
 - **Kotlin**: `android/app/src/main/java/com/example/chess/ffi/README.md`
-- **Swift**: `ios/app-core/README.md`
+- **Swift**: `ios/chess-core/README.md`
 
 ### Contract Specifications
 - **OpenAPI**: Generar swagger de API FFI

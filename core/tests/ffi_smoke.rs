@@ -1,7 +1,7 @@
-//! Smoke test for the UniFFI-exported surface of `app-core`.
+//! Smoke test for the UniFFI-exported surface of `chess-core`.
 //! Exercises the same calls the iOS/Android apps make over the FFI boundary.
 
-use app_core::new_game_session;
+use chess_core::new_game_session;
 
 fn assert_rating_close(actual: f64, expected: f64) {
     assert!(

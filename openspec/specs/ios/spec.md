@@ -35,7 +35,7 @@ The build system MUST enforce performance targets for iOS application builds.
 - **THEN** the build system MUST meet performance requirements
 
 ### Requirement: iOS App Project
-The repository MUST contain an iOS application project that compiles against `AppCore.xcframework` and, at launch, shows a placeholder screen that creates a game session through the generated Swift bindings and displays the initial board state and the player's current rating.
+The repository MUST contain an iOS application project that compiles against `ChessCore.xcframework` and, at launch, shows a placeholder screen that creates a game session through the generated Swift bindings and displays the initial board state and the player's current rating.
 
 #### Scenario: App build for the simulator
 - **WHEN** the app project is built for the iOS simulator
@@ -46,7 +46,7 @@ The repository MUST contain an iOS application project that compiles against `Ap
 - **THEN** the placeholder screen displays the initial board state (standard start position) and the starting player rating without crashing or FFI errors
 
 ### Requirement: iOS XCFramework Simulator Support
-The iOS build MUST produce `AppCore.xcframework` containing both the device slice and the Apple-simulator slice, so the framework can be linked by app builds targeting either destination.
+The iOS build MUST produce `ChessCore.xcframework` containing both the device slice and the Apple-simulator slice, so the framework can be linked by app builds targeting either destination.
 
 #### Scenario: Build produces both slices
 - **WHEN** the iOS build script runs

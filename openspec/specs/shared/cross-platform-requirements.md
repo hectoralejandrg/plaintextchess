@@ -39,7 +39,7 @@ Every build script MUST, before compiling anything:
 ### Shared Dependencies
 - `uniffi` 0.28 (crate) provides the runtime; the bindings CLI is the in-project binary `core/src/bin/cargo-uniffi-bindgen.rs` (uniffi 0.28 does not publish a standalone CLI crate), built by both platform scripts.
 - `shakmaty` and `glicko2` are Rust-only dependencies; neither platform may vendor equivalent logic natively.
-- `app-core` crate type is `["rlib", "cdylib", "staticlib"]`: the staticlib feeds the iOS XCFramework, the cdylib feeds the Android `jniLibs`.
+- `chess-core` crate type is `["rlib", "cdylib", "staticlib"]`: the staticlib feeds the iOS XCFramework, the cdylib feeds the Android `jniLibs`.
 
 ### Platform-Specific Dependencies
 - **iOS:** Xcode 14+, Swift, `aarch64-apple-ios` Rust target.
@@ -48,7 +48,7 @@ Every build script MUST, before compiling anything:
 
 ## Consistency Standards
 
-- Artifact naming MUST follow the patterns defined per platform (`libapp_core.a` in the XCFramework, `libapp_core.so` in `jniLibs`).
+- Artifact naming MUST follow the patterns defined per platform (`libchess_core.a` in the XCFramework, `libchess_core.so` in `jniLibs`).
 - Every build script MUST write a metrics file to `target/build-metrics/<platform>-last.json` with the same schema: `platform`, `environment`, `build_type`, `status`, `duration_seconds`, `finished_at`.
 - Build output MUST be scriptable: progress lines prefixed with `[build-<platform>]`, errors with `[build-<platform>][ERROR]`.
 - Both platforms MUST report failures with a non-zero exit code and a machine-readable status in the metrics file.

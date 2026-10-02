@@ -1,7 +1,7 @@
 # OpenSpec Plan: Cross-Platform Mobile Template
 
 ## Overview
-Este plan describe la implementación especificación-driven para el proyecto `app-core-monorepo`, un template multi-plataforma con un núcleo en Rust (demo de ajedrez: lógica de juego, validación de jugadas, rating) y apps iOS/Android.
+Este plan describe la implementación especificación-driven para el proyecto `plaintextchess`, un template multi-plataforma con un núcleo en Rust (demo de ajedrez: lógica de juego, validación de jugadas, rating) y apps iOS/Android.
 
 ## Objetivo del Proyecto
 Crear una aplicación de ajedrez completa con las siguientes características:
@@ -33,7 +33,7 @@ Cada especificación se implementa y se archiva, dejando un rastro histórico de
 
 ### Estructura del Sistema
 ```
-app-core-monorepo/
+plaintextchess/
 ├── openspec/                    # OpenSpec specifications
 │   ├── specs/                  # Todas las especificaciones
 │   │   ├── rust-core/          # Especificaciones del núcleo Rust
@@ -97,7 +97,7 @@ El proyecto usa un enfoque multi-crate para mantener el código organizado:
    - Tests de integración FFI
 
 #### Entregables:
-- `core/target/release/libapp_core.a` (iOS) o `libapp_core.so` (Android)
+- `core/target/release/libchess_core.a` (iOS) o `libchess_core.so` (Android)
 - Tests unitarios completos
 - Integración FFI probada
 

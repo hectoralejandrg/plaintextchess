@@ -74,9 +74,9 @@ fi
 # --- Built artifacts (only when a build has already run) ---
 if [ -f "target/build-metrics/android-last.json" ]; then
     check "arm64-v8a native library exists" \
-        test -s android/app/src/main/jniLibs/arm64-v8a/libapp_core.so
+        test -s android/app/src/main/jniLibs/arm64-v8a/libchess_core.so
     check "x86_64 native library exists" \
-        test -s android/app/src/main/jniLibs/x86_64/libapp_core.so
+        test -s android/app/src/main/jniLibs/x86_64/libchess_core.so
 else
     echo "  [SKIP] jniLibs not built yet (run ./scripts/build-android.sh first)"
 fi

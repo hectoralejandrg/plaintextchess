@@ -11,10 +11,10 @@ target/
 # Rust build output (core crate)
 core/target/
 
-# iOS XCFramework (AppCore.xcframework, device + simulator slices)
+# iOS XCFramework (ChessCore.xcframework, device + simulator slices)
 ios/Frameworks/
 
-# Android native libs (libapp_core.so per ABI)
+# Android native libs (libchess_core.so per ABI)
 android/app/src/main/jniLibs/
 
 # ---------------------------------------------------------------------------

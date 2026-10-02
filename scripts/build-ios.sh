@@ -24,7 +24,7 @@ BUILD_TYPE="${BUILD_TYPE:-release}"
 
 IOS_TARGET="aarch64-apple-ios"
 IOS_SIM_TARGET="aarch64-apple-ios-sim"
-XCFRAMEWORK_DIR="ios/Frameworks/AppCore.xcframework"
+XCFRAMEWORK_DIR="ios/Frameworks/ChessCore.xcframework"
 METRICS_FILE="target/build-metrics/ios-last.json"
 
 log()  { printf '[build-ios] %s\n' "$*"; }
@@ -69,18 +69,18 @@ cargo build --release --target "$IOS_SIM_TARGET"
 # the FFI metadata is slice-independent)
 ./target/debug/cargo-uniffi-bindgen generate \
     --library \
-    --crate app_core \
+    --crate chess_core \
     --language swift \
     --out-dir "../target/uniffi/ios/" \
-    "target/$IOS_TARGET/release/libapp_core.a"
+    "target/$IOS_TARGET/release/libchess_core.a"
 
 # Create the two-slice XCFramework in ios/Frameworks (per build specification)
 cd "$REPO_ROOT"
 command -v xcodebuild >/dev/null 2>&1 || fail "xcodebuild not found. Install Xcode with the iOS SDK (docs/environment-setup.md)."
 rm -rf "$XCFRAMEWORK_DIR"
 xcodebuild -create-xcframework \
-    -library "core/target/$IOS_TARGET/release/libapp_core.a" \
-    -library "core/target/$IOS_SIM_TARGET/release/libapp_core.a" \
+    -library "core/target/$IOS_TARGET/release/libchess_core.a" \
+    -library "core/target/$IOS_SIM_TARGET/release/libchess_core.a" \
     -output "$XCFRAMEWORK_DIR"
 
 # ---------------------------------------------------------------------------

@@ -7,20 +7,20 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		AA0000000000000000000017 /* MyApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000013 /* MyApp.swift */; };
+		AA0000000000000000000017 /* PlainTextChessApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000013 /* PlainTextChessApp.swift */; };
 		AA0000000000000000000018 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000014 /* ContentView.swift */; };
-		AA0000000000000000000019 /* app_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000015 /* app_core.swift */; };
-		AA000000000000000000001A /* AppCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000016 /* AppCore.xcframework */; };
+		AA0000000000000000000019 /* chess_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000015 /* chess_core.swift */; };
+		AA000000000000000000001A /* ChessCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000016 /* ChessCore.xcframework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		AA0000000000000000000007 /* MyApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MyApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		AA0000000000000000000013 /* MyApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MyApp.swift; sourceTree = "<group>"; };
+		AA0000000000000000000007 /* PlainTextChess.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PlainTextChess.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA0000000000000000000013 /* PlainTextChessApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlainTextChessApp.swift; sourceTree = "<group>"; };
 		AA0000000000000000000014 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		AA0000000000000000000015 /* app_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = app_core.swift; sourceTree = "<group>"; };
-		AA0000000000000000000016 /* AppCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = AppCore.xcframework; sourceTree = "<group>"; };
-		AA000000000000000000001B /* app_coreFFI.modulemap */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.module-map"; path = app_coreFFI.modulemap; sourceTree = "<group>"; };
-		AA000000000000000000001C /* app_coreFFI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = app_coreFFI.h; sourceTree = "<group>"; };
+		AA0000000000000000000015 /* chess_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = chess_core.swift; sourceTree = "<group>"; };
+		AA0000000000000000000016 /* ChessCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ChessCore.xcframework; sourceTree = "<group>"; };
+		AA000000000000000000001B /* chess_coreFFI.modulemap */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.module-map"; path = chess_coreFFI.modulemap; sourceTree = "<group>"; };
+		AA000000000000000000001C /* chess_coreFFI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = chess_coreFFI.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -28,7 +28,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AA000000000000000000001A /* AppCore.xcframework in Frameworks */,
+				AA000000000000000000001A /* ChessCore.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -38,28 +38,28 @@
 		AA0000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				AA0000000000000000000002 /* MyApp */,
+				AA0000000000000000000002 /* PlainTextChess */,
 				AA0000000000000000000003 /* Generated */,
 				AA0000000000000000000004 /* Frameworks */,
 				AA0000000000000000000005 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		AA0000000000000000000002 /* MyApp */ = {
+		AA0000000000000000000002 /* PlainTextChess */ = {
 			isa = PBXGroup;
 			children = (
-				AA0000000000000000000013 /* MyApp.swift */,
+				AA0000000000000000000013 /* PlainTextChessApp.swift */,
 				AA0000000000000000000014 /* ContentView.swift */,
 			);
-			path = MyApp;
+			path = PlainTextChess;
 			sourceTree = "<group>";
 		};
 		AA0000000000000000000003 /* Generated */ = {
 			isa = PBXGroup;
 			children = (
-				AA0000000000000000000015 /* app_core.swift */,
-				AA000000000000000000001B /* app_coreFFI.modulemap */,
-				AA000000000000000000001C /* app_coreFFI.h */,
+				AA0000000000000000000015 /* chess_core.swift */,
+				AA000000000000000000001B /* chess_coreFFI.modulemap */,
+				AA000000000000000000001C /* chess_coreFFI.h */,
 			);
 			name = Generated;
 			path = ../../target/uniffi/ios;
@@ -68,7 +68,7 @@
 		AA0000000000000000000004 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				AA0000000000000000000016 /* AppCore.xcframework */,
+				AA0000000000000000000016 /* ChessCore.xcframework */,
 			);
 			path = ../Frameworks;
 			sourceTree = "<group>";
@@ -76,7 +76,7 @@
 		AA0000000000000000000005 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				AA0000000000000000000007 /* MyApp.app */,
+				AA0000000000000000000007 /* PlainTextChess.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -84,11 +84,11 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		AA0000000000000000000006 /* MyApp */ = {
+		AA0000000000000000000006 /* PlainTextChess */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = AA0000000000000000000009 /* Build configuration list for PBXNativeTarget "MyApp" */;
+			buildConfigurationList = AA0000000000000000000009 /* Build configuration list for PBXNativeTarget "PlainTextChess" */;
 			buildPhases = (
-				AA0000000000000000000012 /* PreBuild: ensure AppCore artifacts */,
+				AA0000000000000000000012 /* PreBuild: ensure ChessCore artifacts */,
 				AA000000000000000000000F /* Sources */,
 				AA0000000000000000000010 /* Frameworks */,
 				AA0000000000000000000011 /* Resources */,
@@ -97,9 +97,9 @@
 			);
 			dependencies = (
 			);
-			name = MyApp;
-			productName = MyApp;
-			productReference = AA0000000000000000000007 /* MyApp.app */;
+			name = PlainTextChess;
+			productName = PlainTextChess;
+			productReference = AA0000000000000000000007 /* PlainTextChess.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -116,7 +116,7 @@
 					};
 				};
 			};
-			buildConfigurationList = AA0000000000000000000008 /* Build configuration list for PBXProject "MyApp" */;
+			buildConfigurationList = AA0000000000000000000008 /* Build configuration list for PBXProject "PlainTextChess" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -129,7 +129,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				AA0000000000000000000006 /* MyApp */,
+				AA0000000000000000000006 /* PlainTextChess */,
 			);
 		};
 /* End PBXProject section */
@@ -145,7 +145,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		AA0000000000000000000012 /* PreBuild: ensure AppCore artifacts */ = {
+		AA0000000000000000000012 /* PreBuild: ensure ChessCore artifacts */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -155,14 +155,14 @@
 			);
 			inputPaths = (
 			);
-			name = "PreBuild: ensure AppCore artifacts";
+			name = "PreBuild: ensure ChessCore artifacts";
 			outputFileListPaths = (
 			);
 			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
-			shellScript = "set -euo pipefail\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\nREPO_ROOT=\"$(cd \"$SRCROOT/../..\" && pwd)\"\nif [ ! -f \"$REPO_ROOT/ios/Frameworks/AppCore.xcframework/Info.plist\" ] || [ ! -f \"$REPO_ROOT/target/uniffi/ios/app_core.swift\" ]; then\n    echo \"[prebuild] AppCore artifacts missing - running scripts/build-ios.sh\"\n    \"$REPO_ROOT/scripts/build-ios.sh\"\nfi\n";
+			shellScript = "set -euo pipefail\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\nREPO_ROOT=\"$(cd \"$SRCROOT/../..\" && pwd)\"\nif [ ! -f \"$REPO_ROOT/ios/Frameworks/ChessCore.xcframework/Info.plist\" ] || [ ! -f \"$REPO_ROOT/target/uniffi/ios/chess_core.swift\" ]; then\n    echo \"[prebuild] ChessCore artifacts missing - running scripts/build-ios.sh\"\n    \"$REPO_ROOT/scripts/build-ios.sh\"\nfi\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
@@ -172,9 +172,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AA0000000000000000000017 /* MyApp.swift in Sources */,
+				AA0000000000000000000017 /* PlainTextChessApp.swift in Sources */,
 				AA0000000000000000000018 /* ContentView.swift in Sources */,
-				AA0000000000000000000019 /* app_core.swift in Sources */,
+				AA0000000000000000000019 /* chess_core.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -268,7 +268,7 @@
 					"$(inherited)",
 					"$(SRCROOT)/../../target/uniffi/ios",
 				);
-				INFOPLIST_KEY_CFBundleDisplayName = MyApp;
+				INFOPLIST_KEY_CFBundleDisplayName = PlainTextChess;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -283,9 +283,9 @@
 				OTHER_SWIFT_FLAGS = (
 					"$(inherited)",
 					"-Xcc",
-					"-fmodule-map-file=$(SRCROOT)/../../target/uniffi/ios/app_coreFFI.modulemap",
+					"-fmodule-map-file=$(SRCROOT)/../../target/uniffi/ios/chess_coreFFI.modulemap",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.hectoralejandrg.plaintextchess;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 			};
@@ -308,7 +308,7 @@
 					"$(inherited)",
 					"$(SRCROOT)/../../target/uniffi/ios",
 				);
-				INFOPLIST_KEY_CFBundleDisplayName = MyApp;
+				INFOPLIST_KEY_CFBundleDisplayName = PlainTextChess;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -323,9 +323,9 @@
 				OTHER_SWIFT_FLAGS = (
 					"$(inherited)",
 					"-Xcc",
-					"-fmodule-map-file=$(SRCROOT)/../../target/uniffi/ios/app_coreFFI.modulemap",
+					"-fmodule-map-file=$(SRCROOT)/../../target/uniffi/ios/chess_coreFFI.modulemap",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.hectoralejandrg.plaintextchess;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 			};
@@ -334,7 +334,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		AA0000000000000000000008 /* Build configuration list for PBXProject "MyApp" */ = {
+		AA0000000000000000000008 /* Build configuration list for PBXProject "PlainTextChess" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				AA000000000000000000000A /* Debug */,
@@ -343,7 +343,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		AA0000000000000000000009 /* Build configuration list for PBXNativeTarget "MyApp" */ = {
+		AA0000000000000000000009 /* Build configuration list for PBXNativeTarget "PlainTextChess" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				AA000000000000000000000C /* Debug */,

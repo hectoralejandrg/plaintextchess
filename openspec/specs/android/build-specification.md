@@ -30,14 +30,14 @@ Environment overrides (see `openspec/specs/shared/cross-platform-requirements.md
 
 | Tool | Requirement | Used for |
 | --- | --- | --- |
-| Rust toolchain (`cargo`, `rustup`) | stable channel | Compile `app-core` |
+| Rust toolchain (`cargo`, `rustup`) | stable channel | Compile `chess-core` |
 | `rustup target aarch64-linux-android` | installed | Cross-compilation for ARM devices |
 | `rustup target x86_64-linux-android` | installed | Cross-compilation for x86_64 emulator |
 | In-project CLI `core/src/bin/cargo-uniffi-bindgen.rs` | built by the script | Generate Kotlin bindings (uniffi 0.28 library mode) |
 | Android NDK (cross-clang + Bionic sysroot) | discovered by the script | Link the cdylib `.so` files |
 | Android SDK + Gradle | Android Studio or command-line tools | Build the app package (APK/AAB) |
 
-The Rust core crate is defined in `core/Cargo.toml` (crate `app-core`, `crate-type = ["rlib", "cdylib"]`, UniFFi 0.28).
+The Rust core crate is defined in `core/Cargo.toml` (crate `chess-core`, `crate-type = ["rlib", "cdylib"]`, UniFFi 0.28).
 
 ## Build Process
 
@@ -46,19 +46,19 @@ The Rust core crate is defined in `core/Cargo.toml` (crate `app-core`, `crate-ty
 1. **Specification validation** — verifies that `openspec/specs/android/build-specification.md`, `config/android-build.yaml`, and `core/Cargo.toml` exist and that every configured target/ABI is present in the configuration.
 2. **NDK discovery** — locates an Android NDK (`ANDROID_NDK_HOME`, `NDK_HOME`, or the default SDK locations) and selects its cross-clang; the NDK provides the Bionic sysroot required to link the cdylib.
 3. **Environment configuration** — reads `BUILD_ENVIRONMENT`, `BUILD_TYPE`, and `PLATFORM_TARGET` with defaults, and checks that `cargo` and `rustup` are available.
-4. **UniFFI CLI build** — `cargo build --bin cargo-uniffi-bindgen` (in-project CLI target of `app-core`).
+4. **UniFFI CLI build** — `cargo build --bin cargo-uniffi-bindgen` (in-project CLI target of `chess-core`).
 5. **Rust compilation** — for each configured target: `rustup target add <triple>`, then `cargo build --release --target <triple>` with the NDK clang as the target linker (`CARGO_TARGET_<TRIPLE>_LINKER`).
-6. **Native library installation** — copies each `libapp_core.so` into `android/app/src/main/jniLibs/<abi>/`.
-7. **UniFFi binding generation** — library mode from the aarch64 cdylib: `./target/debug/cargo-uniffi-bindgen generate --library --crate app_core --language kotlin --out-dir target/uniffi/android/ target/aarch64-linux-android/release/libapp_core.so`.
+6. **Native library installation** — copies each `libchess_core.so` into `android/app/src/main/jniLibs/<abi>/`.
+7. **UniFFi binding generation** — library mode from the aarch64 cdylib: `./target/debug/cargo-uniffi-bindgen generate --library --crate chess_core --language kotlin --out-dir target/uniffi/android/ target/aarch64-linux-android/release/libchess_core.so`.
 8. **Artifact generation documentation** — prints the list of generated artifacts and their locations, and writes build metrics to `target/build-metrics/android-last.json`.
 
 ### Artifact Layout
 ```
 android/app/src/main/jniLibs/
 ├── arm64-v8a/
-│   └── libapp_core.so
+│   └── libchess_core.so
 └── x86_64/
-    └── libapp_core.so
+    └── libchess_core.so
 target/uniffi/android/             # generated Kotlin bindings
 target/build-metrics/android-last.json
 ```
@@ -89,5 +89,5 @@ The build script reports elapsed time so that regressions against these targets 
 A build is considered valid when:
 1. All required specification and configuration files exist (checked at the start of the script).
 2. Rust compilation and UniFFi binding generation complete without errors for every configured target.
-3. `android/app/src/main/jniLibs/arm64-v8a/libapp_core.so` and `android/app/src/main/jniLibs/x86_64/libapp_core.so` exist after the build.
+3. `android/app/src/main/jniLibs/arm64-v8a/libchess_core.so` and `android/app/src/main/jniLibs/x86_64/libchess_core.so` exist after the build.
 4. The reported elapsed time does not exceed the clean build target by more than 50% (warning only).

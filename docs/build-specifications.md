@@ -1,6 +1,6 @@
 # Build Specifications
 
-This document indexes and summarizes the build specifications for the app-core-monorepo project. The authoritative files are listed under "Spec Files"; this page is the quick-reference overview.
+This document indexes and summarizes the build specifications for the plaintextchess project. The authoritative files are listed under "Spec Files"; this page is the quick-reference overview.
 
 ## Spec Files
 

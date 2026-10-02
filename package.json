@@ -2,9 +2,9 @@
   "devDependencies": {
     "@fission-ai/openspec": "^1.13.2"
   },
-  "name": "app-core-monorepo",
+  "name": "plaintextchess",
   "version": "1.0.0",
-  "description": "Cross-platform mobile template: high-performance Rust core with UniFFI bindings and native iOS/Android apps (sample demo: chess game logic, move validation, player rating).",
+  "description": "Cross-platform chess app: high-performance Rust core (chess game logic, move validation, Glicko-2 rating) with UniFFI bindings and native iOS/Android apps.",
   "main": "index.js",
   "dependencies": {
     "ansi-regex": "^6.4.0",

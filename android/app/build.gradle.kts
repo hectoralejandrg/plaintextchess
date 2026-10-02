@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.android"
+    namespace = "com.hectoralejandrg.plaintextchess"
     compileSdk = 35
 
     // Required in AGP 8.5.x: composeOptions alone no longer activates the
@@ -15,7 +15,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.android"
+        applicationId = "com.hectoralejandrg.plaintextchess"
         minSdk = 24
         targetSdk = 35
         versionCode = 1
@@ -41,7 +41,7 @@ android {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
 
-    // The UniFFI-generated Kotlin binding (package uniffi.app_core) is
+    // The UniFFI-generated Kotlin binding (package uniffi.chess_core) is
     // produced by scripts/build-android.sh into ../../target/uniffi/android.
     // Compiling it into the main source set keeps the app self-contained:
     // nothing generated is committed to the repo.
@@ -66,13 +66,13 @@ dependencies {
 }
 
 // ---------------------------------------------------------------------------
-// AppCore artifacts: jniLibs (src/main/jniLibs/<abi>/libapp_core.so) and
+// ChessCore artifacts: jniLibs (src/main/jniLibs/<abi>/libchess_core.so) and
 // the UniFFI Kotlin binding are produced by scripts/build-android.sh. The
 // preBuild hook only regenerates them when they are missing, so incremental
 // builds never rebuild the Rust core needlessly.
 // ---------------------------------------------------------------------------
-val coreLib = File(projectDir, "src/main/jniLibs/arm64-v8a/libapp_core.so")
-val coreBinding = File(projectDir, "../../target/uniffi/android/uniffi/app_core/app_core.kt")
+val coreLib = File(projectDir, "src/main/jniLibs/arm64-v8a/libchess_core.so")
+val coreBinding = File(projectDir, "../../target/uniffi/android/uniffi/chess_core/chess_core.kt")
 
 tasks.register<Exec>("ensureCore") {
     description = "Builds the Rust core artifacts when jniLibs or the Kotlin binding are missing."

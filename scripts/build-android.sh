@@ -114,17 +114,17 @@ for target in "${ANDROID_TARGETS[@]}"; do
     # Install the .so into jniLibs for the app
     cd "$REPO_ROOT"
     mkdir -p "$JNI_LIBS_DIR/$abi"
-    cp "core/target/$target/release/libapp_core.so" "$JNI_LIBS_DIR/$abi/"
+    cp "core/target/$target/release/libchess_core.so" "$JNI_LIBS_DIR/$abi/"
     cd core
 done
 
 # Generate Kotlin bindings from the aarch64 cdylib (library mode)
 ./target/debug/cargo-uniffi-bindgen generate \
     --library \
-    --crate app_core \
+    --crate chess_core \
     --language kotlin \
     --out-dir "../target/uniffi/android/" \
-    "target/${ANDROID_TARGETS[0]}/release/libapp_core.so"
+    "target/${ANDROID_TARGETS[0]}/release/libchess_core.so"
 
 cd "$REPO_ROOT"
 
@@ -148,8 +148,8 @@ cat > "$METRICS_FILE" << EOF
 EOF
 
 log "generated artifacts:"
-log "  - $JNI_LIBS_DIR/arm64-v8a/libapp_core.so"
-log "  - $JNI_LIBS_DIR/x86_64/libapp_core.so"
+log "  - $JNI_LIBS_DIR/arm64-v8a/libchess_core.so"
+log "  - $JNI_LIBS_DIR/x86_64/libchess_core.so"
 log "  - target/uniffi/android/ (UniFFi Kotlin bindings)"
 log "  - $METRICS_FILE (build metrics)"
 if [ "$DURATION" -gt 480 ]; then

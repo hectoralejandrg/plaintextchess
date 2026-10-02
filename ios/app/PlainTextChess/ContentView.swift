@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Placeholder screen that proves the AppCore FFI surface works in-app:
+/// Placeholder screen that proves the ChessCore FFI surface works in-app:
 /// it creates a game session through the UniFFI Swift bindings and shows
 /// the initial board state (FEN) and the starting player rating.
 struct ContentView: View {
@@ -10,7 +10,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("MyApp")
+            Text("PlainTextChess")
                 .font(.largeTitle.bold())
 
             if let boardState, let rating {

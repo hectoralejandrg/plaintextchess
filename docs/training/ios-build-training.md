@@ -1,17 +1,17 @@
 # iOS Build Training
 
-Training material for the iOS cross-platform build setup of `app-core-monorepo`.
+Training material for the iOS cross-platform build setup of `plaintextchess`.
 Target audience: developers who need to build, validate, and troubleshoot the iOS
-Rust artifacts (`AppCore.xcframework` + UniFFi Swift bindings).
+Rust artifacts (`ChessCore.xcframework` + UniFFi Swift bindings).
 
 ## 1. Concepts
 
 | Concept | What it means here |
 | --- | --- |
-| `app-core` | The Rust crate in `core/` containing all game logic (board, moves, rating). |
+| `chess-core` | The Rust crate in `core/` containing all game logic (board, moves, rating). |
 | UniFFI (library mode) | The FFI framework. No UDL files: the surface is declared with `#[uniffi::export]` / `#[derive(uniffi::Object)]` in `core/src/lib.rs`, and metadata is extracted from the **compiled** library. |
-| XCFramework | `ios/Frameworks/AppCore.xcframework` containing the staticlib `libapp_core.a` + `Info.plist`. |
-| Swift bindings | Generated into `target/uniffi/ios/` (`app_core.swift`, `app_coreFFI.h`, `app_coreFFI.modulemap`). |
+| XCFramework | `ios/Frameworks/ChessCore.xcframework` containing the staticlib `libchess_core.a` + `Info.plist`. |
+| Swift bindings | Generated into `target/uniffi/ios/` (`chess_core.swift`, `chess_coreFFI.h`, `chess_coreFFI.modulemap`). |
 | In-project CLI | `core/src/bin/cargo-uniffi-bindgen.rs` — the UniFFI 0.28 CLI as a cargo binary target (uniffi does not publish a standalone CLI crate). |
 
 ## 2. Prerequisites (checklist)
@@ -37,8 +37,8 @@ Expected steps (in order):
 1. Validate `openspec/specs/ios/build-specification.md`, `config/ios-build.yaml`, `core/Cargo.toml`.
 2. `cargo build --bin cargo-uniffi-bindgen` (host, debug).
 3. `cargo build --release --target aarch64-apple-ios` (cdylib + staticlib).
-4. `./target/debug/cargo-uniffi-bindgen generate --library --crate app_core --language swift ...`
-5. Assemble `ios/Frameworks/AppCore.xcframework/`.
+4. `./target/debug/cargo-uniffi-bindgen generate --library --crate chess_core --language swift ...`
+5. Assemble `ios/Frameworks/ChessCore.xcframework/`.
 6. Write `target/build-metrics/ios-last.json`.
 
 On a clean machine the first run compiles the whole dependency tree
@@ -51,17 +51,17 @@ cd core
 cargo build --bin cargo-uniffi-bindgen
 cargo build --release --target aarch64-apple-ios
 ./target/debug/cargo-uniffi-bindgen generate \
-    --library --crate app_core --language swift \
+    --library --crate chess_core --language swift \
     --out-dir ../target/uniffi/ios/ \
-    target/aarch64-apple-ios/release/libapp_core.a
+    target/aarch64-apple-ios/release/libchess_core.a
 ```
 
 Then verify:
 
 ```bash
 python3 -m json.tool target/build-metrics/ios-last.json   # after running the script
-file ios/Frameworks/AppCore.xcframework/ios-aarch64/libapp_core.a
-head -5 target/uniffi/ios/app_core.swift
+file ios/Frameworks/ChessCore.xcframework/ios-aarch64/libchess_core.a
+head -5 target/uniffi/ios/chess_core.swift
 ./tests/validate-ios-build.sh
 ```
 
@@ -79,8 +79,8 @@ All three environment variables (`BUILD_ENVIRONMENT`, `BUILD_TYPE`,
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `no such command: uniffi-bindgen` | Tried the cargo-subcommand form. Cargo passes the subcommand name as an argument and the target-dir lookup is unreliable. | The scripts call the binary directly: `./target/debug/cargo-uniffi-bindgen generate ...`. |
-| `Crate app-core not found in ...libapp_core.a` | Used `--crate app-core` (hyphen). The metadata stores the crate identifier with an underscore. | Use `--crate app_core`. |
-| `failed to open file ...libapp_core.a` | Build before the compile step, or `staticlib` missing from `crate-type`. | Order: build CLI → release build → generate. Keep `crate-type = ["rlib", "cdylib", "staticlib"]`. |
+| `Crate chess-core not found in ...libchess_core.a` | Used `--crate chess-core` (hyphen). The metadata stores the crate identifier with an underscore. | Use `--crate chess_core`. |
+| `failed to open file ...libchess_core.a` | Build before the compile step, or `staticlib` missing from `crate-type`. | Order: build CLI → release build → generate. Keep `crate-type = ["rlib", "cdylib", "staticlib"]`. |
 | `associated functions are not currently supported` | Constructor declared inside the impl block without the right pattern. | Use a free function returning `Arc<GameSession>` (`new_game_session`). |
 | `cannot borrow data in an Arc as mutable` | `&mut self` methods exported through the FFI. | UniFFI objects are shared via `Arc`; use `Mutex` interior mutability and `&self` methods. |
 

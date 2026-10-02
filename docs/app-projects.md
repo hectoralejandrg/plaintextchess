@@ -12,8 +12,8 @@ only regenerate artifacts when they are missing, so day-to-day builds stay fast.
 
 | App | Location | Bindings consumed from | Core artifact |
 | --- | --- | --- | --- |
-| iOS (SwiftUI) | `ios/app/MyApp.xcodeproj` | `target/uniffi/ios/` (`app_core.swift`) | `ios/Frameworks/AppCore.xcframework` |
-| Android (Compose) | `android/app/` | `target/uniffi/android/` (`uniffi.app_core`) | `android/app/src/main/jniLibs/{arm64-v8a,x86_64}/libapp_core.so` |
+| iOS (SwiftUI) | `ios/app/PlainTextChess.xcodeproj` | `target/uniffi/ios/` (`chess_core.swift`) | `ios/Frameworks/ChessCore.xcframework` |
+| Android (Compose) | `android/app/` | `target/uniffi/android/` (`uniffi.chess_core`) | `android/app/src/main/jniLibs/{arm64-v8a,x86_64}/libchess_core.so` |
 
 ## 1. Prerequisites
 
@@ -42,14 +42,14 @@ only regenerate artifacts when they are missing, so day-to-day builds stay fast.
 ./scripts/build-ios.sh
 
 # 2) Build the app for the iOS simulator.
-xcodebuild -project ios/app/MyApp.xcodeproj \
-    -scheme MyApp \
+xcodebuild -project ios/app/PlainTextChess.xcodeproj \
+    -scheme PlainTextChess \
     -destination 'generic/platform=iOS Simulator' build
 
 # 3) Install + launch on a booted simulator.
 xcrun simctl install <SIMUDID> \
-    ~/Library/Developer/Xcode/DerivedData/MyApp-*/Build/Products/Debug-iphonesimulator/MyApp.app
-xcrun simctl launch <SIMUDID> com.example.ios
+    ~/Library/Developer/Xcode/DerivedData/PlainTextChess-*/Build/Products/Debug-iphonesimulator/PlainTextChess.app
+xcrun simctl launch <SIMUDID> com.hectoralejandrg.plaintextchess
 
 # 4) Optional: screenshot to verify the placeholder screen.
 xcrun simctl io <SIMUDID> screenshot /tmp/ios-screen.png
@@ -57,11 +57,11 @@ xcrun simctl io <SIMUDID> screenshot /tmp/ios-screen.png
 
 Notes:
 
-- The project links `ios/Frameworks/AppCore.xcframework` (link-only, no
-  embed) and exposes `app_coreFFI` as a header-only clang module via the
+- The project links `ios/Frameworks/ChessCore.xcframework` (link-only, no
+  embed) and exposes `chess_coreFFI` as a header-only clang module via the
   generated modulemap in `target/uniffi/ios/`.
 - A pre-build script phase runs `scripts/build-ios.sh` only when the
-  XCFramework or `app_core.swift` are missing (`alwaysOutOfDate = 1` keeps
+  XCFramework or `chess_core.swift` are missing (`alwaysOutOfDate = 1` keeps
   the check cheap; suppresses the no-outputs warning intentionally).
 - **arm64-simulator-only limitation**: both XCFramework slices are arm64
   (`ios-arm64` device + `ios-arm64-simulator`), matching Apple Silicon
@@ -81,13 +81,13 @@ cd android
 ./gradlew :app:assembleDebug
 
 # 2) Verify both ABIs are packaged (AGP repackages jniLibs under lib/<abi>/).
-unzip -l app/build/outputs/apk/debug/app-debug.apk | grep libapp_core
-# lib/arm64-v8a/libapp_core.so  and  lib/x86_64/libapp_core.so
+unzip -l app/build/outputs/apk/debug/app-debug.apk | grep libchess_core
+# lib/arm64-v8a/libchess_core.so  and  lib/x86_64/libchess_core.so
 
 # 3) Emulator smoke test (needs a booted AVD; adb from the SDK).
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb shell am start -n com.example.android/.MainActivity
-adb shell pidof com.example.android      # process still alive after 10+ s
+adb shell am start -n com.hectoralejandrg.plaintextchess/.MainActivity
+adb shell pidof com.hectoralejandrg.plaintextchess      # process still alive after 10+ s
 adb logcat -d | grep -iE 'UnsatisfiedLink|FATAL'   # expect no matches
 adb exec-out screencap -p > /tmp/android-screen.png
 ```
@@ -108,16 +108,16 @@ Notes:
   `aarch64-linux-android` Rust target) and `x86_64`.
 - The generated binding compiles in via
   `sourceSets["main"].kotlin.srcDir("../../target/uniffi/android")`, so the
-  `uniffi.app_core` package resolves from its generated path.
+  `uniffi.chess_core` package resolves from its generated path.
 
 ## 4. Where the generated artifacts come from
 
 | Artifact | Producer | Consumed by |
 | --- | --- | --- |
-| `ios/Frameworks/AppCore.xcframework` (2 arm64 slices) | `scripts/build-ios.sh` | Xcode project (link) |
-| `target/uniffi/ios/app_core.swift` (+ headers, modulemap) | `scripts/build-ios.sh` | Xcode project (source) |
-| `android/app/src/main/jniLibs/{arm64-v8a,x86_64}/libapp_core.so` | `scripts/build-android.sh` | Gradle (jniLibs merge) |
-| `target/uniffi/android/uniffi/app_core/app_core.kt` | `scripts/build-android.sh` | Gradle (kotlin source dir) |
+| `ios/Frameworks/ChessCore.xcframework` (2 arm64 slices) | `scripts/build-ios.sh` | Xcode project (link) |
+| `target/uniffi/ios/chess_core.swift` (+ headers, modulemap) | `scripts/build-ios.sh` | Xcode project (source) |
+| `android/app/src/main/jniLibs/{arm64-v8a,x86_64}/libchess_core.so` | `scripts/build-android.sh` | Gradle (jniLibs merge) |
+| `target/uniffi/android/uniffi/chess_core/chess_core.kt` | `scripts/build-android.sh` | Gradle (kotlin source dir) |
 
 Regenerating everything from scratch:
 

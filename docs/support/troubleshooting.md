@@ -55,8 +55,8 @@ infrastructure. Everything else assumes the core crate compiles.
 | `error[E0583]: file not found for module` | both | Missing source file in `core/src/` | Restore the module; run `cargo test` first. |
 | `associated functions are not currently supported` | both | UniFFI export shape changed | Constructors are free functions returning `Arc<T>`; check `core/src/lib.rs`. |
 | `cannot borrow data in an Arc as mutable` | both | `&mut self` FFI method | Use `Mutex` interior mutability; exported methods take `&self`. |
-| `Crate app-core not found in …` | both | `--crate` with a hyphen | Use `--crate app_core` (crate identifier, not package name). |
-| `failed to open file …libapp_core.a` | iOS | Binding generation ran before the release build, or `staticlib` missing | Restore script order (CLI → release build → generate) and keep `crate-type` containing `staticlib`. |
+| `Crate chess-core not found in …` | both | `--crate` with a hyphen | Use `--crate chess_core` (crate identifier, not package name). |
+| `failed to open file …libchess_core.a` | iOS | Binding generation ran before the release build, or `staticlib` missing | Restore script order (CLI → release build → generate) and keep `crate-type` containing `staticlib`. |
 | `no such command: uniffi-bindgen` | both | cargo subcommand lookup | Call `./target/debug/cargo-uniffi-bindgen` directly. |
 | `linking with cc failed` / `--version-script` | Android | Default Apple linker used for ELF | NDK clang must be the target linker (script sets `CARGO_TARGET_<TRIPLE>_LINKER`). |
 | `unable to find library -lc/-llog/-lunwind` | Android | Bare `ld.lld` without Bionic sysroot | Use the NDK cross-clang as linker, not standalone lld. |

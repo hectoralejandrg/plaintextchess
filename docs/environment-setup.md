@@ -30,7 +30,7 @@ xcodebuild -showsdks | grep iOS
 ```
 
 - Accept the Xcode license if prompted: `sudo xcodebuild -license accept`
-- The iOS build (`./scripts/build-ios.sh`) only produces the XCFramework and bindings; building the final app requires the Xcode project linking `ios/Frameworks/AppCore.xcframework`.
+- The iOS build (`./scripts/build-ios.sh`) only produces the XCFramework and bindings; building the final app requires the Xcode project linking `ios/Frameworks/ChessCore.xcframework`.
 
 ## 3. Android
 

@@ -1,30 +1,33 @@
-# App Core Monorepo: Cross-Platform Mobile Template
+# PlainTextChess: Cross-Platform Chess App
 
-A starting point for cross-platform mobile projects: a high-performance **Rust core** exposing a
-**UniFFI** surface, plus native **iOS (SwiftUI)** and **Android (Jetpack Compose)** apps.
-The included sample is a chess demo (board state, move validation, Glicko-2 rating); both apps are
-placeholder screens that prove the full FFI chain end-to-end — initial FEN + starting rating on
-screen, no crash. A playable game UI is a deliberate follow-up.
+A cross-platform chess application: a high-performance **Rust core** (game logic, legal-move
+validation, Glicko-2 rating) exposing a **UniFFI** surface, plus native
+**iOS (SwiftUI)** and **Android (Jetpack Compose)** apps. Grown from the
+[app-core-monorepo](https://github.com/hectoralejandrg/app-core-monorepo) cross-platform template.
+
+Both apps currently show a placeholder screen that proves the full FFI chain end-to-end
+(initial FEN + starting rating, errors rendered in the UI instead of crashing). The playable
+game UI is the active next milestone (see `openspec/` for the in-flight change).
 
 ## What's in the box
 
-- `core/` — Rust crate `app-core` with a UniFFI 0.28 FFI surface (`newGameSession`, `getBoardState`, `getCurrentRating`, …)
-- `ios/app/` — `MyApp` SwiftUI project consuming `AppCore.xcframework`
-- `android/app/` — `MyApp` Compose module consuming `libapp_core.so` (JNI)
+- `core/` — Rust crate `chess-core` with a UniFFI 0.28 FFI surface (`newGameSession`, `getBoardState`, `getCurrentRating`, …)
+- `ios/app/` — `PlainTextChess` SwiftUI project consuming `ChessCore.xcframework`
+- `android/app/` — `PlainTextChess` Compose module consuming `libchess_core.so` (JNI)
 - `scripts/` — the **single producers** of every generated artifact
 - `tests/` — build validators · `config/` — build settings · `docs/` — setup & training · `openspec/` — specs + change history
 
 ## Repository layout
 
 ```
-app-core-monorepo/
-├── core/                        # Rust crate app-core (sample: chess demo)
+plaintextchess/
+├── core/                        # Rust crate chess-core (chess logic + Glicko-2 rating)
 │   ├── src/lib.rs               #   UniFFI FFI surface
 │   ├── src/domain/              #   chess logic + Glicko-2 rating
 │   └── src/bin/cargo-uniffi-bindgen.rs   # in-project bindgen CLI (no external install)
 ├── ios/
-│   ├── app/MyApp.xcodeproj      # SwiftUI app (placeholder screen)
-│   └── Frameworks/              # [generated] AppCore.xcframework (not committed)
+│   ├── app/PlainTextChess.xcodeproj      # SwiftUI app (placeholder screen)
+│   └── Frameworks/              # [generated] ChessCore.xcframework (not committed)
 ├── android/
 │   ├── app/                     # Compose app (placeholder screen)
 │   └── gradlew + gradle/wrapper # committed Gradle 8.7 wrapper
@@ -54,8 +57,8 @@ targetSdk 35, iOS baseline 15.0.
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/app-core-monorepo.git
-cd app-core-monorepo
+git clone https://github.com/<you>/plaintextchess.git
+cd plaintextchess
 
 # 1) Generate all FFI artifacts (Rust -> XCFramework + Swift bindings, jniLibs + Kotlin bindings)
 ./scripts/build-ios.sh       # macOS only (uses xcodebuild -create-xcframework)
@@ -72,8 +75,8 @@ cd app-core-monorepo
 
 ### Run the apps
 
-- **iOS**: open `ios/app/MyApp.xcodeproj` in Xcode and hit Run (or `xcodebuild -project
-  ios/app/MyApp.xcodeproj -scheme MyApp -destination 'generic/platform=iOS Simulator' build`).
+- **iOS**: open `ios/app/PlainTextChess.xcodeproj` in Xcode and hit Run (or `xcodebuild -project
+  ios/app/PlainTextChess.xcodeproj -scheme PlainTextChess -destination 'generic/platform=iOS Simulator' build`).
   The pre-build phase re-runs `build-ios.sh` automatically if the XCFramework is missing.
 - **Android**: `cd android && ./gradlew :app:assembleDebug`, then install
   `app/build/outputs/apk/debug/app-debug.apk` on a device/emulator. The `ensureCore` Gradle
@@ -86,10 +89,10 @@ Per-platform details, troubleshooting, and artifact reference: `docs/app-project
 
 | Artifact | Produced by | Consumed by |
 | --- | --- | --- |
-| `ios/Frameworks/AppCore.xcframework` (arm64 device + simulator slices) | `scripts/build-ios.sh` | `ios/app/MyApp.xcodeproj` |
-| `target/uniffi/ios/app_core.swift` | `scripts/build-ios.sh` | iOS app (Swift) |
-| `android/app/src/main/jniLibs/{arm64-v8a,x86_64}/libapp_core.so` | `scripts/build-android.sh` | `android/app` (packaged into the APK) |
-| `target/uniffi/android/app_core.kt` | `scripts/build-android.sh` | `android/app` (Kotlin) |
+| `ios/Frameworks/ChessCore.xcframework` (arm64 device + simulator slices) | `scripts/build-ios.sh` | `ios/app/PlainTextChess.xcodeproj` |
+| `target/uniffi/ios/chess_core.swift` | `scripts/build-ios.sh` | iOS app (Swift) |
+| `android/app/src/main/jniLibs/{arm64-v8a,x86_64}/libchess_core.so` | `scripts/build-android.sh` | `android/app` (packaged into the APK) |
+| `target/uniffi/android/chess_core.kt` | `scripts/build-android.sh` | `android/app` (Kotlin) |
 | `target/build-metrics/{ios,android}-last.json` | both scripts | validators, CI metrics report |
 
 Invariant: app projects **never** commit generated code. A fresh clone builds everything from the

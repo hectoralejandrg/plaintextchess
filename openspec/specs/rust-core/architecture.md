@@ -116,12 +116,12 @@ func getCurrentRating() -> Double
 ### iOS
 - Soporta iOS 14+
 - Arquitectura: arm64 (native)
-- Framework: XCFramework `AppCore.xcframework`
+- Framework: XCFramework `ChessCore.xcframework`
 
 ### Android
 - Soporta API 24+
 - Arquitectura: arm64-v8a, x86_64
-- Build: .so libraries (`libapp_core.so`)
+- Build: .so libraries (`libchess_core.so`)
 
 ## Security Considerations
 

@@ -36,8 +36,8 @@ ls ~/Library/Android/sdk/ndk   # or set ANDROID_NDK_HOME
 
 ## Where Artifacts Land
 
-- **iOS:** `ios/Frameworks/AppCore.xcframework/` (link this into the Xcode project)
-- **Android:** `android/app/src/main/jniLibs/{aarch64,x86_64}/libapp_core.so`
+- **iOS:** `ios/Frameworks/ChessCore.xcframework/` (link this into the Xcode project)
+- **Android:** `android/app/src/main/jniLibs/{aarch64,x86_64}/libchess_core.so`
 - **Bindings:** `target/uniffi/ios/` (Swift), `target/uniffi/android/` (Kotlin)
 - **Metrics:** `target/build-metrics/*.json`
 

@@ -1,20 +1,20 @@
 # Android Build Training
 
 Training material for the Android cross-platform build setup of
-`app-core-monorepo`.
+`plaintextchess`.
 Target audience: developers who need to build, validate, and troubleshoot the
-Android Rust artifacts (`libapp_core.so` per ABI + UniFFi Kotlin bindings).
+Android Rust artifacts (`libchess_core.so` per ABI + UniFFi Kotlin bindings).
 
 ## 1. Concepts
 
 | Concept | What it means here |
 | --- | --- |
-| `app-core` | The Rust crate in `core/` containing all game logic. |
+| `chess-core` | The Rust crate in `core/` containing all game logic. |
 | UniFFI (library mode) | FFI framework; metadata is extracted from the compiled cdylib. |
-| cdylib | `libapp_core.so` shared object, built per ABI target. |
+| cdylib | `libchess_core.so` shared object, built per ABI target. |
 | ABIs | `arm64-v8a` (devices, AGP NDK ABI tag for the `aarch64-linux-android` Rust target) and `x86_64` (emulator). Mapped in `config/android-build.yaml`. |
-| jniLibs | `android/app/src/main/jniLibs/<abi>/libapp_core.so` — where Gradle picks the libraries up. |
-| Kotlin bindings | Generated into `target/uniffi/android/` (`uniffi/app_core/app_core.kt`). |
+| jniLibs | `android/app/src/main/jniLibs/<abi>/libchess_core.so` — where Gradle picks the libraries up. |
+| Kotlin bindings | Generated into `target/uniffi/android/` (`uniffi/chess_core/chess_core.kt`). |
 | NDK | Provides the cross-clang + Bionic sysroot (`libc`, `liblog`, `libunwind`, …) required to **link** the `.so`. Without it the link step fails with missing `-lc -llog …`. |
 | In-project CLI | `core/src/bin/cargo-uniffi-bindgen.rs` — the UniFFI 0.28 CLI. |
 
@@ -48,8 +48,8 @@ Expected steps (in order):
    - `rustup target add <triple>` (idempotent).
    - Export `CARGO_TARGET_<TRIPLE>_LINKER=<ndk>/…/<triple>21-clang`.
    - `cargo build --release --target <triple>`.
-   - Copy `libapp_core.so` to `android/app/src/main/jniLibs/<abi>/`.
-5. `./target/debug/cargo-uniffi-bindgen generate --library --crate app_core --language kotlin ...`
+   - Copy `libchess_core.so` to `android/app/src/main/jniLibs/<abi>/`.
+5. `./target/debug/cargo-uniffi-bindgen generate --library --crate chess_core --language kotlin ...`
    (from the aarch64 cdylib).
 6. Write `target/build-metrics/android-last.json`.
 
@@ -64,7 +64,7 @@ NDK=~/Library/Android/sdk/ndk/27.1.12297006   # or the NDK your machine has
 CLANG=$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin
 CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG/aarch64-linux-android21-clang \
     cargo build --release --target aarch64-linux-android
-file target/aarch64-linux-android/release/libapp_core.so
+file target/aarch64-linux-android/release/libchess_core.so
 # ELF 64-bit LSB shared object, ARM aarch64 …
 ```
 
@@ -92,7 +92,7 @@ BUILD_ENVIRONMENT=development BUILD_TYPE=debug ./scripts/build-android.sh
 | `no Android NDK found` | NDK not installed or not discoverable. | Install an NDK or set `ANDROID_NDK_HOME` (see `docs/environment-setup.md`). |
 | `aarch64: unbound variable` (on macOS) | Used bash 4+ `declare -A` with the system bash 3.2. | The script maps target→ABI with a `case` function (bash 3.2 compatible). |
 | `no such command: uniffi-bindgen` | Invoked the CLI through cargo subcommand resolution. | Call the binary directly: `./target/debug/cargo-uniffi-bindgen generate …`. |
-| `Crate app-core not found` | Hyphen in `--crate`. | Use `--crate app_core`. |
+| `Crate chess-core not found` | Hyphen in `--crate`. | Use `--crate chess_core`. |
 | Wrong `CARGO_TARGET_…` variable name | Missing `_` between triple and `LINKER` (e.g. `…ANDROIDLINKER`). | The variable is `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` — always `CARGO_TARGET_<TRIPLE>_LINKER`. |
 
 ## 7. Self-check
@@ -101,7 +101,7 @@ After completing this training you should be able to:
 
 1. Run `./scripts/build-android.sh` and explain each log line.
 2. Verify both `.so` files exist with the correct ELF arch (`file`).
-3. Locate the generated Kotlin bindings and open `app_core.kt`.
+3. Locate the generated Kotlin bindings and open `chess_core.kt`.
 4. Read `target/build-metrics/android-last.json` and explain each field.
 5. Run `./tests/validate-android-build.sh` and interpret a failing check.
 6. Explain why an NDK is required even though only Rust is being compiled.

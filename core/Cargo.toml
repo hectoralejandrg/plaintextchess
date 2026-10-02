@@ -1,5 +1,5 @@
 [package]
-name = "app-core"
+name = "chess-core"
 version = "0.1.0"
 edition = "2021"
 

@@ -1,4 +1,4 @@
-package com.example.android
+package com.hectoralejandrg.plaintextchess
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -21,7 +21,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
-import uniffi.app_core.newGameSession
+import uniffi.chess_core.newGameSession
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -36,11 +36,11 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** Data captured from a freshly created [uniffi.app_core.GameSession]. */
+/** Data captured from a freshly created [uniffi.chess_core.GameSession]. */
 private data class SessionInfo(val boardState: String, val rating: Double)
 
 /**
- * Placeholder screen that proves the AppCore FFI surface works in-app:
+ * Placeholder screen that proves the ChessCore FFI surface works in-app:
  * it creates a game session through the UniFFI Kotlin bindings and shows
  * the initial board state (FEN) and the starting player rating. FFI errors
  * are surfaced in the UI instead of crashing.
@@ -68,7 +68,7 @@ fun PlaceholderScreen() {
             .padding(16.dp),
         verticalArrangement = Arrangement.Top
     ) {
-        Text("MyApp", style = MaterialTheme.typography.headlineLarge)
+        Text("PlainTextChess", style = MaterialTheme.typography.headlineLarge)
         Spacer(modifier = Modifier.height(12.dp))
         when {
             info != null -> {

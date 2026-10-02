@@ -50,7 +50,7 @@ jobs:
         with:
           name: ios-xcframework
           path: |
-            ios/Frameworks/AppCore.xcframework
+            ios/Frameworks/ChessCore.xcframework
             target/build-metrics/ios-last.json
 
   build-android:

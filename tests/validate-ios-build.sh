@@ -74,11 +74,11 @@ fi
 # --- Built artifacts (only when a build has already run) ---
 if [ -f "target/build-metrics/ios-last.json" ]; then
     check "XCFramework Info.plist exists" \
-        test -s ios/Frameworks/AppCore.xcframework/Info.plist
+        test -s ios/Frameworks/ChessCore.xcframework/Info.plist
     check "XCFramework device slice library exists" \
-        test -s ios/Frameworks/AppCore.xcframework/ios-arm64/libapp_core.a
+        test -s ios/Frameworks/ChessCore.xcframework/ios-arm64/libchess_core.a
     check "XCFramework simulator slice library exists" \
-        test -s ios/Frameworks/AppCore.xcframework/ios-arm64-simulator/libapp_core.a
+        test -s ios/Frameworks/ChessCore.xcframework/ios-arm64-simulator/libchess_core.a
 else
     echo "  [SKIP] XCFramework not built yet (run ./scripts/build-ios.sh first)"
 fi

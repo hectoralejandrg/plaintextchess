@@ -1,6 +1,6 @@
 # OpenSpec Specs
 
-This directory contains all specifications for the app-core-monorepo project.
+This directory contains all specifications for the plaintextchess project.
 
 ## Overview
 

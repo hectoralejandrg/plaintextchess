@@ -12,7 +12,7 @@ deployment:
   min_ios_version: "15.0"
   architectures:
     - arm64
-  xcframework_path: ios/Frameworks/AppCore.xcframework
+  xcframework_path: ios/Frameworks/ChessCore.xcframework
 
 binding:
   language: swift
