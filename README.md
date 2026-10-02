@@ -1,215 +1,122 @@
 # App Core Monorepo: Cross-Platform Mobile Template
 
-A starting point for cross-platform mobile projects: a high-performance Rust core with UniFFI bindings and native iOS/Android apps. The included sample demo is a chess application (game logic, move validation, rating).
+A starting point for cross-platform mobile projects: a high-performance **Rust core** exposing a
+**UniFFI** surface, plus native **iOS (SwiftUI)** and **Android (Jetpack Compose)** apps.
+The included sample is a chess demo (board state, move validation, Glicko-2 rating); both apps are
+placeholder screens that prove the full FFI chain end-to-end — initial FEN + starting rating on
+screen, no crash. A playable game UI is a deliberate follow-up.
 
-## Overview
+## What's in the box
 
-This template demonstrates a cross-platform application built with:
+- `core/` — Rust crate `app-core` with a UniFFI 0.28 FFI surface (`newGameSession`, `getBoardState`, `getCurrentRating`, …)
+- `ios/app/` — `MyApp` SwiftUI project consuming `AppCore.xcframework`
+- `android/app/` — `MyApp` Compose module consuming `libapp_core.so` (JNI)
+- `scripts/` — the **single producers** of every generated artifact
+- `tests/` — build validators · `config/` — build settings · `docs/` — setup & training · `openspec/` — specs + change history
 
-- **Rust Core**: High-performance chess logic, move validation, and rating system
-- **iOS App**: Native iOS application built with SwiftUI
-- **Android App**: Native Android application built with Jetpack Compose
-- **OpenSpec**: Specification-driven development framework for coordinated development
-
-## Architecture
+## Repository layout
 
 ```
 app-core-monorepo/
-├── openspec/                           # Specification-driven development
-│   ├── specs/                         # All project specifications
-│   │   ├── rust-core/                # Rust core specifications
-│   │   ├── ios/                      # iOS specifications
-│   │   ├── android/                 # Android specifications
-│   │   └── shared/                  # Cross-platform specifications
-│   └── changes/                      # Implemented changes history
-├── core/                              # Rust core (sample: chess engine)
-│   ├── Cargo.toml                      # Rust dependencies
-│   ├── src/lib.rs                     # Core library
-│   └── src/domain/                   # Domain modules
-├── ios/                               # iOS Xcode project
-│   └── Frameworks/                   # XCFramework for Rust core
-├── android/                          # Android project
-│   └── app/                          # Android app structure
-└── scripts/                           # Build scripts
-    ├── build-ios.sh                  # iOS build script
-    └── build-android.sh              # Android build script
+├── core/                        # Rust crate app-core (sample: chess demo)
+│   ├── src/lib.rs               #   UniFFI FFI surface
+│   ├── src/domain/              #   chess logic + Glicko-2 rating
+│   └── src/bin/cargo-uniffi-bindgen.rs   # in-project bindgen CLI (no external install)
+├── ios/
+│   ├── app/MyApp.xcodeproj      # SwiftUI app (placeholder screen)
+│   └── Frameworks/              # [generated] AppCore.xcframework (not committed)
+├── android/
+│   ├── app/                     # Compose app (placeholder screen)
+│   └── gradlew + gradle/wrapper # committed Gradle 8.7 wrapper
+├── scripts/                     # build-ios.sh / build-android.sh / build-coordination.sh
+├── tests/                       # validate-{ios,android,cross-platform}-build.sh
+├── config/                      # per-platform + shared build configuration (YAML)
+├── docs/                        # environment-setup, app-projects, build docs, training
+├── openspec/                    # specs/ + changes/archive/ (SDD history)
+├── .opencode/                   # OpenSpec slash-commands (opsx-*)
+└── .github/workflows/           # CI: validate + build both platforms + metrics report
 ```
 
-## Key Features
+## Prerequisites
 
-### Rust Core
-- **Move Validation**: Legal move detection using Shakmaty chess library
-- **Game State Management**: Complete board tracking with FEN support
-- **Rating System**: Glicko-2 player rating calculations
-- **Cross-Platform FFI**: Native bindings for iOS and Android
+| Tool | Requirement |
+| --- | --- |
+| Rust | `rustup` + `cargo` (stable). The build scripts **auto-install** the needed targets (`aarch64-apple-ios`, `aarch64-apple-ios-sim`, `aarch64-linux-android`, `x86_64-linux-android`). |
+| Xcode | Recent stable (verified with Xcode 27) + an iOS Simulator runtime. macOS only. |
+| JDK | 17 (`export JAVA_HOME=$(/usr/libexec/java_home -v 17)` on macOS). |
+| Android SDK | Platform 35 + build-tools 35.0.0. |
+| Android NDK | Any recent r2x (CI pins r27c). Found via `ANDROID_NDK_HOME`, `NDK_HOME`, or `$ANDROID_SDK_ROOT/ndk/*` / `~/Library/Android/sdk/ndk/*`. |
 
-### iOS Application
-- **SwiftUI Interface**: Modern iOS UI with reactive programming
-- **8x8 Chess Board**: Interactive board with piece rendering
-- **Gesture Handling**: Tap, drag, and swipe gestures for intuitive play
-- **Dark Mode**: System-themed UI with Material Design
-- **Accessibility**: VoiceOver support with semantic UI
+Pinned, self-sufficient versions (no global tooling needed): Gradle 8.7 (committed wrapper),
+AGP 8.5.2, Kotlin 1.9.24, Compose compiler 1.5.14, Compose BOM 2024.08.00, minSdk 24 /
+targetSdk 35, iOS baseline 15.0.
 
-### Android Application
-- **Jetpack Compose**: Modern Android UI with declarative programming
-- **Material Design**: Material Design components and theming
-- **Native Performance**: Built with Android NDK for optimal performance
-- **Drag and Drop**: Native Android drag-and-drop for piece movement
-
-## Technical Specifications
-
-### Rust Core
-- **Language**: Rust 2021
-- **Dependencies**: Shakmaty (chess logic), Glicko-2 (rating system), UniFFI (FFI)
-- **Target Platforms**: iOS (arm64), Android (arm64, x86_64)
-- **Performance**: <10ms move validation, <100MB memory usage
-
-### iOS
-- **Language**: Swift 5.0+
-- **UI Framework**: SwiftUI
-- **Target**: iOS 14.0+
-- **Architecture**: MVVM with Combine
-
-### Android
-- **Language**: Kotlin 1.8+
-- **UI Framework**: Jetpack Compose
-- **Target**: API 24+
-- **Architecture**: Jetpack Compose + ViewModel
-
-## Development Workflow
-
-### 1. Planning (OpenSpec)
-Use OpenSpec to plan features before coding:
+## Quick start
 
 ```bash
-# Initialize OpenSpec for the project
-openspec init
-
-# Explore and plan features
-/opsx:explore "Add chess move validation"
-
-# Propose new features
-/opsx:propose add-move-validation
-```
-
-### 2. Implementation
-Follow the specification-driven workflow:
-
-```bash
-# Build for iOS
+git clone https://github.com/<you>/app-core-monorepo.git
 cd app-core-monorepo
-./scripts/build-ios.sh
 
-# Build for Android
-./scripts/build-android.sh
+# 1) Generate all FFI artifacts (Rust -> XCFramework + Swift bindings, jniLibs + Kotlin bindings)
+./scripts/build-ios.sh       # macOS only (uses xcodebuild -create-xcframework)
+./scripts/build-android.sh   # needs an Android NDK
 
-# Test the Rust core
-cd core
-cargo test --lib
+# 2) Validate (specs, config, scripts, and the built artifacts when present)
+./tests/validate-ios-build.sh
+./tests/validate-android-build.sh
+./tests/validate-cross-platform.sh
+
+# 3) Test the Rust core (unit tests + ffi_smoke integration test)
+(cd core && cargo test)
 ```
 
-### 3. Testing
-Test all components:
+### Run the apps
 
-```bash
-# Unit tests for Rust
-cargo test --lib
+- **iOS**: open `ios/app/MyApp.xcodeproj` in Xcode and hit Run (or `xcodebuild -project
+  ios/app/MyApp.xcodeproj -scheme MyApp -destination 'generic/platform=iOS Simulator' build`).
+  The pre-build phase re-runs `build-ios.sh` automatically if the XCFramework is missing.
+- **Android**: `cd android && ./gradlew :app:assembleDebug`, then install
+  `app/build/outputs/apk/debug/app-debug.apk` on a device/emulator. The `ensureCore` Gradle
+  task re-runs `build-android.sh` automatically if the `.so` files are missing.
 
-# Integration tests
-cargo test --test integration
+Per-platform details, troubleshooting, and artifact reference: `docs/app-projects.md`,
+`docs/support/troubleshooting.md`.
 
-# UI tests (if configured)
-# (TBD)
-```
+## Generated artifacts (never committed)
 
-## Getting Started
+| Artifact | Produced by | Consumed by |
+| --- | --- | --- |
+| `ios/Frameworks/AppCore.xcframework` (arm64 device + simulator slices) | `scripts/build-ios.sh` | `ios/app/MyApp.xcodeproj` |
+| `target/uniffi/ios/app_core.swift` | `scripts/build-ios.sh` | iOS app (Swift) |
+| `android/app/src/main/jniLibs/{arm64-v8a,x86_64}/libapp_core.so` | `scripts/build-android.sh` | `android/app` (packaged into the APK) |
+| `target/uniffi/android/app_core.kt` | `scripts/build-android.sh` | `android/app` (Kotlin) |
+| `target/build-metrics/{ios,android}-last.json` | both scripts | validators, CI metrics report |
 
-### Prerequisites
+Invariant: app projects **never** commit generated code. A fresh clone builds everything from the
+Rust sources; the pre-build phases only regenerate when artifacts are missing.
 
-- **Rust**: Rust toolchain with `cargo`
-- **iOS**: Xcode 14+ with iOS SDK
-- **Android**: Android Studio with Android SDK and NDK
+## Development workflow (OpenSpec)
 
-### Quick Start
+The repository ships with the full specification-driven setup — no `openspec init` needed:
 
-1. **Clone the repository**
-   ```bash
-   git clone https
-   cd app-core-monorepo
-   ```
+- `openspec/specs/` — current specs (`rust-core`, `ios`, `android`, `shared`)
+- `openspec/changes/archive/` — history of implemented changes
+- `.opencode/` — `opsx-*` slash-commands (`/opsx:explore`, `/opsx:propose`, `/opsx:apply`,
+  `/opsx:sync`, `/opsx:archive`, `/opsx:update`)
 
-2. **Build for iOS**
-   ```bash
-   cd app-core-monorepo
-   ./scripts/build-ios.sh
-   ```
+Propose a change, implement its tasks, sync the delta specs, then archive — see
+`openspec/specs/README.md`.
 
-3. **Build for Android**
-   ```bash
-   cd app-core-monorepo
-   ./scripts/build-android.sh
-   ```
+## Continuous integration
 
-4. **Test the Rust core**
-   ```bash
-   cd app-core-monorepo/core
-   cargo test --lib
-   ```
+`.github/workflows/build-validation.yml` runs on push/PR:
 
-## Project Structure
-
-### Core (`core/`)
-- `Cargo.toml`: Rust package configuration
-- `src/lib.rs`: Main library exports
-- `src/domain/`: Domain modules (board, rating)
-
-### iOS (`ios/`)
-- `Frameworks/`: XCFramework containing the Rust core
-- SwiftUI views and views models
-
-### Android (`android/`)
-- `app/`: Android application structure
-- JNI libraries for Rust FFI
-
-### OpenSpec (`openspec/`)
-- `specs/`: All project specifications
-- `changes/`: History of implemented changes
-
-### Build Scripts (`scripts/`)
-- `build-ios.sh`: Build script for iOS
-- `build-android.sh`: Build script for Android
-
-## Contributing
-
-### Development Guidelines
-
-1. **Follow the OpenSpec workflow**: Plan features before implementation
-2. **Maintain code quality**: Write clean, idiomatic Rust and Kotlin/Swift
-3. **Test thoroughly**: Write comprehensive unit and integration tests
-4. **Document changes**: Update OpenSpec specifications as needed
-
-### Pull Request Process
-
-1. Create a feature branch
-2. Implement the feature following the spec
-3. Add tests for the new functionality
-4. Update relevant OpenSpec specifications
-5. Submit a pull request with a clear description
+1. **validate** — runs the three validator scripts (specs, config, scripts, target consistency).
+2. **build-ios** — builds the XCFramework on `macos-latest`.
+3. **build-android** — builds the JNI libraries on `ubuntu-latest` (NDK r27c via
+   `nttld/setup-ndk`).
+4. **quality** — collects `target/build-metrics/*` from both builds and publishes a report artifact.
 
 ## License
 
-This project is licensed under the MIT License. See `LICENSE` for more information.
-
-## Acknowledgments
-
-- **Rust Core**: Built with [Shakmaty](https://github.com/dpc/shakmaty) and [Glicko-2](https://github.com/dmathwin/glicko2)
-- **OpenSpec**: Built with [Fission AI OpenSpec](https://github.com/Fission-AI/OpenSpec)
-- **UI Frameworks**: SwiftUI and Jetpack Compose
-
-## Contact
-
-For questions, suggestions, or contributions, please reach out through the GitHub repository or OpenSpec channels.
-
----
-
-*This project uses OpenSpec for specification-driven development, ensuring coordinated development across all platforms.*
+MIT — see [`LICENSE`](LICENSE).

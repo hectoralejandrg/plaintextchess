@@ -41,7 +41,8 @@ CONFIG_FILE="config/ios-build.yaml"
 [ -f "core/Cargo.toml" ] || fail "core/Cargo.toml not found"
 grep -q "$IOS_TARGET" "$CONFIG_FILE" || fail "target '$IOS_TARGET' is not declared in $CONFIG_FILE"
 
-command -v cargo >/dev/null 2>&1 || fail "cargo not found. Install the Rust toolchain (docs/environment-setup.md)."
+command -v cargo  >/dev/null 2>&1 || fail "cargo not found. Install the Rust toolchain (docs/environment-setup.md)."
+command -v rustup >/dev/null 2>&1 || fail "rustup not found. Install the Rust toolchain (docs/environment-setup.md)."
 
 log "env: BUILD_ENVIRONMENT=$BUILD_ENVIRONMENT BUILD_TYPE=$BUILD_TYPE PLATFORM_TARGET=$PLATFORM_TARGET"
 
