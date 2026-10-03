@@ -15,13 +15,16 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -82,6 +85,30 @@ fun GameScreen() {
             )
             Spacer(Modifier.height(8.dp))
         }
+        // Game controls (add-game-end-dialog D6): secondary actions above the
+        // prominent New game action, with the spec's availability rules.
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = { vm.undo() },
+                enabled = vm.canUndo,
+                modifier = Modifier.weight(1f),
+            ) { Text("Undo") }
+            OutlinedButton(
+                onClick = { vm.resign() },
+                enabled = vm.canResign,
+                modifier = Modifier.weight(1f),
+            ) { Text("Resign") }
+            OutlinedButton(
+                onClick = { vm.flipBoard() },
+                modifier = Modifier.weight(1f),
+            ) { Text("Flip board") }
+        }
+        Spacer(Modifier.height(8.dp))
         Button(
             onClick = { showNewGameSheet = true },
             modifier = Modifier
@@ -96,6 +123,22 @@ fun GameScreen() {
                 onConfirm = { mode ->
                     vm.startGame(mode)
                     showNewGameSheet = false
+                },
+            )
+        }
+        // Game-end dialog (design D1/D2 of add-game-end-dialog): presented
+        // exactly once per game; "Play again" restarts in the same mode and
+        // "Done" just closes the modal.
+        if (vm.showGameEndDialog) {
+            AlertDialog(
+                onDismissRequest = { vm.dismissGameEnd() },
+                title = { Text("Game over") },
+                text = { Text(vm.gameEndMessage ?: "The game is over.") },
+                confirmButton = {
+                    TextButton(onClick = { vm.restart() }) { Text("Play again") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { vm.dismissGameEnd() }) { Text("Done") }
                 },
             )
         }
@@ -196,6 +239,11 @@ private fun StatusRow(vm: GameViewModel) {
             Text("Checkmate! ${status.winner} wins", style = MaterialTheme.typography.titleMedium)
         is GameStatus.Drawn ->
             Text("Game drawn", style = MaterialTheme.typography.titleMedium)
+        is GameStatus.Resigned ->
+            Text(
+                text = if (status.winner == "White") "Black resigns" else "White resigns",
+                style = MaterialTheme.typography.titleMedium,
+            )
         is GameStatus.Failed ->
             Text(
                 text = "Game unavailable",

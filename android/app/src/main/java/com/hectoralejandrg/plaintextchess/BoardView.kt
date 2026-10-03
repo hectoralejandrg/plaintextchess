@@ -71,21 +71,33 @@ private fun pieceRes(piece: String): Int {
 /** The piece mid-slide (design D4): render-only overlay state. */
 private data class MoveSlide(val piece: String, val from: String, val to: String)
 
-/** Board-local center of a square in px. */
-private fun squareCenterPx(name: String, cellPx: Float): Offset {
+/**
+ * Board-local center of a square in px. Board orientation
+ * (add-game-end-dialog D6): 0 = White on the bottom, 180 = board rotated;
+ * the square is placed in its *display* cell.
+ */
+private fun squareCenterPx(name: String, cellPx: Float, orientation: Int): Offset {
     val square = FenBoard.parseSquare(name) ?: return Offset.Zero
-    val (row, col) = square
+    val (aRow, aCol) = square
+    val row = if (orientation == 0) aRow else 7 - aRow
+    val col = if (orientation == 0) aCol else 7 - aCol
     return Offset((col + 0.5f) * cellPx, (row + 0.5f) * cellPx)
 }
 
-/** Square under a board-local point (px); null outside the board. */
-private fun squareAt(point: Offset, cellPx: Float): String? {
+/**
+ * Square under a board-local point (px); null outside the board. The point's
+ * display cell is mapped back to the board square for the orientation
+ * (add-game-end-dialog D6).
+ */
+private fun squareAt(point: Offset, cellPx: Float, orientation: Int): String? {
     if (cellPx <= 0f) return null
     val x = point.x
     val y = point.y
     if (x < 0f || y < 0f || x >= 8f * cellPx || y >= 8f * cellPx) return null
-    val col = (x / cellPx).toInt()
-    val row = (y / cellPx).toInt()
+    val dCol = (x / cellPx).toInt()
+    val dRow = (y / cellPx).toInt()
+    val row = if (orientation == 0) dRow else 7 - dRow
+    val col = if (orientation == 0) dCol else 7 - dCol
     return FenBoard.squareName(row, col)
 }
 
@@ -103,6 +115,10 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
         val cell = maxWidth / 8f
         val density = LocalDensity.current
         val cellPx = with(density) { cell.toPx() }
+
+        // Board orientation (add-game-end-dialog D6): a display preference
+        // owned by the VM; all square<->pixel resolution flows through it.
+        val orientation = vm.boardOrientation
 
         // D3: drag state (design D3): the lifted square + pointer position in
         // board-local px. Pure view-layer state; the lift/drop go through the
@@ -158,7 +174,7 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
         Column(
             Modifier
                 .fillMaxSize()
-                .pointerInput(cellPx) {
+                .pointerInput(cellPx, orientation) {
                     // D3: one container gesture coexisting with the per-square
                     // tap path (the official drag detector built on
                     // awaitEachGesture/awaitFirstDown). A tap (movement under
@@ -167,7 +183,7 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
                     // same drop intent a tap would.
                     detectDragGestures(
                         onDragStart = { start ->
-                            val square = squareAt(start, cellPx)
+                            val square = squareAt(start, cellPx, orientation)
                             if (square != null && vm.canPickup(square)) {
                                 // Same intent as a tap: select the lifted piece.
                                 vm.select(square)
@@ -182,7 +198,7 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
                                 // plays (or opens the promotion picker); an
                                 // illegal one shows "Not a legal move" without
                                 // changing the position.
-                                val dest = dragPos?.let { squareAt(it, cellPx) }
+                                val dest = dragPos?.let { squareAt(it, cellPx, orientation) }
                                 if (dest != null) vm.select(dest)
                             }
                             dragFrom = null
@@ -200,16 +216,22 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
             for (row in 0 until 8) {
                 Row(Modifier.weight(1f).fillMaxWidth()) {
                     for (col in 0 until 8) {
-                        val name = FenBoard.squareName(row, col)
+                        // Display cell (row, col) -> actual square for the
+                        // orientation (add-game-end-dialog D6).
+                        val aRow = if (orientation == 0) row else 7 - row
+                        val aCol = if (orientation == 0) col else 7 - col
+                        val name = FenBoard.squareName(aRow, aCol)
                         // Lifted (D3) or being slid into (D4): show no piece.
                         val hidePiece = name == dragFrom || slide?.to == name
                         SquareCell(
                             vm = vm,
-                            row = row,
-                            col = col,
+                            row = aRow,
+                            col = aCol,
                             cell = cell,
                             modifier = Modifier.weight(1f).fillMaxHeight(),
                             hidePiece = hidePiece,
+                            displayRow = row,
+                            displayCol = col,
                         )
                     }
                 }
@@ -242,8 +264,8 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
         // D4: the sliding piece (the destination square shows no piece while
         // the slide is in flight).
         slide?.let { s ->
-            val fromCenter = squareCenterPx(s.from, cellPx)
-            val toCenter = squareCenterPx(s.to, cellPx)
+            val fromCenter = squareCenterPx(s.from, cellPx, orientation)
+            val toCenter = squareCenterPx(s.to, cellPx, orientation)
             val progress = slideProgress.value
             val center = Offset(
                 fromCenter.x + (toCenter.x - fromCenter.x) * progress,
@@ -284,7 +306,13 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
  */
 @Composable
 private fun PromotionCard(vm: GameViewModel, promo: GameViewModel.PendingPromotion, cell: Dp) {
-    val (row, col) = FenBoard.parseSquare(promo.to) ?: return
+    // Anchor over the destination square in *display* coordinates
+    // (add-game-end-dialog D6); the card keeps its board-interior offset
+    // regardless of the orientation.
+    val (aRow, aCol) = FenBoard.parseSquare(promo.to) ?: return
+    val orientation = vm.boardOrientation
+    val row = if (orientation == 0) aRow else 7 - aRow
+    val col = if (orientation == 0) aCol else 7 - aCol
     // Tap targets must stay >= 48 dp on the smaller phones.
     val base = cell * 0.85f
     val pieceSize = if (base < 48.dp) 48.dp else base
@@ -345,6 +373,8 @@ private fun SquareCell(
     cell: Dp,
     modifier: Modifier,
     hidePiece: Boolean = false,
+    displayRow: Int = row,
+    displayCol: Int = col,
 ) {
     val name = FenBoard.squareName(row, col)
     val piece = vm.board.grid[row][col]
@@ -379,9 +409,11 @@ private fun SquareCell(
             )
         }
         // Coordinates: files along the bottom edge (bottom-left corner),
-        // ranks along the right edge (top-right corner).
+        // ranks along the right edge (top-right corner). The conditions use
+        // the display cell; the labels name the actual square underneath
+        // (add-game-end-dialog D6).
         val labelFont = with(LocalDensity.current) { (cell * 0.20f).toSp() }
-        if (row == 7) {
+        if (displayRow == 7) {
             CoordinateText(
                 text = FILES[col].toString(),
                 fontSize = labelFont,
@@ -389,7 +421,7 @@ private fun SquareCell(
                 modifier = Modifier.align(Alignment.BottomStart).padding(cell * 0.06f),
             )
         }
-        if (col == 7) {
+        if (displayCol == 7) {
             CoordinateText(
                 text = "${8 - row}",
                 fontSize = labelFont,

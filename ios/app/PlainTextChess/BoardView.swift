@@ -91,20 +91,33 @@ struct BoardView: View {
 
     // MARK: - Geometry
 
+    /// Board orientation (add-game-end-dialog D6): 0 = White on the bottom,
+    /// 180 = board rotated. All square↔pixel resolution goes through the two
+    /// mapping functions below, so taps, drags, highlighting, the promotion
+    /// anchor, and the slide animation all follow the orientation for free.
+    private var orientation: Int { vm.boardOrientation }
+
+    /// Display cell of an actual square for the current orientation.
+    private func displayIndex(row: Int, col: Int) -> (row: Int, col: Int) {
+        orientation == 0 ? (row, col) : (7 - row, 7 - col)
+    }
+
     /// Board-local center of a square.
     private func squareCenter(_ name: String, cell: CGFloat) -> CGPoint {
         guard let (row, col) = FenBoard.parseSquare(name) else { return .zero }
-        return CGPoint(x: (CGFloat(col) + 0.5) * cell,
-                       y: (CGFloat(row) + 0.5) * cell)
+        let d = displayIndex(row: row, col: col)
+        return CGPoint(x: (CGFloat(d.col) + 0.5) * cell,
+                       y: (CGFloat(d.row) + 0.5) * cell)
     }
 
     /// Square under a board-local point; nil outside the board.
     private func squareName(at point: CGPoint, cell: CGFloat) -> String? {
         guard cell > 0 else { return nil }
-        let col = Int(point.x / cell)
-        let row = Int(point.y / cell)
-        guard (0..<8).contains(row), (0..<8).contains(col) else { return nil }
-        return FenBoard.squareName(row: row, col: col)
+        let dCol = Int(point.x / cell)
+        let dRow = Int(point.y / cell)
+        guard (0..<8).contains(dRow), (0..<8).contains(dCol) else { return nil }
+        let a = orientation == 0 ? (dRow, dCol) : (7 - dRow, 7 - dCol)
+        return FenBoard.squareName(row: a.0, col: a.1)
     }
 
     // MARK: - Grid
@@ -123,10 +136,14 @@ struct BoardView: View {
 
     // MARK: - Squares
 
+    /// Renders the display cell `(row, col)`; the actual square (board
+    /// coordinates) is derived from the orientation (add-game-end-dialog D6).
     private func square(row: Int, col: Int, size: CGFloat) -> some View {
-        let name = FenBoard.squareName(row: row, col: col)
-        let piece = vm.board.grid[row][col]
-        let isLight = (row + col).isMultiple(of: 2)
+        let aRow = orientation == 0 ? row : 7 - row
+        let aCol = orientation == 0 ? col : 7 - col
+        let name = FenBoard.squareName(row: aRow, col: aCol)
+        let piece = vm.board.grid[aRow][aCol]
+        let isLight = (aRow + aCol).isMultiple(of: 2)
         let isSelected = vm.selectedSquare == name
         let isLegalTarget = vm.legalTargets.contains(name)
         let isLastMove = vm.lastMove?.from == name || vm.lastMove?.to == name
@@ -157,18 +174,20 @@ struct BoardView: View {
         )
         .frame(width: size, height: size)
         .overlay(alignment: .bottomLeading) {
-            // Files along the bottom edge (bottom-left corner).
+            // Files along the bottom edge (bottom-left corner): the display
+            // row 7 shows the actual file of the square underneath it.
             if row == 7 {
-                Text(String(files[col]))
+                Text(String(files[aCol]))
                     .font(font)
                     .foregroundColor(labelColor(isLight))
                     .padding(inset)
             }
         }
         .overlay(alignment: .topTrailing) {
-            // Ranks along the right edge (top-right corner).
+            // Ranks along the right edge (top-right corner): the display
+            // column 7 shows the actual rank of the square underneath it.
             if col == 7 {
-                Text("\(8 - row)")
+                Text("\(8 - aRow)")
                     .font(font)
                     .foregroundColor(labelColor(isLight))
                     .padding(inset)
@@ -254,18 +273,21 @@ struct BoardView: View {
     @ViewBuilder
     private func promotionOverlay(cell: CGFloat) -> some View {
         if let promo = vm.pendingPromotion,
-           let (row, col) = FenBoard.parseSquare(promo.to) {
+           let (aRow, aCol) = FenBoard.parseSquare(promo.to) {
             let pieceSize = cell * 0.85
             let pad = cell * 0.12
             let cardW = pieceSize + 2 * pad
             let cardH = pieceSize * 4 + 2 * pad
-            // Offset into the board interior: white promotes on the top row
-            // (card hangs below), black on the bottom row (card rises above).
-            let x = min(max(CGFloat(col) * cell + (cell - cardW) / 2, 0),
+            // Anchor over the destination square in display coordinates
+            // (add-game-end-dialog D6); offset into the board interior: the
+            // bottom display row gets the card above, the top row below.
+            let dRow = orientation == 0 ? aRow : 7 - aRow
+            let dCol = orientation == 0 ? aCol : 7 - aCol
+            let x = min(max(CGFloat(dCol) * cell + (cell - cardW) / 2, 0),
                         8 * cell - cardW)
-            let y: CGFloat = row == 7
-                ? CGFloat(row) * cell - cardH + cell * 0.35
-                : CGFloat(row) * cell + cell * 0.65
+            let y: CGFloat = dRow == 7
+                ? CGFloat(dRow) * cell - cardH + cell * 0.35
+                : CGFloat(dRow) * cell + cell * 0.65
 
             ZStack(alignment: .topLeading) {
                 // Any tap on the board outside the card cancels (D2).

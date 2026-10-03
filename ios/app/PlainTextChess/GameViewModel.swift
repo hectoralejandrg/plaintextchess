@@ -7,6 +7,9 @@ enum GameStatus: Equatable {
     case playing(toMove: String, inCheck: Bool)
     case checkmated(winner: String)
     case drawn
+    /// App-level terminal state (design D4 of add-game-end-dialog): the
+    /// resigner is the losing side, `winner` the opponent.
+    case resigned(winner: String)
     case failed(String)
 }
 
@@ -82,6 +85,15 @@ final class GameViewModel: ObservableObject {
     /// is locked and the status row shows "CPU is thinking…".
     @Published private(set) var cpuThinking = false
 
+    /// Game-end dialog visibility (design D2 of add-game-end-dialog): the VM
+    /// owns the presentation so the "appears once" rule has no view-layer
+    /// race. `ContentView` binds the alert to this flag.
+    @Published var showGameEndDialog = false
+    /// Board orientation (design D6 of add-game-end-dialog): 0 = White on the
+    /// bottom, 180 = board rotated. A display preference: it persists across
+    /// new games in the session and is never reset by `startGame`.
+    @Published private(set) var boardOrientation = 0
+
     private var session: GameSession
     /// Full UCI moves of the currently selected piece (design D1): the
     /// 5-character ones are the promotion options.
@@ -97,6 +109,12 @@ final class GameViewModel: ObservableObject {
     /// Bumped on every `startGame` so an in-flight CPU move from an older game
     /// is discarded instead of applied (design D5).
     private var cpuGeneration = 0
+
+    /// Game-end dialog bookkeeping (design D2 of add-game-end-dialog): the
+    /// modal is presented once per game and never re-presented after the
+    /// player dismisses it; `startGame` resets both flags.
+    private var gameEndPresented = false
+    private var gameEndDismissed = false
 
     #if DEBUG
     /// DEBUG test hook (like `ANIM_SCALE`/`DRAG`): seconds to hold the
@@ -214,6 +232,10 @@ final class GameViewModel: ObservableObject {
         gameMode = mode
         cpuGeneration += 1
         cpuThinking = false
+        // Game-end dialog: a fresh game gets a fresh dialog (design D2).
+        gameEndPresented = false
+        gameEndDismissed = false
+        showGameEndDialog = false
         session = newGameSession(initialRating: 1500.0)
         toMove = "w"
         clearSelection()
@@ -235,6 +257,133 @@ final class GameViewModel: ObservableObject {
     /// action and the DEBUG `newgame` script token use (design D4).
     func newGame() {
         startGame(.twoPlayers)
+    }
+
+    // MARK: - Game-end dialog (design D2/D3 of add-game-end-dialog)
+
+    /// The result message for the game-end modal (design D3), or `nil` while
+    /// the game is not terminal. Computed from `status` + `gameMode` so it can
+    /// never desynchronize from the status.
+    var gameEndMessage: String? {
+        switch status {
+        case .checkmated(let winner):
+            if case .cpu = gameMode {
+                return winner == "White" ? "Checkmate! You won!" : "Checkmate! You lost."
+            }
+            return "Checkmate! \(winner) wins."
+        case .resigned(let winner):
+            if case .cpu = gameMode {
+                // Only the human resigns against the CPU (design D4/D6 of
+                // add-cpu-opponent: the human is White).
+                return "You resigned. You lost."
+            }
+            let loser = winner == "White" ? "Black" : "White"
+            return "\(loser) resigns. \(winner) wins."
+        case .drawn:
+            return "The game is drawn."
+        default:
+            return nil
+        }
+    }
+
+    /// "Play again" in the game-end dialog (design D2): a fresh game in the
+    /// current mode (and CPU difficulty).
+    func restart() {
+        startGame(gameMode)
+    }
+
+    /// "Done" in the game-end dialog (design D2): close the modal without
+    /// changing the game. The status line keeps showing the result.
+    func dismissGameEnd() {
+        gameEndDismissed = true
+        showGameEndDialog = false
+    }
+
+    // MARK: - Resign / undo / flip (design D4/D5/D6 of add-game-end-dialog)
+
+    /// Whether the game can be resigned or undone right now.
+    var canResign: Bool {
+        if case .playing = status { return true }
+        return false
+    }
+
+    var canUndo: Bool {
+        guard !moveList.isEmpty else { return false }
+        guard case .playing = status else { return false }
+        return true
+    }
+
+    /// Resign the current game (design D4): an app-level terminal state. In a
+    /// two-player game the side to move resigns; against the CPU the human
+    /// (White) resigns. Bumping the generation discards an in-flight CPU move
+    /// (same mechanism as `startGame`, design D5 of add-cpu-opponent).
+    func resign() {
+        guard case .playing = status else { return }
+        cpuGeneration += 1
+        cpuThinking = false
+        clearSelection()
+        lastMove = nil
+        let winner: String
+        switch gameMode {
+        case .twoPlayers:
+            winner = toMove == "w" ? "Black" : "White"
+        case .cpu:
+            winner = "Black"
+        }
+        status = .resigned(winner: winner)
+        errorMessage = nil
+        markTerminalIfNeeded()
+    }
+
+    /// Take back the last move (design D5): the core has no undo, so a fresh
+    /// session is replayed with the kept UCI moves. Two players: one ply; CPU:
+    /// the last pair so it is the human's turn again (one ply when the CPU is
+    /// still thinking its reply, which the generation bump discards).
+    func undo() {
+        guard canUndo else { return }
+        let kept: [String]
+        if case .cpu = gameMode {
+            // Even count: the CPU already replied → take the whole pair back.
+            kept = moveList.count.isMultiple(of: 2)
+                ? Array(moveList.dropLast(2))
+                : Array(moveList.dropLast(1))
+        } else {
+            kept = Array(moveList.dropLast(1))
+        }
+        // Discard any in-flight CPU move (design D5 generation guard).
+        cpuGeneration += 1
+        cpuThinking = false
+        do {
+            let rebuilt = newGameSession(initialRating: 1500.0)
+            var side = "w"
+            for uci in kept {
+                try rebuilt.playMove(uciMove: uci)
+                side = side == "w" ? "b" : "w"
+            }
+            // Replay succeeded: commit the rebuilt session and bookkeeping.
+            // (On failure nothing above touched the live state.)
+            session = rebuilt
+            toMove = side
+            moveList = kept
+            clearSelection()
+            if let lastUci = kept.last {
+                // 5-char promotion UCIs included: destination is chars 2-3.
+                lastMove = LastMove(from: String(lastUci.prefix(2)),
+                                    to: String(lastUci.dropFirst(2).prefix(2)))
+            } else {
+                lastMove = nil
+            }
+            board = try FenBoard(board: rebuilt.getBoardState(), sideToMove: toMove)
+            refreshStatus()
+        } catch {
+            errorMessage = "Undo failed: \(error)"
+        }
+    }
+
+    /// Flip the board orientation (design D6): 0 = White on the bottom,
+    /// 180 = rotated. Display-only: the game state is untouched.
+    func flipBoard() {
+        boardOrientation = boardOrientation == 0 ? 180 : 0
     }
 
     // MARK: - Internals
@@ -349,9 +498,23 @@ final class GameViewModel: ObservableObject {
                 status = .playing(toMove: board.sideToMove, inCheck: false)
             }
             errorMessage = nil
+            markTerminalIfNeeded()
         } catch {
             status = .failed("\(error)")
             errorMessage = "FFI error: \(error)"
+        }
+    }
+
+    /// Design D2 of add-game-end-dialog: present the game-end dialog exactly
+    /// once, the first time the game becomes terminal.
+    private func markTerminalIfNeeded() {
+        guard !gameEndPresented else { return }
+        switch status {
+        case .checkmated, .drawn, .resigned:
+            gameEndPresented = true
+            showGameEndDialog = true
+        default:
+            break
         }
     }
 
@@ -386,6 +549,17 @@ final class GameViewModel: ObservableObject {
                 // Exercises the same intent the picker's outside-tap catcher
                 // calls (design D5).
                 self.cancelPromotion()
+            } else if token == "undo" || token == "resign" || token == "flip"
+                || token == "done" || token == "playagain" {
+                // add-game-end-dialog: drive the new controls and the game-end
+                // dialog through the same intent path the buttons call.
+                switch token {
+                case "undo": self.undo()
+                case "resign": self.resign()
+                case "flip": self.flipBoard()
+                case "done": self.dismissGameEnd()
+                default: self.restart()
+                }
             } else if case .playing = self.status {
                 // Drive the same intent path as a real user: select the
                 // origin, then the destination. An illegal destination

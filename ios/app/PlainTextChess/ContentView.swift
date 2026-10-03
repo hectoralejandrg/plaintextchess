@@ -27,12 +27,17 @@ struct ContentView: View {
     private let debugMode: GameMode
     /// DEBUG: seconds to hold the CPU "thinking" state (test hook for 2.2c).
     private let debugCpuDelay: Double
+    /// DEBUG: seconds between script tokens (add-game-end-dialog D7): default
+    /// 0.5 s; `-PLAINTCHESS_SCRIPT_INTERVAL` widens it so CPU-mode scripts
+    /// wait out CPU replies instead of racing the `cpuThinking` guard.
+    private let debugScriptInterval: Double
 
     init() {
         var animScale = 1.0
         var drag: DragTest?
         var mode: GameMode = .twoPlayers
         var cpuDelay = 0.0
+        var scriptInterval = 0.5
         #if DEBUG
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "-PLAINTCHESS_ANIM_SCALE"),
@@ -58,11 +63,16 @@ struct ContentView: View {
             }
             mode = .cpu(level)
         }
+        if let i = args.firstIndex(of: "-PLAINTCHESS_SCRIPT_INTERVAL"),
+           i + 1 < args.count, let s = Double(args[i + 1]), s > 0 {
+            scriptInterval = s
+        }
         #endif
         debugAnimScale = animScale
         debugDrag = drag
         debugMode = mode
         debugCpuDelay = cpuDelay
+        debugScriptInterval = scriptInterval
     }
 
     var body: some View {
@@ -130,6 +140,9 @@ struct ContentView: View {
                 case .drawn:
                     Text("Game drawn")
                         .font(.headline)
+                case .resigned(let winner):
+                    Text((winner == "White" ? "Black" : "White") + " resigns")
+                        .font(.headline)
                 case .failed:
                     Text("Game unavailable")
                         .font(.headline)
@@ -182,11 +195,39 @@ struct ContentView: View {
                 .font(.footnote)
                 .foregroundColor(.red)
         }
+        // Game controls (add-game-end-dialog D6): secondary actions above the
+        // prominent New game action, with the spec's availability rules.
+        HStack(spacing: 8) {
+            Button(action: { vm.undo() }) {
+                Label("Undo", systemImage: "arrow.uturn.backward")
+                    .frame(maxWidth: .infinity)
+            }
+            .disabled(!vm.canUndo)
+
+            Button(action: { vm.resign() }) {
+                Label("Resign", systemImage: "flag")
+                    .frame(maxWidth: .infinity)
+            }
+            .disabled(!vm.canResign)
+
+            Button(action: { vm.flipBoard() }) {
+                Label("Flip board", systemImage: "arrow.up.arrow.down")
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .buttonStyle(.bordered)
+
         Button(action: { showNewGameSheet = true }) {
             Label("New game", systemImage: "arrow.counterclockwise")
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
+        .alert("Game over", isPresented: $vm.showGameEndDialog) {
+            Button("Play again") { vm.restart() }
+            Button("Done", role: .cancel) { vm.dismissGameEnd() }
+        } message: {
+            Text(vm.gameEndMessage ?? "The game is over.")
+        }
     }
 
 #if DEBUG
@@ -199,7 +240,7 @@ struct ContentView: View {
             index + 1 < args.count
         else { return }
         let moves = args[index + 1].split(separator: " ").map { String($0) }
-        vm.playScript(moves)
+        vm.playScript(moves, interval: debugScriptInterval)
     }
 #endif
 }

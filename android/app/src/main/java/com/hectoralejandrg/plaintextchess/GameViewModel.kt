@@ -18,6 +18,9 @@ sealed class GameStatus {
     data class Playing(val toMove: String, val inCheck: Boolean) : GameStatus()
     data class Checkmated(val winner: String) : GameStatus()
     object Drawn : GameStatus()
+    /** App-level terminal state (design D4 of add-game-end-dialog): the
+     * resigner is the losing side, `winner` the opponent. */
+    data class Resigned(val winner: String) : GameStatus()
     data class Failed(val message: String) : GameStatus()
 }
 
@@ -80,6 +83,17 @@ class GameViewModel {
     var cpuThinking by mutableStateOf(false)
         private set
 
+    /** Game-end dialog visibility (design D2 of add-game-end-dialog): the VM
+     * owns the presentation so the "appears once" rule has no view-layer race. */
+    var showGameEndDialog by mutableStateOf(false)
+        private set
+
+    /** Board orientation (design D6 of add-game-end-dialog): 0 = White on the
+     * bottom, 180 = board rotated. A display preference: it persists across
+     * new games in the session and is never reset by [startGame]. */
+    var boardOrientation by mutableStateOf(0)
+        private set
+
     private var session: GameSession = newGameSession(initialRating = 1500.0)
 
     /** Side to move, tracked locally (the core's board state is position-only). */
@@ -100,6 +114,12 @@ class GameViewModel {
     /** Bumped on every [startGame] so an in-flight CPU move from an older game
      * is discarded instead of applied (design D5). */
     private var cpuGeneration = 0
+
+    /** Game-end dialog bookkeeping (design D2 of add-game-end-dialog): the
+     * modal is presented once per game and never re-presented after the
+     * player dismisses it; [startGame] resets both flags. */
+    private var gameEndPresented = false
+    private var gameEndDismissed = false
 
     /**
      * VM-scoped coroutine context standing in for `viewModelScope` (the view
@@ -218,6 +238,10 @@ class GameViewModel {
         gameMode = mode
         cpuGeneration += 1
         cpuThinking = false
+        // Game-end dialog: a fresh game gets a fresh dialog (design D2).
+        gameEndPresented = false
+        gameEndDismissed = false
+        showGameEndDialog = false
         session = newGameSession(initialRating = 1500.0)
         toMove = "w"
         clearSelection()
@@ -239,6 +263,125 @@ class GameViewModel {
     fun newGame() {
         startGame(GameMode.TwoPlayers)
     }
+
+    // region Game-end dialog (design D2/D3 of add-game-end-dialog)
+
+    /**
+     * The result message for the game-end modal (design D3), or `null` while
+     * the game is not terminal. Computed from [status] + [gameMode] so it can
+     * never desynchronize from the status.
+     */
+    val gameEndMessage: String?
+        get() = when (val s = status) {
+            is GameStatus.Checkmated ->
+                if (gameMode is GameMode.Cpu)
+                    if (s.winner == "White") "Checkmate! You won!"
+                    else "Checkmate! You lost."
+                else "Checkmate! ${s.winner} wins."
+            is GameStatus.Resigned ->
+                if (gameMode is GameMode.Cpu) {
+                    // Only the human resigns against the CPU (the human is
+                    // White, design D6 of add-cpu-opponent).
+                    "You resigned. You lost."
+                } else {
+                    val loser = if (s.winner == "White") "Black" else "White"
+                    "$loser resigns. ${s.winner} wins."
+                }
+            is GameStatus.Drawn -> "The game is drawn."
+            else -> null
+        }
+
+    /** "Play again" in the game-end dialog (design D2): a fresh game in the
+     * current mode (and CPU difficulty). */
+    fun restart() {
+        startGame(gameMode)
+    }
+
+    /** "Done" in the game-end dialog (design D2): close the modal without
+     * changing the game. The status line keeps showing the result. */
+    fun dismissGameEnd() {
+        gameEndDismissed = true
+        showGameEndDialog = false
+    }
+
+    // endregion
+
+    // region Resign / undo / flip (design D4/D5/D6 of add-game-end-dialog)
+
+    /** Whether the game can be resigned or undone right now. */
+    val canResign: Boolean
+        get() = status is GameStatus.Playing
+
+    val canUndo: Boolean
+        get() = moveList.isNotEmpty() && status is GameStatus.Playing
+
+    /**
+     * Resign the current game (design D4): an app-level terminal state. In a
+     * two-player game the side to move resigns; against the CPU the human
+     * (White) resigns. Bumping the generation discards an in-flight CPU move
+     * (same mechanism as [startGame], design D5 of add-cpu-opponent).
+     */
+    fun resign() {
+        val current = status
+        if (current !is GameStatus.Playing) return
+        cpuGeneration += 1
+        cpuThinking = false
+        clearSelection()
+        lastMove = null
+        val winner = when (gameMode) {
+            is GameMode.TwoPlayers -> if (toMove == "w") "Black" else "White"
+            is GameMode.Cpu -> "Black"
+        }
+        status = GameStatus.Resigned(winner)
+        errorMessage = null
+        markTerminalIfNeeded()
+    }
+
+    /**
+     * Take back the last move (design D5): the core has no undo, so a fresh
+     * session is replayed with the kept UCI moves. Two players: one ply; CPU:
+     * the last pair so it is the human's turn again (one ply when the CPU is
+     * still thinking its reply, which the generation bump discards).
+     */
+    fun undo() {
+        if (!canUndo) return
+        val kept =
+            if (gameMode is GameMode.Cpu && moveList.size % 2 == 0) moveList.drop(2)
+            else moveList.dropLast(1)
+        // Discard any in-flight CPU move (design D5 generation guard).
+        cpuGeneration += 1
+        cpuThinking = false
+        try {
+            val rebuilt = newGameSession(initialRating = 1500.0)
+            var side = "w"
+            for (uci in kept) {
+                rebuilt.playMove(uciMove = uci)
+                side = if (side == "w") "b" else "w"
+            }
+            // Replay succeeded: commit the rebuilt session and bookkeeping.
+            // (On failure nothing above touched the live state.)
+            session = rebuilt
+            toMove = side
+            moveList = kept
+            clearSelection()
+            val last = kept.lastOrNull()
+            lastMove = if (last != null) LastMove(last.take(2), last.drop(2).take(2)) else null
+            board = FenBoard.parse(rebuilt.getBoardState(), toMove)
+            refreshStatus()
+        } catch (e: Throwable) {
+            errorMessage = "Undo failed: ${describe(e)}"
+        }
+    }
+
+    /**
+     * Flip the board orientation (design D6): 0 = White on the bottom,
+     * 180 = rotated. Display-only: the game state is untouched.
+     */
+    fun flipBoard() {
+        boardOrientation = if (boardOrientation == 0) 180 else 0
+    }
+
+    // endregion
 
     /**
      * D1: promotions are the 5-character UCI moves. Group them by
@@ -332,9 +475,21 @@ class GameViewModel {
                 else -> GameStatus.Playing(board.sideToMove, inCheck = false)
             }
             errorMessage = null
+            markTerminalIfNeeded()
         } catch (e: Throwable) {
             status = GameStatus.Failed(describe(e))
             errorMessage = "FFI error: ${describe(e)}"
+        }
+    }
+
+    /** Design D2 of add-game-end-dialog: present the game-end dialog exactly
+     * once, the first time the game becomes terminal. */
+    private fun markTerminalIfNeeded() {
+        if (gameEndPresented) return
+        val s = status
+        if (s is GameStatus.Checkmated || s is GameStatus.Drawn || s is GameStatus.Resigned) {
+            gameEndPresented = true
+            showGameEndDialog = true
         }
     }
 
