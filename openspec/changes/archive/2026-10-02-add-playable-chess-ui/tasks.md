@@ -22,4 +22,4 @@
 
 - [x] 3.1 Run the same scripted game (1.e4 e5 2.Nf3 Nc6 3.Bb5 a6 4.Ba4 Nf6 5.O-O Be7, including the capture-free castle) on both platforms and verify both move lists are identical (UCI strings, same order)
 - [x] 3.2 Clean-rebuild from scratch: delete `ios/Frameworks/`, `android/app/src/main/jniLibs/`, `target/uniffi/`, run `./scripts/build-ios.sh` and `./scripts/build-android.sh`, build both apps, then run all three `tests/validate-*.sh` scripts; verify every command exits 0 and all validators print ALL CHECKS PASSED
-- [ ] 3.3 Commit the change work and push to `origin main` (repo `plaintextchess`); verify the `build-validation` Actions run goes green (validate, build-ios, build-android, quality jobs)
+- [x] 3.3 Commit the change work and push to `origin main` (repo `plaintextchess`); verify the `build-validation` Actions run goes green (validate, build-ios, build-android, quality jobs)
