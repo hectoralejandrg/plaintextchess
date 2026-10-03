@@ -1,57 +1,131 @@
 import SwiftUI
 
-/// Placeholder screen that proves the ChessCore FFI surface works in-app:
-/// it creates a game session through the UniFFI Swift bindings and shows
-/// the initial board state (FEN) and the starting player rating.
+/// Playable two-player chess game screen (milestone 1).
+///
+/// Replaces the placeholder screen: status row, 8x8 board, move list and
+/// controls. All game state comes from the view model, which is backed by
+/// the Rust core through the UniFFI Swift bindings.
 struct ContentView: View {
-    @State private var boardState: String?
-    @State private var rating: Double?
-    @State private var errorMessage: String?
+    @StateObject private var vm = GameViewModel()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             Text("PlainTextChess")
                 .font(.largeTitle.bold())
+                .padding(.horizontal)
 
-            if let boardState, let rating {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Board state (FEN)")
-                        .font(.headline)
-                    Text(boardState)
-                        .font(.system(.body, design: .monospaced))
-                        .textSelection(.enabled)
+            statusRow
+                .padding(.horizontal)
 
-                    HStack(spacing: 8) {
-                        Text("Player rating")
-                            .font(.headline)
-                        Text(String(format: "%.1f", rating))
-                            .font(.title2)
-                    }
-                }
-            } else if let errorMessage {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("FFI error")
+            BoardView(vm: vm)
+                .frame(maxWidth: .infinity)
+
+            moveList
+                .padding(.horizontal)
+
+            controls
+                .padding(.horizontal)
+        }
+        .padding(.vertical)
+        .onAppear {
+            #if DEBUG
+            startDebugScriptIfNeeded()
+            #endif
+        }
+    }
+
+    // MARK: - Status row
+
+    @ViewBuilder
+    private var statusRow: some View {
+        HStack(spacing: 8) {
+            switch vm.status {
+            case .starting:
+                Text("Creating session…")
+                    .font(.headline)
+            case .playing(let toMove, let inCheck):
+                Text(toMove == "w" ? "White to move" : "Black to move")
+                    .font(.headline)
+                if inCheck {
+                    Text("— Check!")
                         .font(.headline)
-                        .foregroundStyle(.red)
-                    Text(errorMessage)
+                        .foregroundColor(.red)
                 }
-            } else {
-                ProgressView("Creating session…")
+            case .checkmated(let winner):
+                Text("Checkmate! \(winner) wins")
+                    .font(.headline)
+            case .drawn:
+                Text("Game drawn")
+                    .font(.headline)
+            case .failed:
+                Text("Game unavailable")
+                    .font(.headline)
+                    .foregroundColor(.red)
             }
-
             Spacer()
         }
-        .padding()
-        .onAppear(perform: loadSession)
     }
 
-    private func loadSession() {
-        do {
-            let session = newGameSession(initialRating: 1500.0)
-            boardState = try session.getBoardState()
-            rating = try session.getCurrentRating()
-        } catch {
-            errorMessage = "\(error)"
+    // MARK: - Move list (design D5: UCI strings as returned by the core)
+
+    @ViewBuilder
+    private var moveList: some View {
+        if vm.moveList.isEmpty {
+            Text("No moves yet")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        } else {
+            ScrollView {
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), alignment: .leading),
+                        GridItem(.flexible(), alignment: .leading),
+                    ],
+                    spacing: 4
+                ) {
+                    ForEach(Array(vm.moveList.enumerated()), id: \.offset) { index, uci in
+                        HStack(spacing: 4) {
+                            if index.isMultiple(of: 2) {
+                                Text("\(index / 2 + 1).")
+                                    .font(.caption.monospacedDigit())
+                            }
+                            Text(uci)
+                                .font(.caption.monospaced())
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 120)
         }
     }
+
+    // MARK: - Controls
+
+    @ViewBuilder
+    private var controls: some View {
+        if let error = vm.errorMessage {
+            Text(error)
+                .font(.footnote)
+                .foregroundColor(.red)
+        }
+        Button(action: { vm.newGame() }) {
+            Label("New game", systemImage: "arrow.counterclockwise")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+    }
+
+#if DEBUG
+    /// Test hook: `xcrun simctl launch <sim> <bundle> -PLAINTCHESS_SCRIPT "e2e4 e7e5"`
+    /// plays the scripted sequence through the view model for smoke testing.
+    private func startDebugScriptIfNeeded() {
+        let args = ProcessInfo.processInfo.arguments
+        guard
+            let index = args.firstIndex(of: "-PLAINTCHESS_SCRIPT"),
+            index + 1 < args.count
+        else { return }
+        let moves = args[index + 1].split(separator: " ").map { String($0) }
+        vm.playScript(moves)
+    }
+#endif
 }

@@ -1,9 +1,10 @@
 # App Projects (iOS + Android)
 
-The `ios/app` and `android/app` projects are **placeholder scaffolds**: each one
-instantiates a `GameSession` through the platform UniFFI bindings and displays
-the initial board state (FEN) plus the player's starting rating. Errors surface
-in the UI instead of crashing. A playable game UI is a follow-up.
+The `ios/app` and `android/app` projects host the PlainTextChess game screens.
+Both apps are playable local two-player chess games. Each app instantiates a
+`GameSession` through the platform UniFFI bindings and renders the board from
+the core's state; all chess rules stay in the Rust core (shakmaty). Errors
+surface in the UI instead of crashing.
 
 Both apps consume artifacts produced by the shared build scripts — **never
 commit generated code** (`target/uniffi/**`, `ios/Frameworks/**`, and
@@ -51,9 +52,16 @@ xcrun simctl install <SIMUDID> \
     ~/Library/Developer/Xcode/DerivedData/PlainTextChess-*/Build/Products/Debug-iphonesimulator/PlainTextChess.app
 xcrun simctl launch <SIMUDID> com.hectoralejandrg.plaintextchess
 
-# 4) Optional: screenshot to verify the placeholder screen.
+# 4) Optional: screenshot to verify the game screen.
 xcrun simctl io <SIMUDID> screenshot /tmp/ios-screen.png
 ```
+
+The iOS screen is a local two-player game: an 8×8 board rendered from the
+core's board state, tap a piece to highlight its legal destinations (asked to
+the core via `get_valid_moves`), tap a highlighted square to play the move
+(`play_move`), plus a status row (to move / check / checkmate / draw), the
+move list in UCI notation, and a **New game** action that starts a fresh
+session.
 
 Notes:
 
@@ -68,6 +76,10 @@ Notes:
   simulators. Intel Macs (x86_64 simulators) are not supported yet.
 - Deployment target is 15.0 — Xcode 27 rejects `IPHONEOS_DEPLOYMENT_TARGET`
   below 15.0.
+- `DEBUG` builds accept a launch-argument script that drives moves through the
+  same intent path as taps, e.g.
+  `xcrun simctl launch <SIMUDID> com.hectoralejandrg.plaintextchess -PLAINTCHESS_SCRIPT "e2e4 e7e5"`;
+  the token `newgame` triggers the New game action.
 
 ## 3. Android app
 
@@ -91,6 +103,12 @@ adb shell pidof com.hectoralejandrg.plaintextchess      # process still alive af
 adb logcat -d | grep -iE 'UnsatisfiedLink|FATAL'   # expect no matches
 adb exec-out screencap -p > /tmp/android-screen.png
 ```
+
+The Android screen mirrors iOS: an 8×8 board rendered from the core's board
+state, tap-to-select a piece with core-driven legal-move targets, a status row
+(to move / check / checkmate / draw), the UCI move list and a **New game**
+action. Verified by driving real taps on the emulator (`adb shell input tap`,
+with coordinates read from `adb shell uiautomator dump`).
 
 Notes:
 

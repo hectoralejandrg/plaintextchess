@@ -33,20 +33,27 @@ See proposal.md for motivation. State relevant to the approach:
 
 ## Decisions
 
-### D1 — Board rendering: Unicode chess glyphs, not image assets
-Render pieces as text glyphs (`♜♞♝♛♚♟` black, `♔♕♖♗♘♙` white) inside each
-square. **Why:** zero asset pipeline (no image catalogs on two platforms, no
-tinting logic), scales crisply, trivially consistent between SwiftUI and
-Compose, and ships this milestone in days instead of weeks.
-**Alternatives:** 32 vector assets per platform (heavy asset work, wrong
-cost for milestone 1); a third-party chess UI library (violates the
-self-contained/no-new-dependencies convention).
+### D1 — Board rendering: bundled "cburnett" vector piece set
+Render pieces with the classic **cburnett** chess set (the lichess default),
+shipped as vector assets: SVG image sets in the iOS asset catalog and
+VectorDrawable resources on Android. **Why:** identical, high-quality pieces
+on both platforms, independent of the system font (Unicode glyphs render
+differently on Apple vs. Android fonts, and the "white" glyphs are hollow).
+**Trade-off:** 12 assets per platform plus a CC BY-SA 3.0 attribution (see
+`assets/chess-pieces/README.md`); the artwork is licensed separately from the
+repo's MIT code.
+**Alternatives:** Unicode glyphs (font-dependent and inconsistent across
+platforms — rejected after visual review); a third-party chess UI library
+(violates the self-contained/no-new-dependencies convention).
 
-### D2 — FEN string is the app-side source of truth
-After every successful move the view model stores `boardState` (FEN) returned
+### D2 — Board state is the app-side source of truth
+After every successful move the view model stores the board string returned
 by `get_board_state()` and parses it into an 8×8 piece map for rendering. The
-player to move is derived from FEN field 2 (w/b). Legality is never computed
-in the app — it is always asked to the core via `get_valid_moves`.
+core's board state carries the 8-rank position only (no FEN side-to-move
+field), so the side to move is tracked by the view model: it starts at "w"
+for every new session and flips after each successful move (the app is the
+session's sole operator in milestone 1). Legality is never computed in the
+app — it is always asked to the core via `get_valid_moves`.
 **Why:** the core (shakmaty) is authoritative; a duplicated app-side board
 model risks diverging from it. Parsing FEN for display is a few lines and is
 defensive (malformed FEN → error UI, same as any FFI failure).
@@ -87,11 +94,15 @@ mechanism, so polling after each mutation is the only option; the cost is
 three cheap calls.
 
 ### D7 — Layout
-Both platforms: status row (player to move + check flag) above a square
-board, move list below, New game action. Board is an 8×8 grid of squares
-(SwiftUI nested stacks / Compose 8 rows of 8 squares), squares sized from
-available width; monochrome board colors with a light/dark square pair and
-high-contrast selection markers.
+Both platforms: status row (player to move + check flag) above the board,
+move list below, New game action. The board fills the available width
+edge-to-edge (no side padding): a plain 8×8 grid of squares (SwiftUI nested
+stacks / Compose 8 rows of 8 squares) with **no extra row or column**.
+Coordinates are drawn *inside* the edge squares — files `a–h` along the
+bottom edge anchored to the bottom-left corner, ranks `8–1` along the right
+edge anchored to the top-right corner — colored for contrast against the
+square. Squares use the lichess-style brown pair (light `#F0D9B5` / dark
+`#B58863`) with high-contrast selection markers.
 
 ## Risks / Trade-offs
 

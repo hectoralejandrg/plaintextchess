@@ -11,6 +11,10 @@
 		AA0000000000000000000018 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000014 /* ContentView.swift */; };
 		AA0000000000000000000019 /* chess_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000015 /* chess_core.swift */; };
 		AA000000000000000000001A /* ChessCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000016 /* ChessCore.xcframework */; };
+		AA0000000000000000000024 /* FenBoard.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000021 /* FenBoard.swift */; };
+		AA0000000000000000000025 /* GameViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000022 /* GameViewModel.swift */; };
+		AA0000000000000000000026 /* BoardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000023 /* BoardView.swift */; };
+		AA0000000000000000000028 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000027 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -21,6 +25,10 @@
 		AA0000000000000000000016 /* ChessCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ChessCore.xcframework; sourceTree = "<group>"; };
 		AA000000000000000000001B /* chess_coreFFI.modulemap */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.module-map"; path = chess_coreFFI.modulemap; sourceTree = "<group>"; };
 		AA000000000000000000001C /* chess_coreFFI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = chess_coreFFI.h; sourceTree = "<group>"; };
+		AA0000000000000000000021 /* FenBoard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FenBoard.swift; sourceTree = "<group>"; };
+		AA0000000000000000000022 /* GameViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameViewModel.swift; sourceTree = "<group>"; };
+		AA0000000000000000000023 /* BoardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardView.swift; sourceTree = "<group>"; };
+		AA0000000000000000000027 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -50,6 +58,10 @@
 			children = (
 				AA0000000000000000000013 /* PlainTextChessApp.swift */,
 				AA0000000000000000000014 /* ContentView.swift */,
+				AA0000000000000000000021 /* FenBoard.swift */,
+				AA0000000000000000000022 /* GameViewModel.swift */,
+				AA0000000000000000000023 /* BoardView.swift */,
+				AA0000000000000000000027 /* Assets.xcassets */,
 			);
 			path = PlainTextChess;
 			sourceTree = "<group>";
@@ -139,6 +151,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA0000000000000000000028 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -175,6 +188,9 @@
 				AA0000000000000000000017 /* PlainTextChessApp.swift in Sources */,
 				AA0000000000000000000018 /* ContentView.swift in Sources */,
 				AA0000000000000000000019 /* chess_core.swift in Sources */,
+				AA0000000000000000000024 /* FenBoard.swift in Sources */,
+				AA0000000000000000000025 /* GameViewModel.swift in Sources */,
+				AA0000000000000000000026 /* BoardView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
