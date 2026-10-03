@@ -3,6 +3,30 @@
 ## Overview
 This document defines the user interface specifications for the Android chess application, built with Jetpack Compose.
 
+## Implementation Status
+
+Implemented (current milestone):
+
+- 8x8 board rendered from the core's board state, with in-board file/rank
+  coordinates and the bundled cburnett piece set
+- Two-tap selection: tap a piece to highlight its core-driven legal
+  destinations, tap a highlighted square to play the move
+- **Piece drag and drop**: a board-level gesture (`pointerInput` +
+  `detectDragGestures`) that coexists with the per-square `clickable` tap
+  path; lift/drop drive the same `select` intent as taps
+- **Pawn promotion**: when a pawn's destination is on the last rank, an inline
+  picker card (queen/rook/bishop/knight, tap targets ≥ 48 dp) is shown over
+  the destination square; tapping outside the card cancels the move
+- **Move animation**: a 0.2 s slide of the moved piece from origin to
+  destination; skipped when `ANIMATOR_DURATION_SCALE` is 0 (the Android
+  equivalent of Reduce Motion)
+- Status row (to move / check / checkmate / draw), UCI move list, and the
+  **New game** action
+
+Still aspirational (described above, not implemented): timers, ratings,
+CPU opponent, game result dialog, long-press context menu, themes/dark mode,
+localization, and TalkBack announcements.
+
 ## Key Components
 
 ### 1. Chess Board Component (`ChessBoardComposable`)

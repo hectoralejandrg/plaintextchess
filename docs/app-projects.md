@@ -6,6 +6,11 @@ Both apps are playable local two-player chess games. Each app instantiates a
 the core's state; all chess rules stay in the Rust core (shakmaty). Errors
 surface in the UI instead of crashing.
 
+Both screens support two ways to move a piece that coexist — tapping the piece
+and then a highlighted destination, or dragging the piece onto one — plus an
+inline promotion picker when a pawn's destination is on the last rank and a
+short slide animation for every played move.
+
 Both apps consume artifacts produced by the shared build scripts — **never
 commit generated code** (`target/uniffi/**`, `ios/Frameworks/**`, and
 `android/app/src/main/jniLibs/**` are build outputs). The app pre-build phases
@@ -63,6 +68,18 @@ the core via `get_valid_moves`), tap a highlighted square to play the move
 move list in UCI notation, and a **New game** action that starts a fresh
 session.
 
+Moves can also be played by dragging the piece onto a highlighted square — a
+single board-level drag gesture coexists with the per-square tap gestures
+(only drags past a small distance threshold count; a tap stays the two-tap
+path). Dropping on a square that is not a legal target shows "Not a legal
+move" without changing the position. When the destination is on the last rank
+the core reports one move per promotion piece; instead of playing, the app
+shows an inline picker card with the four cburnett pieces anchored over the
+destination square (offset into the board interior), and tapping outside the
+card cancels the move. Every played move slides from the origin to the
+destination over ~0.2 s; the slide is skipped when the system Reduce Motion
+accessibility setting is on.
+
 Notes:
 
 - The project links `ios/Frameworks/ChessCore.xcframework` (link-only, no
@@ -76,10 +93,21 @@ Notes:
   simulators. Intel Macs (x86_64 simulators) are not supported yet.
 - Deployment target is 15.0 — Xcode 27 rejects `IPHONEOS_DEPLOYMENT_TARGET`
   below 15.0.
-- `DEBUG` builds accept a launch-argument script that drives moves through the
-  same intent path as taps, e.g.
-  `xcrun simctl launch <SIMUDID> com.hectoralejandrg.plaintextchess -PLAINTCHESS_SCRIPT "e2e4 e7e5"`;
-  the token `newgame` triggers the New game action.
+- `DEBUG` builds accept launch-argument hooks that drive the same intent path
+  as taps (all inert in release builds):
+  - `-PLAINTCHESS_SCRIPT "e2e4 e7e5 …"` plays a token script; the token
+    `newgame` triggers the New game action and `cancelpromo` dismisses an open
+    promotion picker. A 5-character token (e.g. `a2b1q`) additionally
+    confirms the promotion through the same intent the picker button calls,
+    while a 4-character token landing on a promotion destination stops with
+    the picker open.
+  - `-PLAINTCHESS_DRAG "e2[,e4]"` forces the in-flight lift on `e2` and, when
+    a second square is given, runs the same drop entry point the drag gesture
+    calls (used to screenshot the lift, since the simulator exposes no
+    pointer injection).
+  - `-PLAINTCHESS_ANIM_SCALE "3"` multiplies the slide-animation duration
+    (e.g. `20` makes a 0.2 s slide run for 4 s, so a mid-slide screenshot is
+    possible).
 
 ## 3. Android app
 
@@ -107,8 +135,26 @@ adb exec-out screencap -p > /tmp/android-screen.png
 The Android screen mirrors iOS: an 8×8 board rendered from the core's board
 state, tap-to-select a piece with core-driven legal-move targets, a status row
 (to move / check / checkmate / draw), the UCI move list and a **New game**
-action. Verified by driving real taps on the emulator (`adb shell input tap`,
-with coordinates read from `adb shell uiautomator dump`).
+action. Verified by driving real input on the emulator (`adb shell input tap`
+and `adb shell input swipe`, with coordinates read from
+`adb shell uiautomator dump`).
+
+Moves can also be played by dragging the piece onto a highlighted square: a
+single board-level gesture (`Modifier.pointerInput` + `detectDragGestures`,
+which runs the official `awaitEachGesture`/`awaitFirstDown` state machine)
+coexists with the per-square `clickable` tap path — movement past the system
+touch slop lifts an own piece, and the release runs the same `select` intent
+a tap would. Dropping on a square that is not a legal target shows "Not a
+legal move" without changing the position. When the destination is on the last
+rank the app shows the same inline promotion picker card as iOS (four cburnett
+pieces anchored over the destination square, tap targets ≥ 48 dp, tapping
+outside the card cancels). Every played move slides from the origin to the
+destination over 0.2 s (a 200 ms `tween` on an `Animatable` — this toolchain's
+Compose has no `withAnimation`); the slide is skipped when
+`Settings.Global.ANIMATOR_DURATION_SCALE` is 0, the Android equivalent of
+Reduce Motion (the system scale also stretches the slide, which is how a
+mid-slide screenshot is taken on the emulator). Drag is the one interaction
+verified with `adb shell input swipe` instead of taps.
 
 Notes:
 

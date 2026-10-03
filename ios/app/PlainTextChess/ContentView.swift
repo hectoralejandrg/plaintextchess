@@ -5,8 +5,40 @@ import SwiftUI
 /// Replaces the placeholder screen: status row, 8x8 board, move list and
 /// controls. All game state comes from the view model, which is backed by
 /// the Rust core through the UniFFI Swift bindings.
+/// DEBUG-only drag simulation (design D5): force the in-flight lift on
+/// `from` and, when `to` is set, run the same drop entry point the gesture
+/// calls. `xcrun simctl launch <sim> <bundle> -PLAINTCHESS_DRAG "e2[,e4]"`.
+struct DragTest {
+    let from: String
+    let to: String?
+}
+
 struct ContentView: View {
     @StateObject private var vm = GameViewModel()
+
+    /// DEBUG launch-arg knobs (design D5); inert in release builds.
+    private let debugAnimScale: Double
+    private let debugDrag: DragTest?
+
+    init() {
+        var animScale = 1.0
+        var drag: DragTest?
+        #if DEBUG
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-PLAINTCHESS_ANIM_SCALE"),
+           i + 1 < args.count, let s = Double(args[i + 1]), s > 0 {
+            animScale = s
+        }
+        if let i = args.firstIndex(of: "-PLAINTCHESS_DRAG"),
+           i + 1 < args.count, !args[i + 1].isEmpty {
+            let parts = args[i + 1].split(separator: ",").map { String($0) }
+            drag = DragTest(from: parts[0],
+                            to: parts.count > 1 ? parts[1] : nil)
+        }
+        #endif
+        debugAnimScale = animScale
+        debugDrag = drag
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -17,7 +49,9 @@ struct ContentView: View {
             statusRow
                 .padding(.horizontal)
 
-            BoardView(vm: vm)
+            BoardView(vm: vm,
+                      animScale: debugAnimScale,
+                      dragTest: debugDrag)
                 .frame(maxWidth: .infinity)
 
             moveList

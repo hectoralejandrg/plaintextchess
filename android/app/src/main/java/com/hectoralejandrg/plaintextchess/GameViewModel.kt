@@ -27,6 +27,12 @@ class GameViewModel {
 
     data class LastMove(val from: String, val to: String)
 
+    /**
+     * A promotion awaiting the player's choice (design D1): the core reports
+     * a last-rank destination with one UCI move per promotion piece.
+     */
+    data class PendingPromotion(val from: String, val to: String, val options: List<String>)
+
     var board by mutableStateOf(FenBoard.start)
         private set
     var status by mutableStateOf<GameStatus>(GameStatus.Starting)
@@ -41,11 +47,19 @@ class GameViewModel {
         private set
     var errorMessage by mutableStateOf<String?>(null)
         private set
+    var pendingPromotion by mutableStateOf<PendingPromotion?>(null)
+        private set
 
     private var session: GameSession = newGameSession(initialRating = 1500.0)
 
     /** Side to move, tracked locally (the core's board state is position-only). */
     private var toMove: String = "w"
+
+    /**
+     * Full UCI moves of the currently selected piece (design D1): the
+     * 5-character ones are the promotion options.
+     */
+    private var selectedMoves: List<String> = emptyList()
 
     init {
         try {
@@ -77,7 +91,14 @@ class GameViewModel {
                 return
             }
             if (legalTargets.contains(squareName)) {
-                playMove(selected, squareName)
+                // D1: a last-rank destination with promotion UCI options opens
+                // the picker instead of playing.
+                val pending = pendingPromotionFor(selected, squareName)
+                if (pending != null) {
+                    pendingPromotion = pending
+                    return
+                }
+                playMove(selected, squareName, selected + squareName)
                 return
             }
         }
@@ -89,21 +110,53 @@ class GameViewModel {
 
         if (isOwn(piece, current.toMove)) {
             selectedSquare = squareName
-            // The core returns full UCI strings ("e2e4"); keep only the
-            // destination square for highlighting and tap matching.
+            // The core returns full UCI strings ("e2e4", "a2b1q", ...). Keep
+            // the full strings (promotion detection, D1) and derive the
+            // destination squares for highlighting and tap matching
+            // (destination is chars 2-3; 5-char promotion UCIs end in the
+            // promotion piece, so `takeLast(2)` is wrong for those).
             val uciMoves = try {
                 session.getValidMoves(square = squareName)
             } catch (e: Throwable) {
                 emptyList()
             }
-            legalTargets = uciMoves
-                .filter { it.startsWith(squareName) }
-                .map { it.takeLast(2) }
+            selectedMoves = uciMoves.filter { it.startsWith(squareName) }
+            legalTargets = selectedMoves.map { it.drop(2).take(2) }
             errorMessage = null
         } else {
             // Enemy piece that is not a legal capture target.
             if (selectedSquare != null) errorMessage = "Not a legal move"
         }
+    }
+
+    /**
+     * Play the chosen promotion piece (design D1). `piece` is one of q/r/b/n
+     * as listed in `pendingPromotion.options`.
+     */
+    fun confirmPromotion(piece: String) {
+        val pending = pendingPromotion ?: return
+        pendingPromotion = null
+        playMove(pending.from, pending.to, pending.from + pending.to + piece)
+    }
+
+    /** Dismiss an open promotion choice without playing (design D2). */
+    fun cancelPromotion() {
+        pendingPromotion = null
+        clearSelection()
+    }
+
+    /**
+     * Whether the piece on this square may be picked up right now. Used by
+     * the drag gesture; the tap path answers the same question inside
+     * [select].
+     */
+    fun canPickup(squareName: String): Boolean {
+        val current = status
+        if (current !is GameStatus.Playing) return false
+        val square = FenBoard.parseSquare(squareName) ?: return false
+        val (row, col) = square
+        val piece = board.grid[row][col]
+        return piece.isNotEmpty() && isOwn(piece, current.toMove)
     }
 
     /** Discard the current session and start a fresh game. */
@@ -123,8 +176,23 @@ class GameViewModel {
         }
     }
 
-    private fun playMove(from: String, to: String) {
-        val uci = from + to
+    /**
+     * D1: promotions are the 5-character UCI moves. Group them by
+     * destination and order the options q/r/b/n.
+     */
+    private fun pendingPromotionFor(from: String, to: String): PendingPromotion? {
+        val promos = selectedMoves.filter {
+            it.length == 5 && it.startsWith(from) && it.drop(2).take(2) == to
+        }
+        if (promos.isEmpty()) return null
+        val options = listOf("q", "r", "b", "n").mapNotNull { piece ->
+            promos.firstOrNull { it.endsWith(piece) }
+        }
+        if (options.isEmpty()) return null
+        return PendingPromotion(from, to, options)
+    }
+
+    private fun playMove(from: String, to: String, uci: String) {
         try {
             session.playMove(uciMove = uci)
             toMove = if (toMove == "w") "b" else "w"
@@ -158,6 +226,8 @@ class GameViewModel {
     private fun clearSelection() {
         selectedSquare = null
         legalTargets = emptyList()
+        selectedMoves = emptyList()
+        pendingPromotion = null
     }
 
     private fun isOwn(piece: String, side: String): Boolean =
