@@ -63,6 +63,19 @@ pub mod core {
     /// String representation of the piece ("K", "Q", "R", "B", "N", "P", or "")
     pub fn get_piece_at(square: &str) -> String;
     
+    /// Get the CPU's move for the side to move at the given difficulty
+    ///
+    /// # Arguments
+    /// * `difficulty` - 1 (easy), 2 (medium), 3 (hard)
+    ///
+    /// # Returns
+    /// UCI move string for the side to move (e.g. "e2e4", or the 5-char
+    /// "b7a8q" when the move is a promotion). Pure query: the session is
+    /// not mutated; the caller plays the result through `play_move`.
+    /// Errors: `InvalidDifficulty` when `difficulty` is not in 1..=3,
+    /// `BoardError` when the side to move has no legal move (game over).
+    pub fn get_cpu_move(difficulty: i32) -> Result<String, ChessError>;
+    
     /// Check if the current player is in check
     pub fn is_check() -> bool;
     
@@ -98,6 +111,9 @@ interface ChessCore {
     
     // Piece Information
     fun getPieceAt(square: String): String
+    
+    // CPU Opponent
+    fun getCpuMove(difficulty: Int): Result<String, ChessError>
 }
 ```
 
@@ -179,6 +195,9 @@ protocol ChessCore: AnyObject {
     
     // Piece Information
     func getPieceAt(square: String) -> String
+    
+    // CPU Opponent
+    func getCpuMove(difficulty: Int32) -> Result<String, ChessError>
 }
 ```
 
@@ -306,6 +325,7 @@ pub enum ChessError {
     BoardError,
     RatingError,
     FFIError(String),
+    InvalidDifficulty,
 }
 
 impl std::fmt::Display for ChessError {
@@ -315,6 +335,7 @@ impl std::fmt::Display for ChessError {
             ChessError::BoardError => write!(f, "Board error"),
             ChessError::RatingError => write!(f, "Rating error"),
             ChessError::FFIError(msg) => write!(f, "FFI error: {}", msg),
+            ChessError::InvalidDifficulty => write!(f, "Invalid difficulty"),
         }
     }
 }
@@ -328,6 +349,7 @@ sealed class ChessError {
     data class BoardError(val message: String) : ChessError()
     data class RatingError(val message: String) : ChessError()
     data class FFIError(val message: String) : ChessError()
+    data class InvalidDifficulty(val message: String) : ChessError()
 }
 ```
 
@@ -339,6 +361,7 @@ enum ChessError: Error, LocalizedError {
     case boardError(String)
     case ratingError(String)
     case ffiError(String)
+    case invalidDifficulty(String)
     
     var errorDescription: String? {
         switch self {
@@ -350,6 +373,8 @@ enum ChessError: Error, LocalizedError {
             return NSLocalizedString("Rating error: \(message)", comment: "")
         case .ffiError(let message):
             return NSLocalizedString("FFI error: \(message)", comment: "")
+        case .invalidDifficulty(let message):
+            return NSLocalizedString("Invalid difficulty: \(message)", comment: "")
         }
     }
 }

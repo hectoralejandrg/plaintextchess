@@ -20,8 +20,14 @@ fn game_flow() {
     );
 
     let moves = s.get_valid_moves("e2").unwrap();
-    assert!(moves.contains(&"e2e4".to_string()), "e2e4 missing in {moves:?}");
-    assert!(moves.contains(&"e2e3".to_string()), "e2e3 missing in {moves:?}");
+    assert!(
+        moves.contains(&"e2e4".to_string()),
+        "e2e4 missing in {moves:?}"
+    );
+    assert!(
+        moves.contains(&"e2e3".to_string()),
+        "e2e3 missing in {moves:?}"
+    );
 
     s.play_move("e2e4").unwrap();
     assert_eq!(

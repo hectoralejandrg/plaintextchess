@@ -59,6 +59,14 @@ impl BoardManager {
             None => String::new(),
         }
     }
+
+    /// CPU move for the side to move at the given difficulty (1 easy,
+    /// 2 medium, 3 hard). Pure query: the board is not mutated. `None`
+    /// when the difficulty is unknown or the side to move has no legal
+    /// move (game over).
+    pub fn best_move(&self, difficulty: u8) -> Option<String> {
+        crate::domain::search::best_move(&self.board, difficulty)
+    }
 }
 
 /// Standard chess piece letters: uppercase for white, lowercase for black.

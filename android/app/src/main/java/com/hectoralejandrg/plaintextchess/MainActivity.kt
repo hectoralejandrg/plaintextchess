@@ -16,11 +16,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -47,6 +53,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun GameScreen() {
     val vm = remember { GameViewModel() }
+    var showNewGameSheet by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -76,18 +83,97 @@ fun GameScreen() {
             Spacer(Modifier.height(8.dp))
         }
         Button(
-            onClick = { vm.newGame() },
+            onClick = { showNewGameSheet = true },
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp),
         ) {
             Text("New game")
         }
+        if (showNewGameSheet) {
+            NewGameSetupSheet(
+                onDismiss = { showNewGameSheet = false },
+                onConfirm = { mode ->
+                    vm.startGame(mode)
+                    showNewGameSheet = false
+                },
+            )
+        }
+    }
+}
+
+/**
+ * New-game setup sheet (design D4): choose the opponent (two players or CPU)
+ * and, for the CPU, its difficulty. Two players is pre-selected; "Start"
+ * begins the game with the chosen mode.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NewGameSetupSheet(
+    onDismiss: () -> Unit,
+    onConfirm: (GameMode) -> Unit,
+) {
+    var isCpu by remember { mutableStateOf(false) }
+    var difficulty by remember { mutableStateOf(CpuDifficulty.MEDIUM) }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("New game", style = MaterialTheme.typography.titleLarge)
+            Text(
+                "Opponent",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = !isCpu,
+                    onClick = { isCpu = false },
+                    label = { Text("Two players") },
+                )
+                FilterChip(
+                    selected = isCpu,
+                    onClick = { isCpu = true },
+                    label = { Text("CPU") },
+                )
+            }
+            if (isCpu) {
+                Text(
+                    "Difficulty",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CpuDifficulty.values().forEach { level ->
+                        FilterChip(
+                            selected = difficulty == level,
+                            onClick = { difficulty = level },
+                            label = { Text(level.displayName) },
+                        )
+                    }
+                }
+            }
+            Button(
+                onClick = {
+                    onConfirm(if (isCpu) GameMode.Cpu(difficulty) else GameMode.TwoPlayers)
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Start")
+            }
+        }
     }
 }
 
 @Composable
 private fun StatusRow(vm: GameViewModel) {
+    if (vm.cpuThinking) {
+        Text("CPU is thinking…", style = MaterialTheme.typography.titleMedium)
+        return
+    }
     when (val status = vm.status) {
         is GameStatus.Starting ->
             Text("Creating session…", style = MaterialTheme.typography.titleMedium)

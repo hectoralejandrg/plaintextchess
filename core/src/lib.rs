@@ -10,6 +10,7 @@ pub enum ChessError {
     BoardError,
     RatingError,
     FfiError,
+    InvalidDifficulty,
 }
 
 impl std::fmt::Display for ChessError {
@@ -19,6 +20,7 @@ impl std::fmt::Display for ChessError {
             ChessError::BoardError => write!(f, "Board error"),
             ChessError::RatingError => write!(f, "Rating error"),
             ChessError::FfiError => write!(f, "FFI error"),
+            ChessError::InvalidDifficulty => write!(f, "Invalid difficulty"),
         }
     }
 }
@@ -64,7 +66,9 @@ impl GameSession {
 
     /// Execute a UCI move (e.g. "e2e4").
     pub fn play_move(&self, uci_move: &str) -> Result<(), ChessError> {
-        lock(&self.board_manager)?.play_move(uci_move).map_err(|_| ChessError::InvalidMove)
+        lock(&self.board_manager)?
+            .play_move(uci_move)
+            .map_err(|_| ChessError::InvalidMove)
     }
 
     /// Whether the side to move is currently in check.
@@ -87,11 +91,27 @@ impl GameSession {
         Ok(lock(&self.board_manager)?.get_piece_at(square))
     }
 
+    /// CPU move for the side to move at the given difficulty
+    /// (1 easy, 2 medium, 3 hard). Pure query: the session is not mutated;
+    /// the caller plays the returned UCI through `play_move`.
+    pub fn get_cpu_move(&self, difficulty: i32) -> Result<String, ChessError> {
+        if !(1..=3).contains(&difficulty) {
+            return Err(ChessError::InvalidDifficulty);
+        }
+        match lock(&self.board_manager)?.best_move(difficulty as u8) {
+            Some(uci) => Ok(uci),
+            None => Err(ChessError::BoardError),
+        }
+    }
+
     /// Update the player rating after a game.
     /// `result`: 1.0 (win), 0.5 (draw), 0.0 (loss).
-    pub fn update_player_rating(&self, opponent_rating: f64, result: f64) -> Result<(), ChessError> {
-        lock(&self.rating_manager)?
-            .update_after_game(opponent_rating, result);
+    pub fn update_player_rating(
+        &self,
+        opponent_rating: f64,
+        result: f64,
+    ) -> Result<(), ChessError> {
+        lock(&self.rating_manager)?.update_after_game(opponent_rating, result);
         Ok(())
     }
 

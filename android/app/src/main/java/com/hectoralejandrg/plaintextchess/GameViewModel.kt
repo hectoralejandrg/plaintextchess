@@ -3,6 +3,11 @@ package com.hectoralejandrg.plaintextchess
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uniffi.chess_core.ChessException
 import uniffi.chess_core.GameSession
 import uniffi.chess_core.newGameSession
@@ -14,6 +19,27 @@ sealed class GameStatus {
     data class Checkmated(val winner: String) : GameStatus()
     object Drawn : GameStatus()
     data class Failed(val message: String) : GameStatus()
+}
+
+/**
+ * Opponent mode for a game (design D4/D6): two human players, or a human
+ * (White) versus the CPU (Black) at a chosen difficulty.
+ */
+sealed class GameMode {
+    object TwoPlayers : GameMode()
+    data class Cpu(val difficulty: CpuDifficulty) : GameMode()
+}
+
+/** CPU difficulty levels, matching the core's search depth (design D2). */
+enum class CpuDifficulty(val rawValue: Int, val displayName: String) {
+    EASY(1, "Easy"),
+    MEDIUM(2, "Medium"),
+    HARD(3, "Hard");
+
+    companion object {
+        fun fromName(name: String): CpuDifficulty =
+            values().firstOrNull { it.name.equals(name, ignoreCase = true) } ?: MEDIUM
+    }
 }
 
 /**
@@ -49,6 +75,10 @@ class GameViewModel {
         private set
     var pendingPromotion by mutableStateOf<PendingPromotion?>(null)
         private set
+    /** True while the CPU computes its reply (design D5): board input is
+     * locked and the status row shows "CPU is thinking…". */
+    var cpuThinking by mutableStateOf(false)
+        private set
 
     private var session: GameSession = newGameSession(initialRating = 1500.0)
 
@@ -60,6 +90,23 @@ class GameViewModel {
      * 5-character ones are the promotion options.
      */
     private var selectedMoves: List<String> = emptyList()
+
+    /** Opponent mode for the current game (design D4/D6). */
+    private var gameMode: GameMode = GameMode.TwoPlayers
+
+    /** The side the CPU plays (design D6: the CPU is always Black). */
+    private val cpuColor = "b"
+
+    /** Bumped on every [startGame] so an in-flight CPU move from an older game
+     * is discarded instead of applied (design D5). */
+    private var cpuGeneration = 0
+
+    /**
+     * VM-scoped coroutine context standing in for `viewModelScope` (the view
+     * model is held with `remember`, not an AndroidX `ViewModel`): launches on
+     * the main dispatcher; the CPU compute hops to [Dispatchers.Default].
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     init {
         try {
@@ -78,6 +125,8 @@ class GameViewModel {
      * selection and shows "not a legal move" feedback.
      */
     fun select(squareName: String) {
+        // Locked while the CPU is thinking (design D5): no selection, no move.
+        if (cpuThinking) return
         val current = status
         if (current !is GameStatus.Playing) return
         val square = FenBoard.parseSquare(squareName) ?: return
@@ -151,6 +200,8 @@ class GameViewModel {
      * [select].
      */
     fun canPickup(squareName: String): Boolean {
+        // Locked while the CPU is thinking (design D5).
+        if (cpuThinking) return false
         val current = status
         if (current !is GameStatus.Playing) return false
         val square = FenBoard.parseSquare(squareName) ?: return false
@@ -159,8 +210,14 @@ class GameViewModel {
         return piece.isNotEmpty() && isOwn(piece, current.toMove)
     }
 
-    /** Discard the current session and start a fresh game. */
-    fun newGame() {
+    /**
+     * Discard the current session and start a fresh game in [mode]
+     * (spec: new-game action; design D4/D5/D6).
+     */
+    fun startGame(mode: GameMode) {
+        gameMode = mode
+        cpuGeneration += 1
+        cpuThinking = false
         session = newGameSession(initialRating = 1500.0)
         toMove = "w"
         clearSelection()
@@ -173,7 +230,14 @@ class GameViewModel {
             board = FenBoard.start
             status = GameStatus.Failed(describe(e))
             errorMessage = "FFI error: ${describe(e)}"
+            return
         }
+        triggerCpuMoveIfNeeded()
+    }
+
+    /** Start a two-player game (design D4 convenience). */
+    fun newGame() {
+        startGame(GameMode.TwoPlayers)
     }
 
     /**
@@ -201,9 +265,60 @@ class GameViewModel {
             moveList = moveList + uci
             board = FenBoard.parse(session.getBoardState(), toMove)
             refreshStatus()
+            // After any successful move (human or CPU), let the CPU answer if
+            // it is its turn (design D5/D6). A no-op after a CPU move.
+            triggerCpuMoveIfNeeded()
         } catch (e: Throwable) {
             errorMessage = "Move failed: ${describe(e)}"
         }
+    }
+
+    /**
+     * Run the CPU driver when the CPU is to move (design D5/D6): mode is cpu,
+     * it is the CPU's color, the game is still playing, and no move is in
+     * flight. The move is computed off the main thread (Dispatchers.Default)
+     * and applied on the main dispatcher through the same internal path a
+     * human move uses, but only if the generation still matches (a newer game
+     * discards the stale result).
+     */
+    private fun triggerCpuMoveIfNeeded() {
+        val mode = gameMode
+        if (mode !is GameMode.Cpu) return
+        val current = status
+        if (current !is GameStatus.Playing) return
+        if (current.toMove != cpuColor) return
+        if (cpuThinking) return
+
+        cpuThinking = true
+        val generation = cpuGeneration
+        val difficulty = mode.difficulty
+        val sess = session
+        scope.launch {
+            // Compute off the main thread; getCpuMove throws ChessException
+            // on error (invalid difficulty / no legal move).
+            val result: Result<String> = withContext(Dispatchers.Default) {
+                runCatching { sess.getCpuMove(difficulty = difficulty.rawValue) }
+            }
+            // Back on the main dispatcher (the scope's context).
+            if (cpuGeneration != generation) return@launch
+            result.onSuccess { uci ->
+                applyCpuMove(uci, generation)
+            }.onFailure { error ->
+                cpuThinking = false
+                errorMessage = "CPU move failed: ${describe(error)}"
+            }
+        }
+    }
+
+    /** Apply a computed CPU move through the same internal path a human move
+     * uses, but only if the game generation still matches (design D5). */
+    private fun applyCpuMove(uci: String, generation: Int) {
+        if (cpuGeneration != generation) return
+        cpuThinking = false
+        // 5-char promotion UCIs included: destination is chars 2-3.
+        val from = uci.take(2)
+        val to = uci.drop(2).take(2)
+        playMove(from, to, uci)
     }
 
     private fun refreshStatus() {
