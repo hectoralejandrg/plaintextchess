@@ -24,4 +24,4 @@
 ## 4. Wrap-up
 
 - [x] 4.1 Cross-platform consistency + regression (design D8): the availability rule, the disabled New game appearance, and the CPU-discard wording match on both platforms; existing interactions (two-tap, drag, promotion, undo, resign, flip, Play again, setup sheet) still work; the determinism anchor (medium `e2e4 d2d4 g1f3 c2c4` → `g8f6 f6e4 b8c6 e7e6`) is unchanged on both platforms; re-run `openspec validate "enforce-single-active-game" --strict`
-- [ ] 4.2 Commit the change work (conventional message, e.g. `feat(ui): gate new game to finished games and harden single-session guarantee on iOS and Android`) and push to `origin main` after explicit user confirmation; then verify the CI run succeeds (GitHub API without `gh`: latest `actions/runs` → all jobs `success`)
+- [x] 4.2 Commit the change work (conventional message, e.g. `feat(ui): gate new game to finished games and harden single-session guarantee on iOS and Android`) and push to `origin main` after explicit user confirmation; then verify the CI run succeeds (GitHub API without `gh`: latest `actions/runs` → all jobs `success`)
