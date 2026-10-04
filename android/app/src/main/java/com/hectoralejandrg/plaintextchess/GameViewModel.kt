@@ -6,6 +6,7 @@ import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.chess_core.ChessException
@@ -122,6 +123,16 @@ class GameViewModel {
     private var gameEndDismissed = false
 
     /**
+     * DEBUG-only hook (enforce-single-active-game D6): milliseconds to hold
+     * the "CPU is thinking…" state before applying the computed move, so
+     * Resign/Undo can deterministically land "while the CPU is thinking" on
+     * the emulator (hard replies otherwise land in <80 ms). Mirrors the iOS
+     * `-PLAINTCHESS_CPU_DELAY` launch argument: `MainActivity` only passes a
+     * non-zero value in debuggable builds, so it is release-inert.
+     */
+    var debugCpuDelayMs: Long = 0L
+
+    /**
      * VM-scoped coroutine context standing in for `viewModelScope` (the view
      * model is held with `remember`, not an AndroidX `ViewModel`): launches on
      * the main dispatcher; the CPU compute hops to [Dispatchers.Default].
@@ -231,10 +242,30 @@ class GameViewModel {
     }
 
     /**
+     * Whether the "New game" action may be started right now (spec:
+     * enforce-single-active-game "Game Mode Selection"): a new game may be
+     * started only when the current game is finished (checkmate, draw,
+     * resignation), when no move of it has been played yet, or when it is in
+     * an error state (recovery). While a game with at least one played move
+     * is in progress, New game is unavailable. Single source of truth: the
+     * UI button binds to it and [startGame] guards on it (design D1);
+     * [restart] needs no special-casing because terminal ⇒ gate open (D2).
+     */
+    val canStartNewGame: Boolean
+        get() = when (val s = status) {
+            is GameStatus.Checkmated, is GameStatus.Drawn,
+            is GameStatus.Resigned, is GameStatus.Failed -> true
+            else -> moveList.isEmpty()
+        }
+
+    /**
      * Discard the current session and start a fresh game in [mode]
      * (spec: new-game action; design D4/D5/D6).
      */
     fun startGame(mode: GameMode) {
+        // Single-active-game rule (enforce-single-active-game D1): never
+        // replace a game that is still in progress.
+        if (!canStartNewGame) return
         gameMode = mode
         cpuGeneration += 1
         cpuThinking = false
@@ -443,9 +474,17 @@ class GameViewModel {
                 runCatching { sess.getCpuMove(difficulty = difficulty.rawValue) }
             }
             // Back on the main dispatcher (the scope's context).
-            if (cpuGeneration != generation) return@launch
+            // Defense in depth (enforce-single-active-game D3): in addition
+            // to the generation guard, the session that computed the move
+            // must still be the active one.
+            if (cpuGeneration != generation || session !== sess) return@launch
             result.onSuccess { uci ->
-                applyCpuMove(uci, generation)
+                // DEBUG hook (enforce-single-active-game D6): hold the
+                // thinking state so Resign/Undo can deterministically land
+                // "while the CPU is thinking". If the game changes in the
+                // meantime, applyCpuMove still discards the move.
+                if (debugCpuDelayMs > 0L) delay(debugCpuDelayMs)
+                applyCpuMove(uci, generation, sess)
             }.onFailure { error ->
                 cpuThinking = false
                 errorMessage = "CPU move failed: ${describe(error)}"
@@ -454,9 +493,12 @@ class GameViewModel {
     }
 
     /** Apply a computed CPU move through the same internal path a human move
-     * uses, but only if the game generation still matches (design D5). */
-    private fun applyCpuMove(uci: String, generation: Int) {
-        if (cpuGeneration != generation) return
+     * uses, but only if the game generation still matches (design D5) and
+     * the session that computed it is still the active one
+     * (enforce-single-active-game D3): a stale move from a replaced session
+     * is never applied to the session that follows. */
+    private fun applyCpuMove(uci: String, generation: Int, session: GameSession) {
+        if (cpuGeneration != generation || session !== this.session) return
         cpuThinking = false
         // 5-char promotion UCIs included: destination is chars 2-3.
         val from = uci.take(2)

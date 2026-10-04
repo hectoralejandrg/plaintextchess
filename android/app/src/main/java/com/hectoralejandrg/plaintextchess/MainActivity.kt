@@ -1,5 +1,6 @@
 package com.hectoralejandrg.plaintextchess
 
+import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -36,12 +37,31 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 
 class MainActivity : ComponentActivity() {
+
+    /**
+     * DEBUG-only verification hook (enforce-single-active-game D6):
+     * milliseconds to hold the CPU "thinking" state before applying the
+     * computed move, so Resign/Undo taps can deterministically land "while
+     * the CPU is thinking" on the emulator. Release-inert (non-debuggable
+     * builds always get 0): the module does not enable `BuildConfig`, so the
+     * debuggable flag is the gate.
+     * `adb shell am start -n com.hectoralejandrg.plaintextchess/.MainActivity
+     * --ei cpu_delay_ms 3000`
+     */
+    private val debugCpuDelayMs: Long
+        get() {
+            val debuggable =
+                (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+            if (!debuggable) return 0L
+            return intent.getIntExtra("cpu_delay_ms", 0).toLong().coerceAtLeast(0L)
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    GameScreen()
+                    GameScreen(debugCpuDelayMs = debugCpuDelayMs)
                 }
             }
         }
@@ -54,8 +74,14 @@ class MainActivity : ComponentActivity() {
  * action. All game state comes from [GameViewModel], backed by the Rust core.
  */
 @Composable
-fun GameScreen() {
-    val vm = remember { GameViewModel() }
+fun GameScreen(debugCpuDelayMs: Long = 0L) {
+    val vm = remember {
+        val model = GameViewModel()
+        // DEBUG hook (enforce-single-active-game D6), release-inert: 0 unless
+        // the activity is debuggable and the cpu_delay_ms extra was set.
+        model.debugCpuDelayMs = debugCpuDelayMs
+        model
+    }
     var showNewGameSheet by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
@@ -109,8 +135,13 @@ fun GameScreen() {
             ) { Text("Flip board") }
         }
         Spacer(Modifier.height(8.dp))
+        // New game is available only when the current game is finished, has
+        // no move played yet, or failed (enforce-single-active-game D1): it
+        // stays visible but greyed out mid-game and starts nothing when
+        // tapped.
         Button(
             onClick = { showNewGameSheet = true },
+            enabled = vm.canStartNewGame,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp),

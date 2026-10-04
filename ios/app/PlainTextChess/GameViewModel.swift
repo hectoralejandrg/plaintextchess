@@ -226,9 +226,29 @@ final class GameViewModel: ObservableObject {
         return !piece.isEmpty && isOwn(piece, toMove: toMove)
     }
 
+    /// Whether the "New game" action may be started right now (spec:
+    /// enforce-single-active-game "Game Mode Selection"): a new game may be
+    /// started only when the current game is finished (checkmate, draw,
+    /// resignation), when no move of it has been played yet, or when it is in
+    /// an error state (recovery). While a game with at least one played move
+    /// is in progress, New game is unavailable. Single source of truth: the
+    /// UI button binds to it and `startGame` guards on it (design D1);
+    /// `restart()` needs no special-casing because terminal ⇒ gate open (D2).
+    var canStartNewGame: Bool {
+        switch status {
+        case .checkmated, .drawn, .resigned, .failed:
+            return true
+        case .starting, .playing:
+            return moveList.isEmpty
+        }
+    }
+
     /// Discard the current session and start a fresh game in `mode`
     /// (spec: new-game action; design D4/D5/D6).
     func startGame(_ mode: GameMode) {
+        // Single-active-game rule (enforce-single-active-game D1): never
+        // replace a game that is still in progress.
+        guard canStartNewGame else { return }
         gameMode = mode
         cpuGeneration += 1
         cpuThinking = false
@@ -433,11 +453,15 @@ final class GameViewModel: ObservableObject {
 
         cpuThinking = true
         let generation = cpuGeneration
-        let session = self.session
+        // Defense in depth (enforce-single-active-game D3): capture the
+        // session that computes the move so the commit can verify identity in
+        // addition to the generation guard, closing any future code path that
+        // could replace the session without bumping the generation.
+        let computingSession = self.session
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result: Result<String, Error>
             do {
-                let uci = try session.getCpuMove(difficulty: difficulty.rawValue)
+                let uci = try computingSession.getCpuMove(difficulty: difficulty.rawValue)
                 result = .success(uci)
             } catch {
                 result = .failure(error)
@@ -448,19 +472,26 @@ final class GameViewModel: ObservableObject {
                 // (design D5). `startGame` already cleared `cpuThinking` for
                 // the new game, so there is nothing to undo here.
                 guard self.cpuGeneration == generation else { return }
+                guard self.session === computingSession else { return }
                 switch result {
                 case .success(let uci):
                     #if DEBUG
                     if self.debugCpuDelay > 0 {
                         // Hold the "thinking" state to observe it (test hook).
                         DispatchQueue.main.asyncAfter(deadline: .now() + self.debugCpuDelay) { [weak self] in
-                            self?.applyCpuMove(uci, generation: generation)
+                            self?.applyCpuMove(uci,
+                                              generation: generation,
+                                              session: computingSession)
                         }
                     } else {
-                        self.applyCpuMove(uci, generation: generation)
+                        self.applyCpuMove(uci,
+                                          generation: generation,
+                                          session: computingSession)
                     }
                     #else
-                    self.applyCpuMove(uci, generation: generation)
+                    self.applyCpuMove(uci,
+                                      generation: generation,
+                                      session: computingSession)
                     #endif
                 case .failure(let error):
                     self.cpuThinking = false
@@ -471,10 +502,14 @@ final class GameViewModel: ObservableObject {
     }
 
     /// Apply a computed CPU move through the same internal path a human move
-    /// uses, but only if the game generation still matches (design D5).
-    private func applyCpuMove(_ uci: String, generation: Int) {
-        guard cpuGeneration == generation else {
-            // A newer game started in the meantime: discard the stale move.
+    /// uses, but only if the game generation still matches (design D5) and
+    /// the session that computed it is still the active one
+    /// (enforce-single-active-game D3): a stale move from a replaced session
+    /// is never applied to the session that follows.
+    private func applyCpuMove(_ uci: String, generation: Int, session: GameSession) {
+        guard cpuGeneration == generation, session === self.session else {
+            // A newer game started (or the session was rebuilt) in the
+            // meantime: discard the stale move.
             return
         }
         cpuThinking = false
@@ -543,7 +578,9 @@ final class GameViewModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self] in
             guard let self else { return }
             if token == "newgame" {
-                // Exercises the same New game action the button triggers.
+                // Exercises the same New game action the button triggers, so
+                // it honors the single-active-game gate too: mid-game it is
+                // rejected by the `startGame` guard (no state touched).
                 self.newGame()
             } else if token == "cancelpromo" {
                 // Exercises the same intent the picker's outside-tap catcher

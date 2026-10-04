@@ -217,11 +217,16 @@ struct ContentView: View {
         }
         .buttonStyle(.bordered)
 
+        // New game is available only when the current game is finished, has
+        // no move played yet, or failed (enforce-single-active-game D1): it
+        // stays visible but greyed out mid-game and starts nothing when
+        // tapped.
         Button(action: { showNewGameSheet = true }) {
             Label("New game", systemImage: "arrow.counterclockwise")
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
+        .disabled(!vm.canStartNewGame)
         .alert("Game over", isPresented: $vm.showGameEndDialog) {
             Button("Play again") { vm.restart() }
             Button("Done", role: .cancel) { vm.dismissGameEnd() }
