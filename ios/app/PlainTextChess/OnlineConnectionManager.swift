@@ -1,0 +1,350 @@
+import Foundation
+import Combine
+
+/// Phase of the online session (task 2.2): idle → connecting →
+/// waiting → inGame, with reconnecting on a mid-game drop and a terminal
+/// failed state.
+enum OnlinePhase: Equatable {
+    case idle
+    case connecting
+    /// We hold a seat in a room that is waiting for the opponent.
+    case waiting(code: String)
+    case inGame
+    /// The socket dropped mid-game; re-attaching to the same seat.
+    case reconnecting
+    case failed(String)
+
+    var isWaiting: Bool {
+        if case .waiting = self {
+            return true
+        }
+        return false
+    }
+}
+
+/// Connection manager for the online protocol (design D2/D4/D7): one
+/// `URLSessionWebSocketTask`, the JSON codec, the phase state machine, and
+/// automatic re-attach with capped backoff while the server's reconnect
+/// window is open. All state changes and callbacks happen on the main
+/// thread (the session's delegate queue is the main queue).
+final class OnlineConnectionManager: ObservableObject {
+    @Published private(set) var phase: OnlinePhase = .idle
+    @Published private(set) var roomCode: String?
+    @Published private(set) var yourColor: OnlineColor?
+    @Published private(set) var reconnecting = false
+    /// Human-readable reason the session failed (for the UI).
+    @Published private(set) var failureReason: String?
+
+    /// Every state snapshot, including the initial one in `room_ready`.
+    var onSnapshot: ((OnlineState) -> Void)?
+    /// Structured errors: join-time room errors and transient in-game errors.
+    var onError: ((OnlineErrorCode, String) -> Void)?
+    /// Phase changes (the view model mirrors these into its own state).
+    var onPhase: ((OnlinePhase) -> Void)?
+
+    /// Server reconnect window: the server's default grace is 120 s, so we
+    /// keep retrying a little past it before giving up.
+    static let maxReconnectWindow: TimeInterval = 150
+
+    private let url: URL
+    private let deviceID: String
+    private let session: URLSession
+    private var task: URLSessionWebSocketTask?
+    /// What the open socket should be told to do when it connects.
+    private var pendingAction: PendingAction = .none
+    /// True once the opponent is seated / the game has started.
+    private var activeGame = false
+    private var retryWorkItem: DispatchWorkItem?
+    private var retryBackoff: TimeInterval = 1
+    private var retryDeadline: Date?
+
+    private enum PendingAction {
+        case none
+        case create
+        case join(String)
+    }
+
+    init(url: URL, deviceID: String) {
+        self.url = url
+        self.deviceID = deviceID
+        // Delegate queue is the main queue: every completion handler and
+        // published change runs on the main thread.
+        self.session = URLSession(configuration: .default, delegate: nil, delegateQueue: .main)
+    }
+
+    deinit {
+        retryWorkItem?.cancel()
+        task?.cancel(with: .normalClosure, reason: nil)
+    }
+
+    // MARK: - Intents
+
+    /// Connect and create a room (the caller takes the White seat).
+    func startCreating() {
+        beginAttempt(phase: .connecting, action: .create, reconnect: false)
+    }
+
+    /// Connect and join an existing room by code.
+    func startJoining(code: String) {
+        beginAttempt(phase: .connecting, action: .join(code), reconnect: false, code: code)
+    }
+
+    /// Re-attach to an in-progress room after a drop or an app relaunch:
+    /// the same device identifier re-enters the seat it held. The first
+    /// attempt goes through the retry schedule (1 s) instead of connecting
+    /// immediately: that gives the "Reconnecting…" banner a visible window
+    /// and avoids racing the server's disconnect bookkeeping.
+    func startReattaching(code: String) {
+        activeGame = true
+        beginAttempt(phase: .reconnecting,
+                     action: .join(code),
+                     reconnect: true,
+                     code: code,
+                     immediate: false)
+    }
+
+    func sendMove(_ uci: String) {
+        send(.move(uci: uci))
+    }
+
+    func resign() {
+        send(.resign)
+    }
+
+    func leave() {
+        send(.leave)
+    }
+
+    /// Close the session and clear all state (the caller owns this manager
+    /// from here on; callbacks stop).
+    func teardown() {
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+        retryDeadline = nil
+        pendingAction = .none
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        activeGame = false
+        reconnecting = false
+        roomCode = nil
+        yourColor = nil
+        failureReason = nil
+        setPhase(.idle)
+    }
+
+    // MARK: - Connection lifecycle
+
+    private func beginAttempt(phase newPhase: OnlinePhase,
+                              action: PendingAction,
+                              reconnect: Bool,
+                              code: String? = nil,
+                              immediate: Bool = true) {
+        // A fresh attempt: clear any previous attempt's state.
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+        retryBackoff = 1
+        retryDeadline = nil
+        pendingAction = action
+        roomCode = code
+        yourColor = nil
+        failureReason = nil
+        if reconnect {
+            reconnecting = true
+        }
+        setPhase(newPhase)
+        if immediate {
+            connect()
+        } else {
+            beginReconnect()
+        }
+    }
+
+    private func connect() {
+        let task = session.webSocketTask(with: URLRequest(url: url))
+        self.task = task
+        task.resume()
+        // Sends are queued until the socket is established, so the intent can
+        // be fired right after resume (create on first connect, join on a
+        // re-attach attempt).
+        switch pendingAction {
+        case .create:
+            send(.createRoom(playerID: deviceID))
+        case .join(let code):
+            send(.joinRoom(playerID: deviceID, roomCode: code))
+        case .none:
+            break
+        }
+        receiveLoop(on: task)
+    }
+
+    /// `URLSessionWebSocketTask.receive` is one-shot: each completion must
+    /// re-arm the next read to keep the frame loop alive.
+    private func receiveLoop(on task: URLSessionWebSocketTask) {
+        task.receive { [weak self] result in
+            // If a newer socket replaced this one (re-attach), this callback
+            // belongs to a dead task: ignore it.
+            guard let self, self.task === task else { return }
+            switch result {
+            case .success(let message):
+                self.handle(incoming: message)
+            case .failure:
+                self.handleSocketDrop()
+            }
+            self.receiveLoop(on: task)
+        }
+    }
+
+    private func setPhase(_ phase: OnlinePhase) {
+        self.phase = phase
+        onPhase?(phase)
+    }
+
+    // MARK: - Incoming frames
+
+    private func handle(incoming message: URLSessionWebSocketTask.Message) {
+        switch message {
+        case .string(let json):
+            do {
+                let server = try OnlineCodec.decodeServer(json)
+                handle(serverMessage: server)
+            } catch {
+                // A malformed frame from the server is a protocol failure:
+                // treat it like a drop.
+                handleSocketDrop()
+            }
+        default:
+            // Binary frames are never sent by the server; a server-side close
+            // arrives as a receive failure, handled by the drop path.
+            break
+        }
+    }
+
+    private func handle(serverMessage: OnlineServerMessage) {
+        switch serverMessage {
+        case .roomReady(let code, let color, let state):
+            roomCode = code
+            yourColor = color
+            reconnecting = false
+            failureReason = nil
+            retryWorkItem?.cancel()
+            retryWorkItem = nil
+            retryDeadline = nil
+            switch pendingAction {
+            case .create:
+                setPhase(.waiting(code: code))
+            case .join:
+                activeGame = true
+                setPhase(.inGame)
+            case .none:
+                break
+            }
+            onSnapshot?(state)
+
+        case .state(let state):
+            reconnecting = false
+            yourColor = state.yourColor
+            if state.opponentOnline || !state.moveList.isEmpty {
+                activeGame = true
+                // A started game settles the phase even mid-attach: the
+                // server answers a re-attach with this resync snapshot (no
+                // room_ready), so waiting for room_ready would leave the
+                // "Reconnecting…" banner up forever.
+                setPhase(.inGame)
+            }
+            onSnapshot?(state)
+
+        case .error(let code, let message):
+            switch code {
+            case .roomNotFound, .roomFull, .invalidRoomCode, .alreadyInRoom:
+                // Definitive for the join in flight: the room is gone or
+                // unavailable, so stop retrying and report the error.
+                terminate(with: message, code: code)
+            default:
+                // Transient in-game error: surface it, keep the session.
+                onError?(code, message)
+            }
+        }
+    }
+
+    /// The socket went away (failure, close frame, or a malformed frame).
+    private func handleSocketDrop() {
+        // Late events after teardown or a definitive failure: ignore.
+        if case .idle = phase { return }
+        if case .failed = phase { return }
+        task?.cancel(with: .normalClosure, reason: nil)
+        task = nil
+        pendingAction = .none
+
+        if roomCode != nil {
+            // A room exists for this device: keep re-attaching while the
+            // server's window is open. In a dropped lobby the first retry
+            // is answered with `room_not_found` and stops.
+            beginReconnect()
+        } else {
+            terminate(with: "Connection lost", code: .notConnected)
+        }
+    }
+
+    // MARK: - Reconnect
+
+    private func beginReconnect() {
+        reconnecting = true
+        setPhase(.reconnecting)
+        if retryDeadline == nil {
+            retryDeadline = Date().addingTimeInterval(Self.maxReconnectWindow)
+        }
+        scheduleRetry()
+    }
+
+    private func scheduleRetry() {
+        retryWorkItem?.cancel()
+        guard let code = roomCode else {
+            terminate(with: "Connection lost", code: .notConnected)
+            return
+        }
+        let delay = retryBackoff
+        retryBackoff = min(retryBackoff * 2, 8)
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard case .reconnecting = self.phase else { return }
+            guard let deadline = self.retryDeadline, Date() < deadline else {
+                self.terminate(with: "Could not reconnect in time", code: .notConnected)
+                return
+            }
+            self.pendingAction = .join(code)
+            self.connect()
+        }
+        retryWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    // MARK: - Outgoing frames
+
+    private func send(_ message: OnlineClientMessage) {
+        guard let task else { return }
+        guard let json = try? OnlineCodec.encodeClient(message) else { return }
+        task.send(.string(json)) { [weak self] error in
+            // A send failure surfaces as a drop in the receive loop; nothing
+            // to do here besides not crashing on the error value.
+            _ = error
+            _ = self
+        }
+    }
+
+    // MARK: - Failure
+
+    private func terminate(with reason: String, code: OnlineErrorCode) {
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+        retryDeadline = nil
+        task?.cancel(with: .normalClosure, reason: nil)
+        task = nil
+        pendingAction = .none
+        activeGame = false
+        reconnecting = false
+        roomCode = nil
+        failureReason = reason
+        setPhase(.failed(reason))
+        onError?(code, reason)
+    }
+}

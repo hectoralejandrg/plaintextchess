@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug-build overlay (add-online-multiplayer D9): the online server URL
+     override accepts plain `ws://` URLs during development and E2E
+     verification, which requires cleartext traffic. Release is unaffected:
+     the default URL is empty and the `online_url` extra is read only in
+     debuggable builds, so no cleartext endpoint can be configured there. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:usesCleartextTraffic="true">
+    </application>
+
+</manifest>

@@ -4,6 +4,7 @@
 #   validate      - runs the spec/config/script validation test scripts
 #   build-ios     - builds the iOS XCFramework (Rust -> aarch64-apple-ios)
 #   build-android - builds the Android JNI libraries (Rust -> aarch64 + x86_64)
+#   build-server  - builds the online-multiplexer server and runs its tests
 #   quality       - collects build metrics from all jobs and reports them
 #
 # The build scripts write metrics to target/build-metrics/<platform>-last.json;
@@ -79,10 +80,21 @@ jobs:
             android/app/src/main/jniLibs
             target/build-metrics/android-last.json
 
+  build-server:
+    name: Build online-multiplexer server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run server test suite
+        run: cargo test --manifest-path server/Cargo.toml
+      - name: Build server (release)
+        run: cargo build --release --manifest-path server/Cargo.toml
+
   quality:
     name: Build quality report
     runs-on: ubuntu-latest
-    needs: [validate, build-ios, build-android]
+    needs: [validate, build-ios, build-android, build-server]
     if: always()
     steps:
       - uses: actions/checkout@v4

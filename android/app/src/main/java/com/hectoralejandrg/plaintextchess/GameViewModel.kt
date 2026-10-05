@@ -1,8 +1,10 @@
 package com.hectoralejandrg.plaintextchess
 
+import android.content.Context
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,16 +24,21 @@ sealed class GameStatus {
     /** App-level terminal state (design D4 of add-game-end-dialog): the
      * resigner is the losing side, `winner` the opponent. */
     data class Resigned(val winner: String) : GameStatus()
+    /** Online: the opponent's reconnect window expired and the server
+     * forfeited the absent player (add-online-multiplayer D8). */
+    data class Forfeited(val winner: String) : GameStatus()
     data class Failed(val message: String) : GameStatus()
 }
 
 /**
- * Opponent mode for a game (design D4/D6): two human players, or a human
- * (White) versus the CPU (Black) at a chosen difficulty.
+ * Opponent mode for a game (design D4/D6): two human players, a human
+ * (White) versus the CPU (Black) at a chosen difficulty, or an online match
+ * whose seat color is assigned by the server (add-online-multiplayer D4).
  */
 sealed class GameMode {
     object TwoPlayers : GameMode()
     data class Cpu(val difficulty: CpuDifficulty) : GameMode()
+    object Online : GameMode()
 }
 
 /** CPU difficulty levels, matching the core's search depth (design D2). */
@@ -53,7 +60,7 @@ enum class CpuDifficulty(val rawValue: Int, val displayName: String) {
  * through the UniFFI `GameSession`; this class only renders state and
  * forwards user intents. Held with `remember` in the composable.
  */
-class GameViewModel {
+class GameViewModel(private val context: Context) {
 
     data class LastMove(val from: String, val to: String)
 
@@ -95,6 +102,59 @@ class GameViewModel {
     var boardOrientation by mutableStateOf(0)
         private set
 
+    // region Online multiplayer (add-online-multiplayer)
+
+    /** Connection phase mirrored from the [OnlineConnectionManager] (the VM
+     * owns the observed state; the manager drives it). */
+    var onlinePhase by mutableStateOf<OnlinePhase>(OnlinePhase.Idle)
+        private set
+
+    /** True while the socket is dropped and the manager re-attaches; the UI
+     * shows a banner and the last known position stays on screen. */
+    var onlineReconnecting by mutableStateOf(false)
+        private set
+
+    /** The room code of the current online room (shown with a copy action in
+     * the waiting state). */
+    var onlineRoomCode by mutableStateOf<String?>(null)
+        private set
+
+    /** Our color in the online game ("w"/"b"), from the server snapshot. */
+    var onlineYourColor by mutableStateOf<String?>(null)
+        private set
+
+    /** True once the server confirmed the seat (`room_ready` received): the
+     * setup sheet dismisses itself. */
+    var onlineSessionReady by mutableStateOf(false)
+        private set
+
+    /** A join-time error, shown on the join screen while the sheet stays open. */
+    var onlineJoinError by mutableStateOf<String?>(null)
+        private set
+
+    /** Whether the opponent is currently connected (the lobby gate). */
+    var onlineOpponentOnline by mutableStateOf(false)
+        private set
+
+    /** Ratings from the last snapshot, by color (add-online-multiplayer D5).
+     * Shown in the terminal-state modal so both clients see the updated
+     * ratings in the final state (design D11, step 4). */
+    var onlineWhiteRating by mutableStateOf(1500.0)
+        private set
+    var onlineBlackRating by mutableStateOf(1500.0)
+        private set
+
+    private var online: OnlineConnectionManager? = null
+
+    // endregion
+
+    /**
+     * DEBUG-only hook (add-online-multiplayer D9): the online server URL from
+     * the `online_url` intent extra; [MainActivity] only passes it in
+     * debuggable builds, so it is release-inert.
+     */
+    var debugOnlineURL: String? = null
+
     private var session: GameSession = newGameSession(initialRating = 1500.0)
 
     /** Side to move, tracked locally (the core's board state is position-only). */
@@ -111,6 +171,11 @@ class GameViewModel {
 
     /** The side the CPU plays (design D6: the CPU is always Black). */
     private val cpuColor = "b"
+
+    /** True when the current game is online (the UI switches to the online
+     * wording: "Your move", You won/lost modal, no Play again, no Undo). */
+    val isOnlineMode: Boolean
+        get() = gameMode is GameMode.Online
 
     /** Bumped on every [startGame] so an in-flight CPU move from an older game
      * is discarded instead of applied (design D5). */
@@ -160,6 +225,14 @@ class GameViewModel {
         if (cpuThinking) return
         val current = status
         if (current !is GameStatus.Playing) return
+        // Online: input is only accepted while the game is in progress and on
+        // our own turn (add-online-multiplayer D4). The board stays inert in
+        // the lobby (opponent not seated, no move played) and while the
+        // opponent is to move; a temporarily disconnected opponent does not
+        // lock the board, since the server still accepts our moves.
+        if (gameMode is GameMode.Online &&
+            (current.toMove != onlineYourColor || (!onlineOpponentOnline && moveList.isEmpty()))
+        ) return
         val square = FenBoard.parseSquare(squareName) ?: return
         val (row, col) = square
         val piece = board.grid[row][col]
@@ -235,6 +308,11 @@ class GameViewModel {
         if (cpuThinking) return false
         val current = status
         if (current !is GameStatus.Playing) return false
+        // Same online gate as [select] (add-online-multiplayer D4): the drag
+        // gesture asks the same question the tap path answers.
+        if (gameMode is GameMode.Online &&
+            (current.toMove != onlineYourColor || (!onlineOpponentOnline && moveList.isEmpty()))
+        ) return false
         val square = FenBoard.parseSquare(squareName) ?: return false
         val (row, col) = square
         val piece = board.grid[row][col]
@@ -254,7 +332,8 @@ class GameViewModel {
     val canStartNewGame: Boolean
         get() = when (val s = status) {
             is GameStatus.Checkmated, is GameStatus.Drawn,
-            is GameStatus.Resigned, is GameStatus.Failed -> true
+            is GameStatus.Resigned, is GameStatus.Forfeited,
+            is GameStatus.Failed -> true
             else -> moveList.isEmpty()
         }
 
@@ -266,6 +345,12 @@ class GameViewModel {
         // Single-active-game rule (enforce-single-active-game D1): never
         // replace a game that is still in progress.
         if (!canStartNewGame) return
+        // A local game replaces any open online session
+        // (add-online-multiplayer D7/D8): close the socket and forget the
+        // persisted room.
+        if (isOnlineMode) {
+            teardownOnlineSession()
+        }
         gameMode = mode
         cpuGeneration += 1
         cpuThinking = false
@@ -305,12 +390,18 @@ class GameViewModel {
     val gameEndMessage: String?
         get() = when (val s = status) {
             is GameStatus.Checkmated ->
-                if (gameMode is GameMode.Cpu)
+                if (gameMode is GameMode.Online)
+                    if (wonOnline(s.winner)) "You won.\n$onlineRatingsLine"
+                    else "You lost.\n$onlineRatingsLine"
+                else if (gameMode is GameMode.Cpu)
                     if (s.winner == "White") "Checkmate! You won!"
                     else "Checkmate! You lost."
                 else "Checkmate! ${s.winner} wins."
             is GameStatus.Resigned ->
-                if (gameMode is GameMode.Cpu) {
+                if (gameMode is GameMode.Online)
+                    if (wonOnline(s.winner)) "You won.\n$onlineRatingsLine"
+                    else "You lost.\n$onlineRatingsLine"
+                else if (gameMode is GameMode.Cpu) {
                     // Only the human resigns against the CPU (the human is
                     // White, design D6 of add-cpu-opponent).
                     "You resigned. You lost."
@@ -318,13 +409,27 @@ class GameViewModel {
                     val loser = if (s.winner == "White") "Black" else "White"
                     "$loser resigns. ${s.winner} wins."
                 }
-            is GameStatus.Drawn -> "The game is drawn."
+            is GameStatus.Forfeited ->
+                // Online only (add-online-multiplayer D4): the absent player
+                // lost when the server's reconnect window closed.
+                if (wonOnline(s.winner)) "You won.\n$onlineRatingsLine"
+                else "You lost.\n$onlineRatingsLine"
+            is GameStatus.Drawn ->
+                if (gameMode is GameMode.Online) "Draw.\n$onlineRatingsLine"
+                else "The game is drawn."
             else -> null
         }
 
     /** "Play again" in the game-end dialog (design D2): a fresh game in the
      * current mode (and CPU difficulty). */
     fun restart() {
+        // Online games have no "Play again" (a rematch would need a new room):
+        // the modal offers only "Done" there, and a stray call must not start
+        // one.
+        if (isOnlineMode) {
+            dismissGameEnd()
+            return
+        }
         startGame(gameMode)
     }
 
@@ -333,7 +438,26 @@ class GameViewModel {
     fun dismissGameEnd() {
         gameEndDismissed = true
         showGameEndDialog = false
+        // Online: release the seat so this device is free for a new room
+        // (add-online-multiplayer D4).
+        if (isOnlineMode) {
+            online?.leave()
+        }
     }
+
+    /** Online perspective (add-online-multiplayer D4): does the named winner
+     * color match the seat this device holds? */
+    private fun wonOnline(winner: String): Boolean =
+        (if (winner == "White") "w" else "b") == onlineYourColor
+
+    /** The ratings footer for the online game-end modal (design D11, step 4):
+     * our rating first, the opponent's second, rounded to whole points. */
+    private val onlineRatingsLine: String
+        get() {
+            val mine = if (onlineYourColor == "w") onlineWhiteRating else onlineBlackRating
+            val theirs = if (onlineYourColor == "w") onlineBlackRating else onlineWhiteRating
+            return "Your rating: ${Math.round(mine)} · Opponent: ${Math.round(theirs)}"
+        }
 
     // endregion
 
@@ -341,10 +465,24 @@ class GameViewModel {
 
     /** Whether the game can be resigned or undone right now. */
     val canResign: Boolean
-        get() = status is GameStatus.Playing
+        get() {
+            if (status !is GameStatus.Playing) return false
+            // Online: only once the game has actually started (the opponent is
+            // seated) or a move was played — the lobby answers `not_connected`.
+            if (isOnlineMode && !onlineOpponentOnline && moveList.isEmpty()) {
+                return false
+            }
+            return true
+        }
 
     val canUndo: Boolean
-        get() = moveList.isNotEmpty() && status is GameStatus.Playing
+        get() {
+            if (moveList.isEmpty() || status !is GameStatus.Playing) return false
+            // Online: the server owns the move list, so there is nothing to
+            // take back locally (add-online-multiplayer D4).
+            if (isOnlineMode) return false
+            return true
+        }
 
     /**
      * Resign the current game (design D4): an app-level terminal state. In a
@@ -355,13 +493,21 @@ class GameViewModel {
     fun resign() {
         val current = status
         if (current !is GameStatus.Playing) return
+        clearSelection()
+        // Online: the server records the resignation and confirms it with a
+        // terminal snapshot (add-online-multiplayer D4); nothing changes
+        // locally until that snapshot arrives.
+        if (isOnlineMode) {
+            online?.resign()
+            return
+        }
         cpuGeneration += 1
         cpuThinking = false
-        clearSelection()
         lastMove = null
         val winner = when (gameMode) {
             is GameMode.TwoPlayers -> if (toMove == "w") "Black" else "White"
             is GameMode.Cpu -> "Black"
+            is GameMode.Online -> "Black" // unreachable: the online branch returns above
         }
         status = GameStatus.Resigned(winner)
         errorMessage = null
@@ -414,6 +560,262 @@ class GameViewModel {
 
     // endregion
 
+    // region Online multiplayer (add-online-multiplayer D2/D4/D7/D8)
+
+    /**
+     * Connect and start an online game: create a fresh room (the caller takes
+     * the White seat) or join an existing one by code. The server is
+     * authoritative: the seat, the color, and every move come from its
+     * snapshots.
+     */
+    fun startOnlineGame(create: Boolean, code: String? = null): Boolean {
+        if (!canStartNewGame) return false
+        val url = resolvedServerURL() ?: run {
+            onlineJoinError = "No online server configured."
+            return false
+        }
+        // A fresh attempt replaces any stale session.
+        teardownOnlineSession()
+        resetForOnlineGame()
+        makeOnlineConnection(url)
+        if (create) {
+            online?.startCreating()
+        } else {
+            code?.let { online?.startJoining(it) }
+        }
+        return true
+    }
+
+    /** The setup sheet is opening: reset the online-join handshake flags so a
+     * stale "ready" from a previous attempt cannot auto-dismiss this sheet
+     * (add-online-multiplayer D4). The join error is kept on purpose: it is
+     * still relevant to the player who is choosing again. */
+    fun resetOnlineSheetState() {
+        onlineSessionReady = false
+    }
+
+    /** App-relaunch recovery (add-online-multiplayer D8, E2E 5.2): when a
+     * room was persisted mid-game, re-attach to it on startup so the server's
+     * reconnect window can resume the game on this device. */
+    fun restoreOnlineSessionIfNeeded() {
+        // A persisted in-progress room wins over the fresh local default game
+        // (which always has zero moves at startup, design D8).
+        if (moveList.isNotEmpty()) return
+        val code = GameViewModel.persistedRoomCode(context)
+        if (code.isNullOrEmpty()) return
+        val url = resolvedServerURL() ?: run {
+            // No server available: the persisted room can never be resumed.
+            clearOnlineRoomPersistence()
+            return
+        }
+        teardownOnlineSession()
+        resetForOnlineGame()
+        makeOnlineConnection(url)
+        online?.startReattaching(code)
+    }
+
+    /** Resolve the online server URL (add-online-multiplayer D9): the DEBUG
+     * override wins over the build-time default. */
+    private fun resolvedServerURL(): String? =
+        (debugOnlineURL ?: OnlineConfig.DEFAULT_URL).trim().takeIf { it.isNotEmpty() }
+
+    /** Fresh local mirror for an online game: the server is authoritative,
+     * and this session only replays the move list to answer "is this legal /
+     * is check on" locally. */
+    private fun resetForOnlineGame() {
+        gameMode = GameMode.Online
+        cpuGeneration += 1
+        cpuThinking = false
+        gameEndPresented = false
+        gameEndDismissed = false
+        showGameEndDialog = false
+        session = newGameSession(initialRating = 1500.0)
+        toMove = "w"
+        clearSelection()
+        lastMove = null
+        moveList = emptyList()
+        status = GameStatus.Starting
+        errorMessage = null
+        onlineJoinError = null
+        onlineSessionReady = false
+        onlineYourColor = null
+        onlineOpponentOnline = false
+        runCatching {
+            board = FenBoard.parse(session.getBoardState(), toMove)
+        }
+    }
+
+    private fun makeOnlineConnection(url: String) {
+        val manager = OnlineConnectionManager(url, GameViewModel.deviceID(context))
+        manager.onSnapshot = { state -> applyOnlineSnapshot(state) }
+        manager.onError = { code, message -> handleOnlineError(code, message) }
+        manager.onPhase = { phase -> handleOnlinePhase(phase) }
+        online = manager
+    }
+
+    /** Apply a server snapshot (add-online-multiplayer D2/D3): new moves are
+     * replayed into the mirror session, and the UI (board, move list, last
+     * move, status) is driven from the server's data. */
+    private fun applyOnlineSnapshot(state: OnlineState) {
+        onlineYourColor = state.yourColor.sideToMove
+        onlineOpponentOnline = state.opponentOnline
+        onlineWhiteRating = state.whiteRating
+        onlineBlackRating = state.blackRating
+        onlineRoomCode = online?.roomCode
+
+        // Replay any new moves into the mirror session.
+        if (state.moveList.size > moveList.size) {
+            val fresh = state.moveList.drop(moveList.size)
+            val replayed = runCatching {
+                for (uci in fresh) session.playMove(uciMove = uci)
+            }
+            if (replayed.isFailure) {
+                // The server confirmed a move the core rejects: desync.
+                status = GameStatus.Failed("Lost sync with the server")
+                errorMessage = "Lost sync with the server"
+                return
+            }
+            moveList = state.moveList
+            toMove = state.sideToMove
+            state.moveList.lastOrNull()?.let { lastUci ->
+                // 5-char promotion UCIs included: destination is chars 2-3.
+                lastMove = LastMove(lastUci.take(2), lastUci.drop(2).take(2))
+            }
+            clearSelection()
+            errorMessage = null
+        }
+
+        // Board: the snapshot carries the authoritative placement.
+        runCatching {
+            board = FenBoard.parse(state.boardFen, state.sideToMove)
+        }
+
+        status = when (val s = state.status) {
+            is OnlineStatus.Playing -> {
+                val inCheck = runCatching { session.isCheck() }.getOrDefault(false)
+                GameStatus.Playing(state.sideToMove, inCheck)
+            }
+            is OnlineStatus.Checkmated -> GameStatus.Checkmated(s.winnerColor.displayName)
+            is OnlineStatus.Drawn -> GameStatus.Drawn
+            is OnlineStatus.Resigned -> GameStatus.Resigned(s.winnerColor.displayName)
+            is OnlineStatus.Forfeited -> GameStatus.Forfeited(s.winnerColor.displayName)
+        }
+
+        if (state.status.isTerminal) {
+            // The game is over: the room will not be resumed on relaunch.
+            clearOnlineRoomPersistence()
+        }
+        onlineSessionReady = true
+        markTerminalIfNeeded()
+    }
+
+    /** Structured server errors (add-online-multiplayer D5): room-level
+     * errors land on the join screen; in-game rejections keep the server
+     * position and clear the selection. */
+    private fun handleOnlineError(code: OnlineErrorCode?, message: String) {
+        when (code) {
+            OnlineErrorCode.ROOM_NOT_FOUND,
+            OnlineErrorCode.ROOM_FULL,
+            OnlineErrorCode.INVALID_ROOM_CODE,
+            OnlineErrorCode.ALREADY_IN_ROOM ->
+                // The sheet (if open) shows this; it stays open so the player
+                // can fix the code or create a room instead.
+                onlineJoinError = message
+
+            OnlineErrorCode.NOT_YOUR_TURN,
+            OnlineErrorCode.ILLEGAL_MOVE -> {
+                errorMessage = message
+                clearSelection()
+            }
+
+            else -> errorMessage = message
+        }
+    }
+
+    /** Mirror the connection phase into the view model's own observed state
+     * and maintain the persisted-room bookkeeping. */
+    private fun handleOnlinePhase(phase: OnlinePhase) {
+        onlinePhase = phase
+        onlineReconnecting = phase is OnlinePhase.Reconnecting
+        onlineRoomCode = online?.roomCode
+        when (phase) {
+            is OnlinePhase.Waiting ->
+                // A seat was confirmed: remember the room for relaunch recovery.
+                persistOnlineRoom(phase.code)
+
+            is OnlinePhase.InGame ->
+                online?.roomCode?.let { persistOnlineRoom(it) }
+
+            is OnlinePhase.Failed -> {
+                onlineSessionReady = false
+                when (status) {
+                    is GameStatus.Playing -> {
+                        status = GameStatus.Failed("Connection to the online server was lost")
+                        errorMessage = "Connection lost"
+                    }
+                    is GameStatus.Starting -> errorMessage = "Connection lost"
+                    else -> {}
+                }
+            }
+
+            else -> {}
+        }
+    }
+
+    /** Close and forget the online session (add-online-multiplayer D7/D8). */
+    private fun teardownOnlineSession() {
+        online?.teardown()
+        online = null
+        onlinePhase = OnlinePhase.Idle
+        onlineReconnecting = false
+        onlineRoomCode = null
+        onlineYourColor = null
+        onlineJoinError = null
+        onlineSessionReady = false
+        onlineOpponentOnline = false
+        clearOnlineRoomPersistence()
+    }
+
+    private fun persistOnlineRoom(code: String) {
+        GameViewModel.persistRoomCode(context, code)
+    }
+
+    private fun clearOnlineRoomPersistence() {
+        GameViewModel.clearPersistedRoom(context)
+    }
+
+    // endregion
+
+    companion object {
+        private const val PREFS_NAME = "plaintextchess"
+        private const val KEY_DEVICE_ID = "plaintextchess.device_id"
+        private const val KEY_ONLINE_ROOM_CODE = "plaintextchess.online_room_code"
+
+        /** Persistent device identifier (add-online-multiplayer D8): one room
+         * per device across relaunches; the server re-binds the seat by it. */
+        fun deviceID(context: Context): String {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs.getString(KEY_DEVICE_ID, null)?.let { return it }
+            val id = UUID.randomUUID().toString()
+            prefs.edit().putString(KEY_DEVICE_ID, id).apply()
+            return id
+        }
+
+        fun persistedRoomCode(context: Context): String? =
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_ONLINE_ROOM_CODE, null)
+
+        fun persistRoomCode(context: Context, code: String) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putString(KEY_ONLINE_ROOM_CODE, code).apply()
+        }
+
+        fun clearPersistedRoom(context: Context) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().remove(KEY_ONLINE_ROOM_CODE).apply()
+        }
+    }
+
     /**
      * D1: promotions are the 5-character UCI moves. Group them by
      * destination and order the options q/r/b/n.
@@ -431,6 +833,15 @@ class GameViewModel {
     }
 
     private fun playMove(from: String, to: String, uci: String) {
+        if (gameMode is GameMode.Online) {
+            // The server is authoritative (add-online-multiplayer D4/D7): send
+            // the move and wait for the confirming snapshot; the board only
+            // changes when the server confirms. A rejected move answers with a
+            // structured error and the position stays as it is.
+            clearSelection()
+            online?.sendMove(uci)
+            return
+        }
         try {
             session.playMove(uciMove = uci)
             toMove = if (toMove == "w") "b" else "w"
@@ -529,7 +940,9 @@ class GameViewModel {
     private fun markTerminalIfNeeded() {
         if (gameEndPresented) return
         val s = status
-        if (s is GameStatus.Checkmated || s is GameStatus.Drawn || s is GameStatus.Resigned) {
+        if (s is GameStatus.Checkmated || s is GameStatus.Drawn ||
+            s is GameStatus.Resigned || s is GameStatus.Forfeited
+        ) {
             gameEndPresented = true
             showGameEndDialog = true
         }

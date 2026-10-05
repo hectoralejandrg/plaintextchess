@@ -10,14 +10,20 @@ enum GameStatus: Equatable {
     /// App-level terminal state (design D4 of add-game-end-dialog): the
     /// resigner is the losing side, `winner` the opponent.
     case resigned(winner: String)
+    /// Online terminal state (add-online-multiplayer D4): the absent player
+    /// lost by the server's reconnect-window forfeit; `winner` is the
+    /// connected player's color.
+    case forfeited(winner: String)
     case failed(String)
 }
 
-/// Opponent mode for a game (design D4/D6): two human players, or a human
-/// (White) versus the CPU (Black) at a chosen difficulty.
+/// Opponent mode for a game (design D4/D6): two human players, a human
+/// (White) versus the CPU (Black) at a chosen difficulty, or an online game
+/// against another device (add-online-multiplayer D4/D7).
 enum GameMode: Equatable {
     case twoPlayers
     case cpu(CpuDifficulty)
+    case online
 }
 
 /// CPU difficulty levels, matching the core's search depth (design D2):
@@ -85,6 +91,35 @@ final class GameViewModel: ObservableObject {
     /// is locked and the status row shows "CPU is thinking…".
     @Published private(set) var cpuThinking = false
 
+    // MARK: Online multiplayer state (add-online-multiplayer D4/D7/D8).
+
+    /// Connection phase mirrored from the `OnlineConnectionManager` (SwiftUI
+    /// observes the view model, so the manager's state is mirrored here from
+    /// its callbacks).
+    @Published private(set) var onlinePhase: OnlinePhase = .idle
+    /// True while the socket is dropped and the manager re-attaches; the UI
+    /// shows a banner and the last known position stays on screen.
+    @Published private(set) var onlineReconnecting = false
+    /// The room code of the current online room (shown with a copy action in
+    /// the waiting state).
+    @Published private(set) var onlineRoomCode: String?
+    /// Our color in the online game ("w"/"b"), from the server snapshot.
+    @Published private(set) var onlineYourColor: String?
+    /// True once the server confirmed the seat (`room_ready` received): the
+    /// setup sheet dismisses itself.
+    @Published private(set) var onlineSessionReady = false
+    /// A join-time error, shown on the join screen while the sheet stays open.
+    @Published private(set) var onlineJoinError: String?
+    /// Whether the opponent's seat is currently connected, per the last
+    /// snapshot: false in the lobby (our room, no opponent yet), which gates
+    /// input and resign until the game has actually started.
+    @Published private(set) var onlineOpponentOnline = false
+    /// Ratings from the last snapshot, by color (add-online-multiplayer D5).
+    /// Shown in the terminal-state modal so both clients see the updated
+    /// ratings in the final state (design D11, step 4).
+    @Published private(set) var onlineWhiteRating: Double = 1500
+    @Published private(set) var onlineBlackRating: Double = 1500
+
     /// Game-end dialog visibility (design D2 of add-game-end-dialog): the VM
     /// owns the presentation so the "appears once" rule has no view-layer
     /// race. `ContentView` binds the alert to this flag.
@@ -109,6 +144,37 @@ final class GameViewModel: ObservableObject {
     /// Bumped on every `startGame` so an in-flight CPU move from an older game
     /// is discarded instead of applied (design D5).
     private var cpuGeneration = 0
+    /// Live online session (add-online-multiplayer D7); `nil` for local games.
+    private var online: OnlineConnectionManager?
+
+    /// Persistent device identifier (add-online-multiplayer D8): the server
+    /// tracks players by it, so a re-attach after a drop or an app relaunch
+    /// re-enters the same seat.
+    static let deviceIDKey = "plaintextchess.device_id"
+    /// Persisted room code of an in-progress online game, so an app relaunch
+    /// can re-attach within the server's reconnect window.
+    static let onlineRoomKey = "plaintextchess.online_room_code"
+
+    /// The stable per-device identifier: created once, reused forever.
+    static var deviceID: String {
+        if let existing = UserDefaults.standard.string(forKey: deviceIDKey),
+           !existing.isEmpty
+        {
+            return existing
+        }
+        let id = UUID().uuidString
+        UserDefaults.standard.set(id, forKey: deviceIDKey)
+        return id
+    }
+
+    /// True when the current game is online (the UI switches to the online
+    /// wording: "Your move", You won/lost modal, no Play again, no Undo).
+    var isOnlineMode: Bool {
+        if case .online = gameMode {
+            return true
+        }
+        return false
+    }
 
     /// Game-end dialog bookkeeping (design D2 of add-game-end-dialog): the
     /// modal is presented once per game and never re-presented after the
@@ -125,6 +191,15 @@ final class GameViewModel: ObservableObject {
 
     func setDebugCpuDelay(_ seconds: Double) {
         debugCpuDelay = seconds
+    }
+
+    /// DEBUG test hook (add-online-multiplayer): the online server URL from
+    /// `-PLAINTCHESS_ONLINE_URL`; the `onlinecreate` and `onlinejoin:<code>`
+    /// script tokens use it to drive a live server from the script.
+    private var debugOnlineURL: String?
+
+    func setDebugOnlineURL(_ url: String?) {
+        debugOnlineURL = url
     }
     #endif
 
@@ -151,6 +226,13 @@ final class GameViewModel: ObservableObject {
         // Locked while the CPU is thinking (design D5): no selection, no move.
         guard !cpuThinking else { return }
         guard case .playing(let toMove, _) = status else { return }
+        // Online: input is only accepted while the game is in progress and on
+        // our own turn (add-online-multiplayer D4). The board stays inert in
+        // the lobby (opponent not seated, no move played) and while the
+        // opponent is to move; a temporarily disconnected opponent does not
+        // lock the board, since the server still accepts our moves.
+        if case .online = gameMode,
+           toMove != onlineYourColor || (!onlineOpponentOnline && moveList.isEmpty) { return }
         guard let (row, col) = FenBoard.parseSquare(squareName) else { return }
         let piece = board.grid[row][col]
 
@@ -221,6 +303,10 @@ final class GameViewModel: ObservableObject {
         // Locked while the CPU is thinking (design D5).
         guard !cpuThinking else { return false }
         guard case .playing(let toMove, _) = status else { return false }
+        // Online: only our own color may be picked up, once the game has
+        // started (add-online-multiplayer D4) — same rule as `select`.
+        if case .online = gameMode,
+           (!onlineOpponentOnline && moveList.isEmpty) || toMove != onlineYourColor { return false }
         guard let (row, col) = FenBoard.parseSquare(squareName) else { return false }
         let piece = board.grid[row][col]
         return !piece.isEmpty && isOwn(piece, toMove: toMove)
@@ -236,7 +322,7 @@ final class GameViewModel: ObservableObject {
     /// `restart()` needs no special-casing because terminal ⇒ gate open (D2).
     var canStartNewGame: Bool {
         switch status {
-        case .checkmated, .drawn, .resigned, .failed:
+        case .checkmated, .drawn, .resigned, .forfeited, .failed:
             return true
         case .starting, .playing:
             return moveList.isEmpty
@@ -249,6 +335,12 @@ final class GameViewModel: ObservableObject {
         // Single-active-game rule (enforce-single-active-game D1): never
         // replace a game that is still in progress.
         guard canStartNewGame else { return }
+        // A local game replaces any open online session
+        // (add-online-multiplayer D7/D8): close the socket and forget the
+        // persisted room.
+        if isOnlineMode {
+            teardownOnlineSession()
+        }
         gameMode = mode
         cpuGeneration += 1
         cpuThinking = false
@@ -287,11 +379,19 @@ final class GameViewModel: ObservableObject {
     var gameEndMessage: String? {
         switch status {
         case .checkmated(let winner):
+            if case .online = gameMode {
+                return wonOnline(winner) ? "You won.\n\(onlineRatingsLine)"
+                                        : "You lost.\n\(onlineRatingsLine)"
+            }
             if case .cpu = gameMode {
                 return winner == "White" ? "Checkmate! You won!" : "Checkmate! You lost."
             }
             return "Checkmate! \(winner) wins."
         case .resigned(let winner):
+            if case .online = gameMode {
+                return wonOnline(winner) ? "You won.\n\(onlineRatingsLine)"
+                                        : "You lost.\n\(onlineRatingsLine)"
+            }
             if case .cpu = gameMode {
                 // Only the human resigns against the CPU (design D4/D6 of
                 // add-cpu-opponent: the human is White).
@@ -299,16 +399,47 @@ final class GameViewModel: ObservableObject {
             }
             let loser = winner == "White" ? "Black" : "White"
             return "\(loser) resigns. \(winner) wins."
+        case .forfeited(let winner):
+            // Online only (add-online-multiplayer D4): the absent player lost
+            // when the server's reconnect window closed.
+            return wonOnline(winner) ? "You won.\n\(onlineRatingsLine)"
+                                     : "You lost.\n\(onlineRatingsLine)"
         case .drawn:
+            if case .online = gameMode {
+                return "Draw.\n\(onlineRatingsLine)"
+            }
             return "The game is drawn."
         default:
             return nil
         }
     }
 
+    /// The ratings footer for the online game-end modal (design D11, step 4):
+    /// our rating first, the opponent's second, rounded to whole points.
+    private var onlineRatingsLine: String {
+        let (mine, theirs) = onlineYourColor == "w"
+            ? (onlineWhiteRating, onlineBlackRating)
+            : (onlineBlackRating, onlineWhiteRating)
+        return "Your rating: \(Int(mine.rounded())) · Opponent: \(Int(theirs.rounded()))"
+    }
+
+    /// Online perspective (add-online-multiplayer D4): does the named winner
+    /// color match the seat this device holds?
+    private func wonOnline(_ winner: String) -> Bool {
+        let square = winner == "White" ? "w" : "b"
+        return square == onlineYourColor
+    }
+
     /// "Play again" in the game-end dialog (design D2): a fresh game in the
     /// current mode (and CPU difficulty).
     func restart() {
+        // Online games have no "Play again" (a rematch would need a new room):
+        // the modal offers only "Done" there, and a stray call must not start
+        // one.
+        if isOnlineMode {
+            dismissGameEnd()
+            return
+        }
         startGame(gameMode)
     }
 
@@ -317,19 +448,32 @@ final class GameViewModel: ObservableObject {
     func dismissGameEnd() {
         gameEndDismissed = true
         showGameEndDialog = false
+        // Online: release the seat so this device is free for a new room
+        // (add-online-multiplayer D4).
+        if isOnlineMode {
+            online?.leave()
+        }
     }
 
     // MARK: - Resign / undo / flip (design D4/D5/D6 of add-game-end-dialog)
 
     /// Whether the game can be resigned or undone right now.
     var canResign: Bool {
-        if case .playing = status { return true }
-        return false
+        guard case .playing = status else { return false }
+        // Online: only once the game has actually started (the opponent is
+        // seated) or a move was played — the lobby answers `not_connected`.
+        if isOnlineMode, !onlineOpponentOnline, moveList.isEmpty {
+            return false
+        }
+        return true
     }
 
     var canUndo: Bool {
         guard !moveList.isEmpty else { return false }
         guard case .playing = status else { return false }
+        // Online: the server owns the move list, so there is nothing to take
+        // back locally (add-online-multiplayer D4).
+        if isOnlineMode { return false }
         return true
     }
 
@@ -339,9 +483,16 @@ final class GameViewModel: ObservableObject {
     /// (same mechanism as `startGame`, design D5 of add-cpu-opponent).
     func resign() {
         guard case .playing = status else { return }
+        clearSelection()
+        // Online: the server records the resignation and confirms it with a
+        // terminal snapshot (add-online-multiplayer D4); nothing changes
+        // locally until that snapshot arrives.
+        if isOnlineMode {
+            online?.resign()
+            return
+        }
         cpuGeneration += 1
         cpuThinking = false
-        clearSelection()
         lastMove = nil
         let winner: String
         switch gameMode {
@@ -349,6 +500,9 @@ final class GameViewModel: ObservableObject {
             winner = toMove == "w" ? "Black" : "White"
         case .cpu:
             winner = "Black"
+        case .online:
+            // Unreachable: the online branch returns above.
+            return
         }
         status = .resigned(winner: winner)
         errorMessage = nil
@@ -406,6 +560,245 @@ final class GameViewModel: ObservableObject {
         boardOrientation = boardOrientation == 0 ? 180 : 0
     }
 
+    // MARK: - Online multiplayer (add-online-multiplayer D4/D7/D8)
+
+    /// Start an online game: `create` takes the White seat of a new room;
+    /// otherwise join the room `code` (Black seat). Returns `false` without
+    /// touching the game when the New game gate is closed or no server is
+    /// configured (the setup sheet stays open and shows the reason).
+    @discardableResult
+    func startOnlineGame(create: Bool, code: String? = nil,
+                         serverURLString: String?) -> Bool {
+        guard canStartNewGame else { return false }
+        guard let url = Self.onlineServerURL(serverURLString) else {
+            onlineJoinError = "No online server configured."
+            return false
+        }
+        // A fresh attempt replaces any stale session.
+        teardownOnlineSession()
+        resetForOnlineGame()
+        makeOnlineConnection(url: url)
+        if create {
+            online?.startCreating()
+        } else if let code {
+            online?.startJoining(code: code)
+        }
+        return true
+    }
+
+    /// The setup sheet is opening: reset the online-join handshake flags so a
+    /// stale "ready" from a previous attempt cannot auto-dismiss this sheet
+    /// (add-online-multiplayer D4). The join error is kept on purpose: it is
+    /// still relevant to the player who is choosing again.
+    func resetOnlineSheetState() {
+        onlineSessionReady = false
+    }
+
+    /// App-relaunch recovery (add-online-multiplayer D8, E2E 5.2): when a room
+    /// was persisted mid-game, re-attach to it on startup so the server's
+    /// reconnect window can resume the game on this device.
+    func restoreOnlineSessionIfNeeded(serverURLString: String?) {
+        // A persisted in-progress room wins over the fresh local default game
+        // (which always has zero moves at startup, design D8).
+        guard moveList.isEmpty else { return }
+        guard let code = UserDefaults.standard.string(forKey: Self.onlineRoomKey),
+              !code.isEmpty
+        else { return }
+        guard let url = Self.onlineServerURL(serverURLString) else {
+            // No server available: the persisted room can never be resumed.
+            clearOnlineRoomPersistence()
+            return
+        }
+        teardownOnlineSession()
+        resetForOnlineGame()
+        makeOnlineConnection(url: url)
+        online?.startReattaching(code: code)
+    }
+
+    private static func onlineServerURL(_ string: String?) -> URL? {
+        guard let trimmed = string?.trimmingCharacters(in: .whitespaces),
+              !trimmed.isEmpty,
+              let url = URL(string: trimmed)
+        else { return nil }
+        return url
+    }
+
+    /// Fresh local mirror for an online game: the server is authoritative, and
+    /// this session only replays the move list to answer "is this legal / is
+    /// check on" locally.
+    private func resetForOnlineGame() {
+        gameMode = .online
+        cpuGeneration += 1
+        cpuThinking = false
+        gameEndPresented = false
+        gameEndDismissed = false
+        showGameEndDialog = false
+        session = newGameSession(initialRating: 1500.0)
+        toMove = "w"
+        clearSelection()
+        lastMove = nil
+        moveList = []
+        status = .starting
+        errorMessage = nil
+        onlineJoinError = nil
+        onlineSessionReady = false
+        onlineYourColor = nil
+        onlineOpponentOnline = false
+        do {
+            board = try FenBoard(board: session.getBoardState(), sideToMove: toMove)
+        } catch {
+            board = try! FenBoard(board: FenBoard.startBoard, sideToMove: "w")
+        }
+    }
+
+    private func makeOnlineConnection(url: URL) {
+        let manager = OnlineConnectionManager(url: url, deviceID: Self.deviceID)
+        manager.onSnapshot = { [weak self] state in
+            self?.applyOnlineSnapshot(state)
+        }
+        manager.onError = { [weak self] errorCode, message in
+            self?.handleOnlineError(code: errorCode, message: message)
+        }
+        manager.onPhase = { [weak self] phase in
+            self?.handleOnlinePhase(phase)
+        }
+        online = manager
+    }
+
+    /// Apply a server snapshot (add-online-multiplayer D2/D3): new moves are
+    /// replayed into the mirror session, and the UI (board, move list, last
+    /// move, status) is driven from the server's data.
+    private func applyOnlineSnapshot(_ state: OnlineState) {
+        onlineYourColor = state.yourColor.sideToMoveSquare
+        onlineOpponentOnline = state.opponentOnline
+        onlineWhiteRating = state.whiteRating
+        onlineBlackRating = state.blackRating
+        if let code = online?.roomCode {
+            onlineRoomCode = code
+        }
+
+        // Replay any new moves into the mirror session.
+        if state.moveList.count > moveList.count {
+            let fresh = state.moveList.dropFirst(moveList.count)
+            do {
+                for uci in fresh {
+                    try session.playMove(uciMove: uci)
+                }
+            } catch {
+                // The server confirmed a move the core rejects: desync.
+                status = .failed("Lost sync with the server")
+                errorMessage = "Lost sync with the server"
+                return
+            }
+            moveList = state.moveList
+            toMove = state.sideToMove
+            if let lastUci = state.moveList.last {
+                // 5-char promotion UCIs included: destination is chars 2-3.
+                lastMove = LastMove(from: String(lastUci.prefix(2)),
+                                    to: String(lastUci.dropFirst(2).prefix(2)))
+            }
+            clearSelection()
+            errorMessage = nil
+        }
+
+        // Board: the snapshot carries the authoritative placement.
+        if let rebuilt = try? FenBoard(board: state.boardFen, sideToMove: state.sideToMove) {
+            board = rebuilt
+        }
+
+        switch state.status {
+        case .playing:
+            let inCheck = (try? session.isCheck()) ?? false
+            status = .playing(toMove: state.sideToMove, inCheck: inCheck)
+        case .checkmated(let winner):
+            status = .checkmated(winner: winner.displayName)
+        case .drawn:
+            status = .drawn
+        case .resigned(let winner):
+            status = .resigned(winner: winner.displayName)
+        case .forfeited(let winner):
+            status = .forfeited(winner: winner.displayName)
+        }
+
+        if state.status.isTerminal {
+            // The game is over: the room will not be resumed on relaunch.
+            clearOnlineRoomPersistence()
+        }
+        onlineSessionReady = true
+        markTerminalIfNeeded()
+    }
+
+    /// Structured server errors (add-online-multiplayer D5): room-level errors
+    /// land on the join screen; in-game rejections keep the server position
+    /// and clear the selection.
+    private func handleOnlineError(code: OnlineErrorCode, message: String) {
+        switch code {
+        case .roomNotFound, .roomFull, .invalidRoomCode, .alreadyInRoom:
+            // The sheet (if open) shows this; it stays open so the player can
+            // fix the code or create a room instead.
+            onlineJoinError = message
+        case .notYourTurn, .illegalMove:
+            errorMessage = message
+            clearSelection()
+        default:
+            errorMessage = message
+        }
+    }
+
+    /// Mirror the connection phase into the view model's own published state
+    /// and maintain the persisted-room bookkeeping.
+    private func handleOnlinePhase(_ phase: OnlinePhase) {
+        onlinePhase = phase
+        onlineReconnecting = (phase == .reconnecting)
+        if let code = online?.roomCode {
+            onlineRoomCode = code
+        }
+        switch phase {
+        case .waiting(let code):
+            // A seat was confirmed: remember the room for relaunch recovery.
+            persistOnlineRoom(code)
+        case .inGame:
+            if let code = online?.roomCode {
+                persistOnlineRoom(code)
+            }
+        case .failed:
+            onlineSessionReady = false
+            switch status {
+            case .playing:
+                status = .failed("Connection to the online server was lost")
+                errorMessage = "Connection lost"
+            case .starting:
+                errorMessage = "Connection lost"
+            default:
+                break
+            }
+        default:
+            break
+        }
+    }
+
+    /// Close and forget the online session (add-online-multiplayer D7/D8).
+    private func teardownOnlineSession() {
+        online?.teardown()
+        online = nil
+        onlinePhase = .idle
+        onlineReconnecting = false
+        onlineRoomCode = nil
+        onlineYourColor = nil
+        onlineJoinError = nil
+        onlineSessionReady = false
+        onlineOpponentOnline = false
+        clearOnlineRoomPersistence()
+    }
+
+    private func persistOnlineRoom(_ code: String) {
+        UserDefaults.standard.set(code, forKey: Self.onlineRoomKey)
+    }
+
+    private func clearOnlineRoomPersistence() {
+        UserDefaults.standard.removeObject(forKey: Self.onlineRoomKey)
+    }
+
     // MARK: - Internals
 
     /// D1: promotions are the 5-character UCI moves. Group them by
@@ -424,6 +817,15 @@ final class GameViewModel: ObservableObject {
     }
 
     private func playMove(from: String, to: String, uci: String) {
+        if isOnlineMode {
+            // The server is authoritative (add-online-multiplayer D4/D7): send
+            // the move and wait for the confirming snapshot; the board only
+            // changes when the server confirms. A rejected move answers with a
+            // structured error and the position stays as it is.
+            clearSelection()
+            online?.sendMove(uci)
+            return
+        }
         do {
             try session.playMove(uciMove: uci)
             toMove = toMove == "w" ? "b" : "w"
@@ -545,7 +947,7 @@ final class GameViewModel: ObservableObject {
     private func markTerminalIfNeeded() {
         guard !gameEndPresented else { return }
         switch status {
-        case .checkmated, .drawn, .resigned:
+        case .checkmated, .drawn, .resigned, .forfeited:
             gameEndPresented = true
             showGameEndDialog = true
         default:
@@ -586,6 +988,23 @@ final class GameViewModel: ObservableObject {
                 // Exercises the same intent the picker's outside-tap catcher
                 // calls (design D5).
                 self.cancelPromotion()
+            } else if token == "onlinecreate" {
+                // add-online-multiplayer: start an online game as the room
+                // creator (White) against the -PLAINTCHESS_ONLINE_URL server.
+                _ = self.startOnlineGame(create: true,
+                                         serverURLString: self.debugOnlineURL)
+            } else if token.hasPrefix("onlinejoin:") {
+                // `onlinejoin:AB23CD`: join that room as Black.
+                let code = String(token.dropFirst("onlinejoin:".count))
+                _ = self.startOnlineGame(create: false, code: code,
+                                         serverURLString: self.debugOnlineURL)
+            } else if token.hasPrefix("forcemove:") {
+                // E2E rejection check (task 2.4): send a raw UCI to the server
+                // bypassing the turn gating, to exercise the structured-error
+                // path (not_your_turn / illegal_move → message + selection
+                // cleared, server position kept).
+                let uci = String(token.dropFirst("forcemove:".count))
+                self.online?.sendMove(uci)
             } else if token == "undo" || token == "resign" || token == "flip"
                 || token == "done" || token == "playagain" {
                 // add-game-end-dialog: drive the new controls and the game-end
@@ -607,11 +1026,28 @@ final class GameViewModel: ObservableObject {
                 // with the picker open (screenshot-able, design D5).
                 let from = String(token.prefix(2))
                 let to = String(token.dropFirst(2).prefix(2))
-                self.select(from)
-                self.select(to)
-                if token.count == 5 {
-                    self.confirmPromotion(String(token.suffix(1)))
+                // Online: the move is only "confirmed" when the server's
+                // snapshot lands (moveList gains this exact UCI). Attempt it
+                // while unconfirmed and retry the same token on later ticks
+                // (turn gating inside `select` makes early attempts no-ops);
+                // advance only once confirmed. Local games apply the move
+                // synchronously, so they keep advancing unconditionally.
+                // A UCI move can never repeat within one game, so "present in
+                // the list" is a safe confirmation. (`.last` is wrong: by the
+                // next tick the opponent has usually already replied, so the
+                // last entry is their move, not ours.)
+                let confirmed = self.moveList.contains(token)
+                if !confirmed {
+                    self.select(from)
+                    self.select(to)
+                    if token.count == 5 {
+                        self.confirmPromotion(String(token.suffix(1)))
+                    }
                 }
+                let advance = confirmed || !self.isOnlineMode
+                self.playScriptNow(advance ? Array(moves.dropFirst()) : moves,
+                                   interval: interval)
+                return
             }
             self.playScriptNow(Array(moves.dropFirst()), interval: interval)
         }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Playable two-player chess game screen (milestone 1).
 ///
@@ -31,6 +32,9 @@ struct ContentView: View {
     /// 0.5 s; `-PLAINTCHESS_SCRIPT_INTERVAL` widens it so CPU-mode scripts
     /// wait out CPU replies instead of racing the `cpuThinking` guard.
     private let debugScriptInterval: Double
+    /// DEBUG: online server URL override (add-online-multiplayer D9); wins
+    /// over `OnlineConfig.defaultURL`.
+    private let debugOnlineURL: String?
 
     init() {
         var animScale = 1.0
@@ -38,6 +42,7 @@ struct ContentView: View {
         var mode: GameMode = .twoPlayers
         var cpuDelay = 0.0
         var scriptInterval = 0.5
+        var onlineURL: String?
         #if DEBUG
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "-PLAINTCHESS_ANIM_SCALE"),
@@ -67,43 +72,111 @@ struct ContentView: View {
            i + 1 < args.count, let s = Double(args[i + 1]), s > 0 {
             scriptInterval = s
         }
+        if let i = args.firstIndex(of: "-PLAINTCHESS_ONLINE_URL"),
+           i + 1 < args.count, !args[i + 1].isEmpty {
+            onlineURL = args[i + 1]
+        }
         #endif
         debugAnimScale = animScale
         debugDrag = drag
         debugMode = mode
         debugCpuDelay = cpuDelay
         debugScriptInterval = scriptInterval
+        debugOnlineURL = onlineURL
+    }
+
+    /// The online server URL for this build: the DEBUG launch-arg override
+    /// wins over the default constant (add-online-multiplayer D9). `nil` when
+    /// none is configured: online play is then unavailable.
+    private var effectiveOnlineURL: String? {
+        let url = debugOnlineURL ?? OnlineConfig.defaultURL
+        return url.isEmpty ? nil : url
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("PlainTextChess")
-                .font(.largeTitle.bold())
-                .padding(.horizontal)
+        GeometryReader { proxy in
+            // The board always spans the full container width and keeps that
+            // exact size in every state. A fixed square frame derived from
+            // the screen width can never be squeezed by the dynamic siblings
+            // (waiting banner, error footnote, growing move list), so the
+            // board never resizes. The chrome around it is budgeted so the
+            // worst simultaneous content still fits around a full-width
+            // board on an iPhone 16 Pro (472.7 pt available): the move list
+            // is capped at 96 pt, the stack spacing is 10 pt, and the
+            // waiting banner keeps a 10 pt inset, leaving slack for Dynamic
+            // Type / rendering differences.
+            let boardSide = proxy.size.width
+            VStack(alignment: .leading, spacing: 10) {
+                Text("PlainTextChess")
+                    .font(.largeTitle.bold())
+                    .padding(.horizontal)
 
-            statusRow
-                .padding(.horizontal)
+                statusRow
+                    .padding(.horizontal)
 
-            BoardView(vm: vm,
-                      animScale: debugAnimScale,
-                      dragTest: debugDrag)
-                .frame(maxWidth: .infinity)
+                if case .waiting(let code) = vm.onlinePhase {
+                    // Online waiting state (add-online-multiplayer D4): the room
+                    // code, with a copy action, while the opponent is still away.
+                    waitingBanner(code: code)
+                        .padding(.horizontal)
+                }
 
-            moveList
-                .padding(.horizontal)
+                BoardView(vm: vm,
+                          animScale: debugAnimScale,
+                          dragTest: debugDrag)
+                    .frame(width: boardSide, height: boardSide)
+                    .overlay {
+                        // Reconnect banner (add-online-multiplayer D7): the last
+                        // known position stays on screen behind it.
+                        if vm.onlineReconnecting {
+                            Text("Reconnecting…")
+                                .font(.callout.bold())
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(.thinMaterial, in: Capsule())
+                        }
+                    }
 
-            controls
-                .padding(.horizontal)
+                moveList
+                    .padding(.horizontal)
+
+                controls
+                    .padding(.horizontal)
+            }
+            .padding(.vertical)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .padding(.vertical)
-        .sheet(isPresented: $showNewGameSheet) {
-            NewGameSetupView { mode in
-                vm.startGame(mode)
+        // The sheet also closes itself once the server confirms an online
+        // seat (`onlineSessionReady`); opening it resets the handshake flag.
+        .sheet(isPresented: Binding(
+            get: { showNewGameSheet && !vm.onlineSessionReady },
+            set: { showNewGameSheet = $0 }
+        )) {
+            NewGameSetupView(
+                hasServerURL: effectiveOnlineURL != nil,
+                joinError: vm.onlineJoinError
+            ) { choice in
+                switch choice {
+                case .twoPlayers:
+                    vm.startGame(.twoPlayers)
+                case .cpu(let difficulty):
+                    vm.startGame(.cpu(difficulty))
+                case .onlineCreate:
+                    _ = vm.startOnlineGame(create: true,
+                                           serverURLString: effectiveOnlineURL)
+                case .onlineJoin(let code):
+                    _ = vm.startOnlineGame(create: false, code: code,
+                                           serverURLString: effectiveOnlineURL)
+                }
             }
         }
         .onAppear {
+            // Relaunch recovery (add-online-multiplayer D8, E2E 5.2): re-attach
+            // to a persisted in-progress room within the server's window.
+            vm.restoreOnlineSessionIfNeeded(serverURLString: effectiveOnlineURL)
             #if DEBUG
             vm.setDebugCpuDelay(debugCpuDelay)
+            vm.setDebugOnlineURL(effectiveOnlineURL)
             if case .cpu = debugMode {
                 // Start directly in a CPU game for scripted verification.
                 vm.startGame(debugMode)
@@ -118,17 +191,37 @@ struct ContentView: View {
     @ViewBuilder
     private var statusRow: some View {
         HStack(spacing: 8) {
-            if vm.cpuThinking {
+            if vm.onlineReconnecting {
+                // Online: the socket dropped mid-game; the last known position
+                // stays on screen (add-online-multiplayer D7).
+                Text("Reconnecting…")
+                    .font(.headline)
+                    .foregroundColor(.orange)
+            } else if case .waiting = vm.onlinePhase {
+                Text("Waiting for opponent to join…")
+                    .font(.headline)
+            } else if vm.cpuThinking {
                 Text("CPU is thinking…")
                     .font(.headline)
             } else {
                 switch vm.status {
                 case .starting:
-                    Text("Creating session…")
+                    Text(vm.isOnlineMode ? "Connecting to online server…"
+                                         : "Creating session…")
                         .font(.headline)
                 case .playing(let toMove, let inCheck):
-                    Text(toMove == "w" ? "White to move" : "Black to move")
-                        .font(.headline)
+                    if vm.isOnlineMode, toMove == vm.onlineYourColor {
+                        // Clearly mark the player's own turn
+                        // (add-online-multiplayer D4).
+                        Text("Your move")
+                            .font(.headline.bold())
+                    } else if vm.isOnlineMode {
+                        Text("Opponent to move")
+                            .font(.headline)
+                    } else {
+                        Text(toMove == "w" ? "White to move" : "Black to move")
+                            .font(.headline)
+                    }
                     if inCheck {
                         Text("— Check!")
                             .font(.headline)
@@ -143,6 +236,9 @@ struct ContentView: View {
                 case .resigned(let winner):
                     Text((winner == "White" ? "Black" : "White") + " resigns")
                         .font(.headline)
+                case .forfeited(let winner):
+                    Text((winner == "White" ? "Black" : "White") + " forfeits")
+                        .font(.headline)
                 case .failed:
                     Text("Game unavailable")
                         .font(.headline)
@@ -151,6 +247,27 @@ struct ContentView: View {
             }
             Spacer()
         }
+    }
+
+    /// Online waiting banner (add-online-multiplayer D4): the 6-character room
+    /// code, large and monospaced, with a copy action next to it.
+    private func waitingBanner(code: String) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Room code")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text(code)
+                    .font(.title3.monospaced().bold())
+            }
+            Spacer()
+            Button("Copy") {
+                UIPasteboard.general.string = code
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
     }
 
     // MARK: - Move list (design D5: UCI strings as returned by the core)
@@ -182,7 +299,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .frame(maxHeight: 120)
+            .frame(maxHeight: 96)
         }
     }
 
@@ -221,14 +338,23 @@ struct ContentView: View {
         // no move played yet, or failed (enforce-single-active-game D1): it
         // stays visible but greyed out mid-game and starts nothing when
         // tapped.
-        Button(action: { showNewGameSheet = true }) {
+        Button(action: {
+            // Reset the online handshake so a finished online game's
+            // "ready" flag cannot auto-dismiss this opening (D4).
+            vm.resetOnlineSheetState()
+            showNewGameSheet = true
+        }) {
             Label("New game", systemImage: "arrow.counterclockwise")
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
         .disabled(!vm.canStartNewGame)
         .alert("Game over", isPresented: $vm.showGameEndDialog) {
-            Button("Play again") { vm.restart() }
+            // Online games offer only "Done" (add-online-multiplayer D4): a
+            // rematch would need a new room.
+            if !vm.isOnlineMode {
+                Button("Play again") { vm.restart() }
+            }
             Button("Done", role: .cancel) { vm.dismissGameEnd() }
         } message: {
             Text(vm.gameEndMessage ?? "The game is over.")
@@ -250,14 +376,60 @@ struct ContentView: View {
 #endif
 }
 
-/// New-game setup sheet (design D4): choose the opponent (two players or CPU)
-/// and, for the CPU, its difficulty. Two players is pre-selected; confirming
-/// starts the game with the chosen mode.
+/// A choice in the new-game setup sheet (add-online-multiplayer D4): the
+/// local modes plus the two online intents.
+enum NewGameChoice: Equatable {
+    case twoPlayers
+    case cpu(CpuDifficulty)
+    case onlineCreate
+    case onlineJoin(code: String)
+}
+
+/// New-game setup sheet (design D4 + add-online-multiplayer D4): choose the
+/// opponent (two players, CPU, or online) and, for the CPU, its difficulty;
+/// for online, create a room or join one by code. Two players is
+/// pre-selected and keeps the existing behavior.
+///
+/// Join behavior: the sheet stays open until the server confirms the seat
+/// (`ContentView` dismisses it on `onlineSessionReady`) or answers with a
+/// room error, which is shown here so the player can fix the code or create
+/// a room instead.
 struct NewGameSetupView: View {
-    @State private var isCpu = false
+    enum Mode: Hashable {
+        case twoPlayers
+        case cpu
+        case online
+    }
+
+    enum OnlineAction: Hashable {
+        case create
+        case join
+    }
+
+    @State private var mode: Mode = .twoPlayers
     @State private var difficulty: CpuDifficulty = .medium
-    let onConfirm: (GameMode) -> Void
+    @State private var onlineAction: OnlineAction = .create
+    @State private var roomCode = ""
+    /// Whether an online server URL is configured for this build.
+    let hasServerURL: Bool
+    /// A join-time error from the last attempt (the sheet stays open on it).
+    let joinError: String?
+    let onStart: (NewGameChoice) -> Void
     @Environment(\.dismiss) private var dismiss
+
+    private var onlineJoinCodeValid: Bool {
+        roomCode.uppercased().count == 6
+    }
+
+    private var startDisabled: Bool {
+        if mode == .online, !hasServerURL {
+            return true
+        }
+        if mode == .online, onlineAction == .join, !onlineJoinCodeValid {
+            return true
+        }
+        return false
+    }
 
     var body: some View {
         VStack(spacing: 20) {
@@ -269,14 +441,15 @@ struct NewGameSetupView: View {
                     Text("Opponent")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
-                    Picker("Opponent", selection: $isCpu) {
-                        Text("Two players").tag(false)
-                        Text("CPU").tag(true)
+                    Picker("Opponent", selection: $mode) {
+                        Text("Two players").tag(Mode.twoPlayers)
+                        Text("CPU").tag(Mode.cpu)
+                        Text("Online").tag(Mode.online)
                     }
                     .pickerStyle(.segmented)
                 }
 
-                if isCpu {
+                if mode == .cpu {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Difficulty")
                             .font(.subheadline)
@@ -289,18 +462,46 @@ struct NewGameSetupView: View {
                         .pickerStyle(.segmented)
                     }
                 }
+
+                if mode == .online {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Online game")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        if hasServerURL {
+                            Picker("Online", selection: $onlineAction) {
+                                Text("Create").tag(OnlineAction.create)
+                                Text("Join").tag(OnlineAction.join)
+                            }
+                            .pickerStyle(.segmented)
+                            if onlineAction == .join {
+                                TextField("Room code (6 characters)", text: $roomCode)
+                                    .textFieldStyle(.roundedBorder)
+                                    .autocorrectionDisabled()
+                                    .textInputAutocapitalization(.characters)
+                                if let joinError {
+                                    Text(joinError)
+                                        .font(.footnote)
+                                        .foregroundColor(.red)
+                                }
+                            }
+                        } else {
+                            Text("No online server configured for this build.")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
             }
 
             Spacer(minLength: 0)
 
-            Button(action: {
-                onConfirm(isCpu ? .cpu(difficulty) : .twoPlayers)
-                dismiss()
-            }) {
+            Button(action: start) {
                 Text("Start")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .disabled(startDisabled)
 
             Button("Cancel") {
                 dismiss()
@@ -308,5 +509,25 @@ struct NewGameSetupView: View {
             .font(.footnote)
         }
         .padding()
+    }
+
+    private func start() {
+        switch mode {
+        case .twoPlayers:
+            onStart(.twoPlayers)
+            dismiss()
+        case .cpu:
+            onStart(.cpu(difficulty))
+            dismiss()
+        case .online:
+            if onlineAction == .create {
+                onStart(.onlineCreate)
+                dismiss()
+            } else {
+                // Stay open: the sheet closes when the server confirms the
+                // seat, or shows the join error (see the type's doc).
+                onStart(.onlineJoin(code: roomCode.uppercased()))
+            }
+        }
     }
 }

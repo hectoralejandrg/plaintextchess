@@ -60,12 +60,21 @@ dependencies {
     // CPU move computation (milestone 3) runs off the main thread via
     // Dispatchers.Default and applies on the main dispatcher.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    // Online multiplayer (add-online-multiplayer D2/D7): the WebSocket client
+    // for the versioned JSON protocol, one long-lived socket per session.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // The UniFFI 0.28 Kotlin bindings call Rust through JNA. The AAR packaging
     // ships the native dispatcher (libjnidispatch.so) for the Android ABIs,
     // which JNA loads via System.loadLibrary at startup (required on Android,
     // per the official UniFFI Kotlin/Gradle docs).
     implementation("net.java.dev.jna:jna:5.14.0@aar")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    // JVM unit tests for the online protocol codec (add-online-multiplayer
+    // task 3.2): pure JSON parsing. `org.json:json` supplies a real JSON
+    // implementation for the JVM classpath (the mockable android.jar's
+    // org.json stubs throw "not mocked" otherwise).
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
 
 // ---------------------------------------------------------------------------
