@@ -38,4 +38,4 @@
 ## 6. Wrap-up
 
 - [x] 6.1 Run `openspec validate add-online-time-controls --strict` and the full suites (server `cargo test`, iOS test suite, Android test suite); verify everything passes and `cargo clippy -p chess-server` is clean
-- [ ] 6.2 Commit and push the change to `main`; verify the CI run for the pushed commit is green (`build-server` and all `quality` jobs)
+- [x] 6.2 Commit and push the change to `main`; verify the CI run for the pushed commit is green (`build-server` and all `quality` jobs)
