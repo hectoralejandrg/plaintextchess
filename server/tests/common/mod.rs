@@ -7,9 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use chess_server::app::{App, Conn};
-use chess_server::config::Config;
-use chess_server::protocol::{ServerMessage, State};
+pub use chess_server::infrastructure::server::{App, Conn};
+use chess_server::infrastructure::config::Config;
+use chess_server::interface::protocol::{ServerMessage, State};
 use tokio::sync::mpsc;
 
 pub const P_A: &str = "device-a";

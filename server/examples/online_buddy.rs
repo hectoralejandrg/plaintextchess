@@ -9,6 +9,7 @@
 //!   BUDDY_MODE    "create" (default) or "join"
 //!   BUDDY_ROOM    room code (required when BUDDY_MODE=join)
 //!   BUDDY_MOVES   space-separated UCI replies for the buddy's own turns
+//!   BUDDY_TIME_CONTROL  time control to create with (e.g. "3+2"; default 15+10)
 //!
 //! Usage:
 //!   BUDDY_MOVES="d1h5 g8f6" cargo run --manifest-path server/Cargo.toml \
@@ -16,7 +17,7 @@
 
 use std::env;
 
-use chess_server::protocol::{ClientMessage, Color, ServerMessage, Status};
+use chess_server::interface::protocol::{ClientMessage, Color, ServerMessage, Status};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::WebSocketStream;
@@ -39,11 +40,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .split_whitespace()
         .map(str::to_string)
         .collect();
+    let time_control = env::var("BUDDY_TIME_CONTROL").ok();
 
     let first = if mode == "create" {
         ClientMessage::CreateRoom {
             v: 1,
             player_id: device.clone(),
+            time_control: time_control.clone(),
         }
     } else if mode == "join" {
         let code = room.clone().ok_or_else(|| {
@@ -133,7 +136,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Log the snapshot; if it is the buddy's turn, send the next scripted move.
 async fn handle_state(
-    state: &chess_server::protocol::State,
+    state: &chess_server::interface::protocol::State,
     my_color: &Option<Color>,
     reply_moves: &[String],
     reply_index: &mut usize,

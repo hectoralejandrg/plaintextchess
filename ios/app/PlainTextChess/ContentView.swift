@@ -114,6 +114,14 @@ struct ContentView: View {
                 statusRow
                     .padding(.horizontal)
 
+                if vm.isOnlineMode {
+                    // Online clocks (add-online-time-controls, design D6): a
+                    // fixed-height row so the full-width board keeps its exact
+                    // size in every online state.
+                    clockRow
+                        .padding(.horizontal)
+                }
+
                 if case .waiting(let code) = vm.onlinePhase {
                     // Online waiting state (add-online-multiplayer D4): the room
                     // code, with a copy action, while the opponent is still away.
@@ -161,8 +169,8 @@ struct ContentView: View {
                     vm.startGame(.twoPlayers)
                 case .cpu(let difficulty):
                     vm.startGame(.cpu(difficulty))
-                case .onlineCreate:
-                    _ = vm.startOnlineGame(create: true,
+                case .onlineCreate(let timeControl):
+                    _ = vm.startOnlineGame(create: true, timeControl: timeControl,
                                            serverURLString: effectiveOnlineURL)
                 case .onlineJoin(let code):
                     _ = vm.startOnlineGame(create: false, code: code,
@@ -239,6 +247,9 @@ struct ContentView: View {
                 case .forfeited(let winner):
                     Text((winner == "White" ? "Black" : "White") + " forfeits")
                         .font(.headline)
+                case .timedOut(let winner):
+                    Text((winner == "White" ? "Black" : "White") + " ran out of time")
+                        .font(.headline)
                 case .failed:
                     Text("Game unavailable")
                         .font(.headline)
@@ -247,6 +258,59 @@ struct ContentView: View {
             }
             Spacer()
         }
+    }
+
+    /// Online clocks (add-online-time-controls, design D6): the side on the
+    /// top edge of the board first, then the side on the bottom edge, each
+    /// labeled by color so the two clocks are never confusable. The
+    /// side-to-move clock is emphasized and turns red at ≤ 10 s. A
+    /// `TimelineView` interpolates the countdown between server snapshots.
+    @ViewBuilder
+    private var clockRow: some View {
+        if let clock = vm.onlineClock {
+            TimelineView(.periodic(from: .now, by: 0.1)) { context in
+                let white = clock.remaining(for: "w", now: context.date)
+                let black = clock.remaining(for: "b", now: context.date)
+                let topColor = vm.boardOrientation == 0 ? "Black" : "White"
+                let bottomColor = vm.boardOrientation == 0 ? "White" : "Black"
+                HStack(spacing: 8) {
+                    clockCell(color: topColor,
+                              milliseconds: topColor == "White" ? white : black,
+                              active: clock.isRunning && clock.sideToMove == (topColor == "White" ? "w" : "b"))
+                    Spacer()
+                    Text(vm.onlineTimeControl)
+                        .font(.caption.monospaced())
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    clockCell(color: bottomColor,
+                              milliseconds: bottomColor == "White" ? white : black,
+                              active: clock.isRunning && clock.sideToMove == (bottomColor == "White" ? "w" : "b"))
+                }
+                .frame(height: 34)
+            }
+        }
+    }
+
+    private func clockCell(color: String, milliseconds: Int, active: Bool) -> some View {
+        let low = milliseconds <= 10_000
+        return VStack(spacing: 0) {
+            Text(color)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Text(OnlineClock.format(milliseconds))
+                .font(.headline.monospacedDigit())
+                .foregroundColor(low ? .red : .primary)
+        }
+        .frame(minWidth: 74)
+        .padding(.vertical, 2)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(active ? Color.accentColor.opacity(0.18) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(active ? Color.accentColor : Color.clear, lineWidth: 1)
+        )
     }
 
     /// Online waiting banner (add-online-multiplayer D4): the 6-character room
@@ -381,7 +445,7 @@ struct ContentView: View {
 enum NewGameChoice: Equatable {
     case twoPlayers
     case cpu(CpuDifficulty)
-    case onlineCreate
+    case onlineCreate(timeControl: String)
     case onlineJoin(code: String)
 }
 
@@ -410,6 +474,7 @@ struct NewGameSetupView: View {
     @State private var difficulty: CpuDifficulty = .medium
     @State private var onlineAction: OnlineAction = .create
     @State private var roomCode = ""
+    @State private var timeControl: OnlineTimeControl = .default
     /// Whether an online server URL is configured for this build.
     let hasServerURL: Bool
     /// A join-time error from the last attempt (the sheet stays open on it).
@@ -474,6 +539,19 @@ struct NewGameSetupView: View {
                                 Text("Join").tag(OnlineAction.join)
                             }
                             .pickerStyle(.segmented)
+                            if onlineAction == .create {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Time control")
+                                        .font(.subheadline)
+                                        .foregroundColor(.secondary)
+                                    Picker("Time control", selection: $timeControl) {
+                                        ForEach(OnlineTimeControl.presets) { preset in
+                                            Text(preset.label).tag(preset)
+                                        }
+                                    }
+                                    .pickerStyle(.segmented)
+                                }
+                            }
                             if onlineAction == .join {
                                 TextField("Room code (6 characters)", text: $roomCode)
                                     .textFieldStyle(.roundedBorder)
@@ -521,7 +599,7 @@ struct NewGameSetupView: View {
             dismiss()
         case .online:
             if onlineAction == .create {
-                onStart(.onlineCreate)
+                onStart(.onlineCreate(timeControl: timeControl.label))
                 dismiss()
             } else {
                 // Stay open: the sheet closes when the server confirms the

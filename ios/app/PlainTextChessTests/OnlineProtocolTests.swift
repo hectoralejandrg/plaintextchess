@@ -19,17 +19,24 @@ final class OnlineProtocolTests: XCTestCase {
     /// The server's `room_ready`/`state` snapshot at the start of a game
     /// (same shape as the server's wire-form test sample).
     private let startingState = """
-    {"board_fen":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR","move_list":[],"side_to_move":"w","status":"playing","your_color":"white","white_rating":1500.0,"black_rating":1500.0,"opponent_online":true}
+    {"board_fen":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR","move_list":[],"side_to_move":"w","status":"playing","your_color":"white","white_rating":1500.0,"black_rating":1500.0,"opponent_online":true,"time_control":"15+10","white_time_ms":900000,"black_time_ms":900000}
     """
 
     // MARK: - Client messages (encode)
 
     func testCreateRoomEncoding() throws {
-        let json = try OnlineCodec.encodeClient(.createRoom(playerID: "device-a"))
+        let json = try OnlineCodec.encodeClient(.createRoom(playerID: "device-a", timeControl: "3+2"))
         let object = try jsonObject(json)
         XCTAssertEqual(object["type"] as? String, "create_room")
         XCTAssertEqual(object["v"] as? Int, 1)
         XCTAssertEqual(object["player_id"] as? String, "device-a")
+        XCTAssertEqual(object["time_control"] as? String, "3+2")
+    }
+
+    func testCreateRoomWithoutTimeControlOmitsTheField() throws {
+        let json = try OnlineCodec.encodeClient(.createRoom(playerID: "device-a", timeControl: nil))
+        let object = try jsonObject(json)
+        XCTAssertNil(object["time_control"], "an unset control must be absent, not null")
     }
 
     func testJoinRoomEncoding() throws {
@@ -63,7 +70,8 @@ final class OnlineProtocolTests: XCTestCase {
 
     func testClientMessagesRoundTrip() throws {
         for message: OnlineClientMessage in [
-            .createRoom(playerID: "p1"),
+            .createRoom(playerID: "p1", timeControl: "3+2"),
+            .createRoom(playerID: "p1", timeControl: nil),
             .joinRoom(playerID: "p2", roomCode: "AB23CD"),
             .move(uci: "e2e4"),
             .move(uci: "g7h8q"),
@@ -98,6 +106,9 @@ final class OnlineProtocolTests: XCTestCase {
         XCTAssertEqual(state.whiteRating, 1500)
         XCTAssertEqual(state.blackRating, 1500)
         XCTAssertTrue(state.opponentOnline)
+        XCTAssertEqual(state.timeControl, "15+10")
+        XCTAssertEqual(state.whiteTimeMs, 900_000)
+        XCTAssertEqual(state.blackTimeMs, 900_000)
     }
 
     func testStateDecoding() throws {
@@ -114,7 +125,7 @@ final class OnlineProtocolTests: XCTestCase {
     func testAllStatusVariantsDecode() throws {
         func decodeStatus(_ fragment: String) throws -> OnlineStatus {
             let state = """
-            {"board_fen":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR","move_list":[],"side_to_move":"w","status":\(fragment),"your_color":"white","white_rating":1500.0,"black_rating":1500.0,"opponent_online":false}
+            {"board_fen":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR","move_list":[],"side_to_move":"w","status":\(fragment),"your_color":"white","white_rating":1500.0,"black_rating":1500.0,"opponent_online":false,"time_control":"5+0","white_time_ms":300000,"black_time_ms":300000}
             """
             let json = """
             {"v":1,"type":"state","state":\(state)}
@@ -136,6 +147,14 @@ final class OnlineProtocolTests: XCTestCase {
                        .resigned(winner: .black))
         XCTAssertEqual(try decodeStatus("{\"forfeited\":{\"winner\":\"black\"}}"),
                        .forfeited(winner: .black))
+        XCTAssertEqual(try decodeStatus("{\"timed_out\":{\"winner\":\"white\"}}"),
+                       .timedOut(winner: .white))
+    }
+
+    func testTimeControlPresetsMatchTheServer() {
+        XCTAssertEqual(OnlineTimeControl.presets.map(\.label),
+                       ["15+10", "10+0", "5+0", "3+2", "1+0"])
+        XCTAssertEqual(OnlineTimeControl.default.label, "15+10")
     }
 
     func testErrorDecodingAllStableCodes() throws {

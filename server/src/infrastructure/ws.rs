@@ -22,11 +22,12 @@ fn protocol_close() -> Message {
     }))
 }
 
-use crate::app::{App, Conn};
-use crate::protocol::{
+use crate::application::room_actor::RoomMsg;
+use crate::domain::time_control::TimeControl;
+use crate::infrastructure::server::{App, Conn};
+use crate::interface::protocol::{
     decode_incoming, ClientMessage, ErrorCode, ServerMessage, PROTOCOL_CLOSE_CODE, VERSION,
 };
-use crate::room::RoomMsg;
 
 /// `GET /healthz`: 200 with a machine-readable body while the server accepts
 /// WebSocket connections.
@@ -117,7 +118,11 @@ async fn handle_text(
     };
 
     match message {
-        ClientMessage::CreateRoom { player_id, .. } => {
+        ClientMessage::CreateRoom {
+            player_id,
+            time_control,
+            ..
+        } => {
             if conn.is_some() {
                 let _ = send_json(
                     socket,
@@ -125,7 +130,14 @@ async fn handle_text(
                 )
                 .await;
             } else {
-                match app.create_room(&player_id) {
+                // An absent or unrecognized control falls back to the default
+                // (design D5), so older clients keep working against this
+                // server.
+                let time_control = time_control
+                    .as_deref()
+                    .and_then(TimeControl::parse)
+                    .unwrap_or(TimeControl::DEFAULT);
+                match app.create_room_with_time_control(&player_id, time_control) {
                     Ok(new_conn) => *conn = Some(new_conn),
                     Err(err) => {
                         let _ = send_json(socket, &err).await;

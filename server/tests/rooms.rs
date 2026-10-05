@@ -6,11 +6,11 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chess_server::app::Conn;
-use chess_server::protocol::{Color, ServerMessage, State, Status};
+use chess_server::infrastructure::server::Conn;
+use chess_server::interface::protocol::{Color, ServerMessage, State, Status};
 use common::*;
 
-use chess_server::room::RoomMsg;
+use chess_server::application::room_actor::RoomMsg;
 
 const START_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
 
@@ -78,7 +78,7 @@ async fn create_returns_valid_code_and_seats_white() {
     let mut conn = create(&app, P_A);
 
     assert!(
-        chess_server::app::App::is_valid_code(&conn.code),
+        chess_server::infrastructure::server::App::is_valid_code(&conn.code),
         "creator code `{}` must be 6 chars from the unambiguous alphabet",
         conn.code
     );
@@ -425,7 +425,7 @@ async fn five_char_promotion_is_accepted() {
 
 #[tokio::test]
 async fn draw_terminates_the_game_and_splits_the_point() {
-    use chess_server::room::classify_mover_outcome;
+    use chess_server::application::room_actor::classify_mover_outcome;
 
     // The draw verdict arrives through `classify_mover_outcome`, whose
     // Drawn branch is unit-tested in `room::tests`; the terminal side

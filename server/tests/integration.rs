@@ -7,9 +7,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chess_server::app::App;
-use chess_server::config::Config;
-use chess_server::protocol::{ClientMessage, Color, ServerMessage, State, Status};
+use chess_server::infrastructure::config::Config;
+use chess_server::infrastructure::server::App;
+use chess_server::interface::protocol::{ClientMessage, Color, ServerMessage, State, Status};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::WebSocketStream;
@@ -24,8 +24,11 @@ async fn spawn_server(grace_secs: u64) -> (SocketAddr, Arc<App>) {
     );
     let app = Arc::new(App::new(config));
     let router = axum::Router::new()
-        .route("/healthz", axum::routing::get(chess_server::ws::healthz))
-        .route("/ws", axum::routing::get(chess_server::ws::ws_upgrade))
+        .route("/healthz", axum::routing::get(chess_server::infrastructure::ws::healthz))
+        .route(
+            "/ws",
+            axum::routing::get(chess_server::infrastructure::ws::ws_upgrade),
+        )
         .with_state(Arc::clone(&app));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -95,6 +98,7 @@ async fn create_room(client: &mut WsClient, player_id: &str) -> String {
         .send(action(&ClientMessage::CreateRoom {
             v: 1,
             player_id: player_id.into(),
+            time_control: None,
         }))
         .await
         .expect("send create");

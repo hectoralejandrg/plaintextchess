@@ -27,7 +27,10 @@ class OnlineProtocolTest {
           "your_color": "white",
           "white_rating": 1500.0,
           "black_rating": 1499.0,
-          "opponent_online": true
+          "opponent_online": true,
+          "time_control": "15+10",
+          "white_time_ms": 900000,
+          "black_time_ms": 890000
         }
         """
     )
@@ -36,10 +39,17 @@ class OnlineProtocolTest {
 
     @Test
     fun clientCreateRoomWireForm() {
-        val json = JSONObject(OnlineCodec.encodeCreateRoom("p1"))
+        val json = JSONObject(OnlineCodec.encodeCreateRoom("p1", "3+2"))
         assertEquals("create_room", json.getString("type"))
         assertEquals(1, json.getInt("v"))
         assertEquals("p1", json.getString("player_id"))
+        assertEquals("3+2", json.getString("time_control"))
+    }
+
+    @Test
+    fun clientCreateRoomWithoutTimeControlOmitsTheField() {
+        val json = JSONObject(OnlineCodec.encodeCreateRoom("p1", null))
+        assertFalse("an unset control must be absent, not null", json.has("time_control"))
     }
 
     @Test
@@ -142,6 +152,19 @@ class OnlineProtocolTest {
             OnlineStatus.Forfeited(OnlineColor.Black),
             OnlineStatus.decode(JSONObject("""{"forfeited":{"winner":"black"}}""")),
         )
+        assertEquals(
+            OnlineStatus.TimedOut(OnlineColor.White),
+            OnlineStatus.decode(JSONObject("""{"timed_out":{"winner":"white"}}""")),
+        )
+    }
+
+    @Test
+    fun timeControlPresetsMatchTheServer() {
+        assertEquals(
+            listOf("15+10", "10+0", "5+0", "3+2", "1+0"),
+            OnlineTimeControl.presets.map { it.label },
+        )
+        assertEquals("15+10", OnlineTimeControl.default.label)
     }
 
     @Test
@@ -205,6 +228,9 @@ class OnlineProtocolTest {
         assertEquals(1500.0, state.whiteRating, 0.0)
         assertEquals(1499.0, state.blackRating, 0.0)
         assertEquals(true, state.opponentOnline)
+        assertEquals("15+10", state.timeControl)
+        assertEquals(900000, state.whiteTimeMs)
+        assertEquals(890000, state.blackTimeMs)
     }
 
     private inline fun <reified T : Throwable> assertThrows(block: () -> Unit) {

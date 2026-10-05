@@ -1,15 +1,17 @@
 //! Room actor: one task per room owns that room's authoritative game session
-//! (design D2/D3). The actor is the single place where room state mutates, so
-//! seat, turn, and timer logic is free of races.
+//! (design D2/D3 of add-online-multiplayer). The actor is the single place
+//! where room state mutates, so seat, turn, and timer logic is free of races.
+//! It depends on the domain layer and on ports only (design D1).
 
-use std::sync::Arc;
-
-use chess_core::GameSession;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 
-use crate::app::App;
-use crate::protocol::{Color, ErrorCode, ServerMessage, State, Status, VERSION};
+use crate::application::ports::{EngineSession, RoomServices};
+use crate::domain::clock::Clocks;
+use crate::domain::material;
+use crate::domain::rating::{self, DEFAULT_RATING};
+use crate::domain::time_control::TimeControl;
+use crate::interface::protocol::{Color, ErrorCode, ServerMessage, State, Status, VERSION};
 
 const WHITE: usize = 0;
 const BLACK: usize = 1;
@@ -55,25 +57,44 @@ struct Seat {
 
 struct Room {
     code: String,
-    app: Arc<App>,
+    services: RoomServices,
+    time_control: TimeControl,
     seats: [Option<Seat>; 2],
-    session: Arc<GameSession>,
+    session: Box<dyn EngineSession>,
     move_list: Vec<String>,
     status: Status,
+    /// The running clock; `None` until the game starts (both seats filled).
+    clocks: Option<Clocks>,
     /// Grace window for a disconnected seat: `(seat index, deadline)`.
     grace: Option<(usize, Instant)>,
 }
 
 impl Room {
-    fn new(app: Arc<App>, code: String) -> Self {
+    fn new(services: RoomServices, code: String, time_control: TimeControl) -> Self {
+        let session = services.engine.new_game_session();
         Self {
             code,
-            app,
+            services,
+            time_control,
             seats: [None, None],
-            session: chess_core::new_game_session(0.0),
+            session,
             move_list: Vec::new(),
             status: Status::Playing,
+            clocks: None,
             grace: None,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.services.time.now_ms()
+    }
+
+    /// Remaining time of `side` at `now_ms`: the base time while the room is
+    /// still in the lobby, the running clock once the game has started.
+    fn remaining_ms(&self, side: usize, now_ms: u64) -> u64 {
+        match self.clocks.as_ref() {
+            Some(clocks) => clocks.remaining_ms(side as u8, now_ms),
+            None => self.time_control.base_ms,
         }
     }
 
@@ -103,8 +124,8 @@ impl Room {
 
     fn rating(&self, idx: usize) -> f64 {
         match &self.seats[idx] {
-            Some(seat) => self.app.ratings().rating_of(&seat.player_id),
-            None => crate::rating::DEFAULT_RATING,
+            Some(seat) => self.services.ratings.rating_of(&seat.player_id),
+            None => DEFAULT_RATING,
         }
     }
 
@@ -112,8 +133,9 @@ impl Room {
     /// move list, side to move, status, the seat's color, both ratings, and
     /// whether the opponent is connected.
     fn snapshot(&self, for_seat: usize) -> State {
+        let now_ms = self.now_ms();
         State {
-            board_fen: self.session.get_board_state().expect("board state"),
+            board_fen: self.session.board_state().expect("board state"),
             move_list: self.move_list.clone(),
             side_to_move: if self.move_list.len().is_multiple_of(2) {
                 "w"
@@ -128,6 +150,9 @@ impl Room {
             opponent_online: self.seats[1 - for_seat]
                 .as_ref()
                 .is_some_and(|seat| seat.connected),
+            time_control: self.time_control.label(),
+            white_time_ms: self.remaining_ms(WHITE, now_ms),
+            black_time_ms: self.remaining_ms(BLACK, now_ms),
         }
     }
 
@@ -175,13 +200,9 @@ impl Room {
         else {
             return;
         };
-        let score = if matches!(self.status, Status::Drawn) {
-            0.5
-        } else {
-            1.0
-        };
-        self.app
-            .ratings()
+        let score = rating::winner_score(matches!(self.status, Status::Drawn));
+        self.services
+            .ratings
             .apply_result(&winner.player_id, &loser.player_id, score);
     }
 
@@ -191,14 +212,15 @@ impl Room {
             self.cancel_grace();
         }
         if let Some(seat) = self.seats[idx].take() {
-            self.app
+            self.services
+                .registry
                 .untrack_player_if(&seat.player_id, &self.code);
         }
     }
 
     /// Drop the room from the registry (also frees any still-tracked seats).
     fn cleanup(&self) {
-        self.app.remove_room(&self.code);
+        self.services.registry.remove_room(&self.code);
     }
 
     fn handle_connect(
@@ -224,39 +246,60 @@ impl Room {
         // winner watches the result).
         if self.status.is_terminal() {
             let _ = out.send(ServerMessage::error(ErrorCode::RoomFull));
-            self.app.untrack_player_if(&player_id, &self.code);
+            self.services
+                .registry
+                .untrack_player_if(&player_id, &self.code);
             return;
         }
 
         // Re-attach: the same device identifier returns to the seat it
         // occupied (spec: "Re-attachment MUST be limited to the player who
         // occupied the seat").
-        for idx in [WHITE, BLACK] {
-            if let Some(seat) = self.seats[idx].as_mut() {
-                if seat.player_id == player_id {
-                    seat.out = out;
-                    seat.connected = true;
-                    self.cancel_grace();
-                    self.send_state(idx); // resync snapshot for the re-attached player
-                    self.send_state(1 - idx); // opponent_online goes back to true
-                    return;
-                }
+        if let Some(idx) = self.seat_index_of(&player_id) {
+            {
+                let seat = self.seats[idx].as_mut().unwrap();
+                seat.out = out;
+                seat.connected = true;
             }
+            // Deferred flag (design D8): if this player's own clock ran out
+            // while they were away, settle the flag now, exactly as if they
+            // had been connected when it fell.
+            if self.started()
+                && !self.status.is_terminal()
+                && self
+                    .clocks
+                    .as_ref()
+                    .is_some_and(|c| c.side_to_move() == idx as u8 && c.is_flagged(self.now_ms()))
+            {
+                self.settle_flag();
+                return;
+            }
+            self.cancel_grace();
+            self.send_state(idx); // resync snapshot for the re-attached player
+            self.send_state(1 - idx); // opponent_online goes back to true
+            return;
         }
 
         // Seat is occupied by someone else.
         if self.seats[BLACK].is_some() {
             let _ = out.send(ServerMessage::error(ErrorCode::RoomFull));
-            self.app.untrack_player_if(&player_id, &self.code);
+            self.services
+                .registry
+                .untrack_player_if(&player_id, &self.code);
             return;
         }
 
-        // New Black player: the game starts.
+        // New Black player: the game starts and both clocks start at base.
         self.seats[BLACK] = Some(Seat {
             player_id,
             out,
             connected: true,
         });
+        self.clocks = Some(Clocks::new(
+            self.time_control.base_ms,
+            WHITE as u8,
+            self.now_ms(),
+        ));
         self.send_room_ready(BLACK);
         self.send_state(WHITE);
     }
@@ -285,11 +328,29 @@ impl Room {
             self.send_error(idx, ErrorCode::NotYourTurn);
             return;
         }
+        // A move is honored only if it is applied before the flag (design
+        // D3): the clock deadline decides, exactly, at apply time.
+        if self
+            .clocks
+            .as_ref()
+            .is_some_and(|c| c.is_flagged(self.now_ms()))
+        {
+            self.settle_flag();
+            self.send_error(idx, ErrorCode::GameOver);
+            return;
+        }
         if self.session.play_move(uci).is_err() {
             self.send_error(idx, ErrorCode::IllegalMove);
             return;
         }
         self.move_list.push(uci.to_string());
+        // Fischer settlement (design D2): deduct the thinking time, add the
+        // increment on completion, and switch the side to move.
+        let increment_ms = self.time_control.increment_ms;
+        let now_ms = self.now_ms();
+        if let Some(clocks) = self.clocks.as_mut() {
+            clocks.settle_move(idx as u8, increment_ms, now_ms);
+        }
 
         let status = classify_mover_outcome(
             self.session.is_checkmate().expect("checkmate check"),
@@ -379,9 +440,49 @@ impl Room {
             return;
         }
         // In play: hold the seat for the grace window and tell the opponent.
-        let grace = self.app.config().reconnect_grace;
-        self.grace = Some((idx, Instant::now() + grace));
+        self.grace = Some((idx, Instant::now() + self.services.reconnect_grace));
         self.send_state(1 - idx);
+    }
+
+    /// The side to move's clock has reached zero: end the game by flag fall
+    /// (design D4) — a draw when the winner cannot deliver checkmate.
+    fn settle_flag(&mut self) {
+        let Some(clocks) = self.clocks.as_ref() else {
+            return;
+        };
+        let flagged = clocks.side_to_move();
+        let winner = 1 - flagged as usize;
+        let fen = self.session.board_state().expect("board state");
+        let drawn = material::insufficient_to_mate(&fen, winner == WHITE);
+        self.status = if drawn {
+            Status::Drawn
+        } else {
+            Status::TimedOut {
+                winner: Self::color_of(winner),
+            }
+        };
+        self.apply_terminal_ratings(winner);
+        self.cancel_grace(); // the game is over: nothing left to time out
+        self.send_state_both();
+    }
+
+    /// The periodic deadline check (design D2/D8): settles a flag that fell
+    /// while the side to move is connected. A flag that falls while the side
+    /// to move is disconnected is deferred until re-attach or grace expiry.
+    fn tick_flags(&mut self) {
+        if !self.started() || self.status.is_terminal() {
+            return;
+        }
+        let Some(clocks) = self.clocks.as_ref() else {
+            return;
+        };
+        let flagged = clocks.side_to_move();
+        let connected = self.seats[flagged as usize]
+            .as_ref()
+            .is_some_and(|s| s.connected);
+        if connected && clocks.is_flagged(self.now_ms()) {
+            self.settle_flag();
+        }
     }
 
     fn handle_grace_expiry(&mut self, idx: usize) {
@@ -405,12 +506,12 @@ impl Room {
         self.apply_terminal_ratings(winner);
         self.send_state(winner); // final snapshot (forfeited, new ratings)
         self.remove_seat(idx); // the absent player can no longer re-attach
-        self.app.remove_room(&self.code); // the room is gone from the registry
+        self.services.registry.remove_room(&self.code); // the room is gone from the registry
     }
 }
 
 /// The status a game carries after `mover`'s move is applied, given the
-/// core's checkmate/draw verdicts (spec: "Checkmate or a draw ends the
+/// engine's checkmate/draw verdicts (spec: "Checkmate or a draw ends the
 /// game"). Mate wins for the mover; a core-reported draw ends the game as
 /// a draw; otherwise the game keeps playing.
 pub fn classify_mover_outcome(checkmated: bool, drawn: bool, mover: Color) -> Status {
@@ -424,12 +525,18 @@ pub fn classify_mover_outcome(checkmated: bool, drawn: bool, mover: Color) -> St
 }
 
 /// Run the room actor to completion (until every seat is gone).
-pub async fn run(
+pub async fn run_room(
     mut mailbox: mpsc::UnboundedReceiver<RoomMsg>,
-    app: Arc<App>,
+    services: RoomServices,
     code: String,
+    time_control: TimeControl,
 ) {
-    let mut room = Room::new(app, code);
+    let mut room = Room::new(services, code, time_control);
+    // The deadline tick (design D2): 200 ms is precise enough for a side
+    // project, and the exact apply-time check in `handle_move` means a move
+    // that lands before the next tick is never lost.
+    let mut deadline_tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    deadline_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             msg = mailbox.recv() => match msg {
@@ -447,6 +554,7 @@ pub async fn run(
                 Some(RoomMsg::Detach { player_id }) => room.handle_detach(&player_id),
                 None => break, // both connection tasks gave up: room is dead
             },
+            _ = deadline_tick.tick() => room.tick_flags(),
             seat = grace_timeout(&room.grace) => room.handle_grace_expiry(seat),
         }
         if !room.alive() {

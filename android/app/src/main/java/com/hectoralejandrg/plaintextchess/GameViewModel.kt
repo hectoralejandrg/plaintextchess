@@ -27,7 +27,40 @@ sealed class GameStatus {
     /** Online: the opponent's reconnect window expired and the server
      * forfeited the absent player (add-online-multiplayer D8). */
     data class Forfeited(val winner: String) : GameStatus()
+    /** Online: a player's clock ran out (flag fall, add-online-time-controls);
+     * `winner` is the opponent's color. */
+    data class TimedOut(val winner: String) : GameStatus()
     data class Failed(val message: String) : GameStatus()
+}
+
+/**
+ * The online clock as reported by the latest server snapshot
+ * (add-online-time-controls, design D6). [whiteMs]/[blackMs] are the
+ * snapshot's authoritative remaining times captured at [referenceMillis];
+ * the UI derives the live display value with [remainingMs], which only
+ * interpolates the side-to-move countdown (the waiting side is frozen).
+ */
+data class OnlineClock(
+    val whiteMs: Int,
+    val blackMs: Int,
+    val sideToMove: String,
+    val referenceMillis: Long,
+    val isRunning: Boolean,
+) {
+    fun remainingMs(color: String, nowMillis: Long): Int {
+        val base = if (color == "w") whiteMs else blackMs
+        if (!isRunning || color != sideToMove) return maxOf(0, base)
+        val elapsed = (nowMillis - referenceMillis).toInt()
+        return maxOf(0, base - elapsed)
+    }
+
+    companion object {
+        /** `m:ss`. */
+        fun format(milliseconds: Int): String {
+            val seconds = maxOf(0, milliseconds) / 1000
+            return "%d:%02d".format(seconds / 60, seconds % 60)
+        }
+    }
 }
 
 /**
@@ -142,6 +175,16 @@ class GameViewModel(private val context: Context) {
     var onlineWhiteRating by mutableStateOf(1500.0)
         private set
     var onlineBlackRating by mutableStateOf(1500.0)
+        private set
+
+    /** The server's clock as of the last snapshot (add-online-time-controls,
+     * design D6): the snapshot times are authoritative; the UI interpolates
+     * the side-to-move countdown between snapshots. */
+    var onlineClock by mutableStateOf<OnlineClock?>(null)
+        private set
+
+    /** The room's time control label from the last snapshot (lobby included). */
+    var onlineTimeControl by mutableStateOf(OnlineTimeControl.default.label)
         private set
 
     private var online: OnlineConnectionManager? = null
@@ -330,9 +373,10 @@ class GameViewModel(private val context: Context) {
      * [restart] needs no special-casing because terminal ⇒ gate open (D2).
      */
     val canStartNewGame: Boolean
-        get() = when (val s = status) {
+        get() = when (status) {
             is GameStatus.Checkmated, is GameStatus.Drawn,
             is GameStatus.Resigned, is GameStatus.Forfeited,
+            is GameStatus.TimedOut,
             is GameStatus.Failed -> true
             else -> moveList.isEmpty()
         }
@@ -414,6 +458,11 @@ class GameViewModel(private val context: Context) {
                 // lost when the server's reconnect window closed.
                 if (wonOnline(s.winner)) "You won.\n$onlineRatingsLine"
                 else "You lost.\n$onlineRatingsLine"
+            is GameStatus.TimedOut ->
+                // Online only (add-online-time-controls D4): a flag fall is
+                // stated as a win/loss on time.
+                if (wonOnline(s.winner)) "You won on time.\n$onlineRatingsLine"
+                else "You lost on time.\n$onlineRatingsLine"
             is GameStatus.Drawn ->
                 if (gameMode is GameMode.Online) "Draw.\n$onlineRatingsLine"
                 else "The game is drawn."
@@ -568,7 +617,8 @@ class GameViewModel(private val context: Context) {
      * authoritative: the seat, the color, and every move come from its
      * snapshots.
      */
-    fun startOnlineGame(create: Boolean, code: String? = null): Boolean {
+    fun startOnlineGame(create: Boolean, code: String? = null,
+                        timeControl: String? = null): Boolean {
         if (!canStartNewGame) return false
         val url = resolvedServerURL() ?: run {
             onlineJoinError = "No online server configured."
@@ -579,7 +629,7 @@ class GameViewModel(private val context: Context) {
         resetForOnlineGame()
         makeOnlineConnection(url)
         if (create) {
-            online?.startCreating()
+            online?.startCreating(timeControl)
         } else {
             code?.let { online?.startJoining(it) }
         }
@@ -640,6 +690,8 @@ class GameViewModel(private val context: Context) {
         onlineSessionReady = false
         onlineYourColor = null
         onlineOpponentOnline = false
+        onlineClock = null
+        onlineTimeControl = OnlineTimeControl.default.label
         runCatching {
             board = FenBoard.parse(session.getBoardState(), toMove)
         }
@@ -662,6 +714,18 @@ class GameViewModel(private val context: Context) {
         onlineWhiteRating = state.whiteRating
         onlineBlackRating = state.blackRating
         onlineRoomCode = online?.roomCode
+        onlineTimeControl = state.timeControl
+        // The clock runs while the game is in progress; in the waiting lobby
+        // (no opponent, no moves) the clocks show the base time, inactive.
+        val clockRunning = state.status == OnlineStatus.Playing &&
+            (state.opponentOnline || state.moveList.isNotEmpty())
+        onlineClock = OnlineClock(
+            whiteMs = state.whiteTimeMs,
+            blackMs = state.blackTimeMs,
+            sideToMove = state.sideToMove,
+            referenceMillis = System.currentTimeMillis(),
+            isRunning = clockRunning,
+        )
 
         // Replay any new moves into the mirror session.
         if (state.moveList.size > moveList.size) {
@@ -699,6 +763,7 @@ class GameViewModel(private val context: Context) {
             is OnlineStatus.Drawn -> GameStatus.Drawn
             is OnlineStatus.Resigned -> GameStatus.Resigned(s.winnerColor.displayName)
             is OnlineStatus.Forfeited -> GameStatus.Forfeited(s.winnerColor.displayName)
+            is OnlineStatus.TimedOut -> GameStatus.TimedOut(s.winnerColor.displayName)
         }
 
         if (state.status.isTerminal) {
@@ -773,6 +838,7 @@ class GameViewModel(private val context: Context) {
         onlineJoinError = null
         onlineSessionReady = false
         onlineOpponentOnline = false
+        onlineClock = null
         clearOnlineRoomPersistence()
     }
 
@@ -941,7 +1007,8 @@ class GameViewModel(private val context: Context) {
         if (gameEndPresented) return
         val s = status
         if (s is GameStatus.Checkmated || s is GameStatus.Drawn ||
-            s is GameStatus.Resigned || s is GameStatus.Forfeited
+            s is GameStatus.Resigned || s is GameStatus.Forfeited ||
+            s is GameStatus.TimedOut
         ) {
             gameEndPresented = true
             showGameEndDialog = true

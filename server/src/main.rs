@@ -6,9 +6,9 @@
 use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 
-use chess_server::app::App;
-use chess_server::config::Config;
-use chess_server::ws;
+use chess_server::infrastructure::config::Config;
+use chess_server::infrastructure::server::App;
+use chess_server::infrastructure::ws;
 
 #[tokio::main]
 async fn main() {

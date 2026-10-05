@@ -60,7 +60,7 @@ final class OnlineConnectionManager: ObservableObject {
 
     private enum PendingAction {
         case none
-        case create
+        case create(String?)
         case join(String)
     }
 
@@ -79,9 +79,10 @@ final class OnlineConnectionManager: ObservableObject {
 
     // MARK: - Intents
 
-    /// Connect and create a room (the caller takes the White seat).
-    func startCreating() {
-        beginAttempt(phase: .connecting, action: .create, reconnect: false)
+    /// Connect and create a room (the caller takes the White seat) with the
+    /// chosen time-control label.
+    func startCreating(timeControl: String?) {
+        beginAttempt(phase: .connecting, action: .create(timeControl), reconnect: false)
     }
 
     /// Connect and join an existing room by code.
@@ -167,8 +168,8 @@ final class OnlineConnectionManager: ObservableObject {
         // be fired right after resume (create on first connect, join on a
         // re-attach attempt).
         switch pendingAction {
-        case .create:
-            send(.createRoom(playerID: deviceID))
+        case .create(let timeControl):
+            send(.createRoom(playerID: deviceID, timeControl: timeControl))
         case .join(let code):
             send(.joinRoom(playerID: deviceID, roomCode: code))
         case .none:

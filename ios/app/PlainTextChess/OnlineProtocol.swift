@@ -38,6 +38,7 @@ enum OnlineStatus: Equatable {
     case drawn
     case resigned(winner: OnlineColor)
     case forfeited(winner: OnlineColor)
+    case timedOut(winner: OnlineColor)
 
     var isTerminal: Bool {
         if case .playing = self {
@@ -49,11 +50,20 @@ enum OnlineStatus: Equatable {
     /// The winner of a decisive result (`nil` while playing or drawn).
     var winner: OnlineColor? {
         switch self {
-        case .checkmated(let winner), .resigned(let winner), .forfeited(let winner):
+        case .checkmated(let winner), .resigned(let winner), .forfeited(let winner),
+             .timedOut(let winner):
             return winner
         case .playing, .drawn:
             return nil
         }
+    }
+
+    /// Whether this ending was a flag fall (a loss/won on time).
+    var isFlagFall: Bool {
+        if case .timedOut = self {
+            return true
+        }
+        return false
     }
 }
 
@@ -64,6 +74,7 @@ extension OnlineStatus: Codable {
         case drawn
         case resigned
         case forfeited
+        case timedOut = "timed_out"
     }
 
     private enum WinnerKey: CodingKey {
@@ -105,6 +116,12 @@ extension OnlineStatus: Codable {
             self = .forfeited(winner: winner)
             return
         }
+        if let winner = try? container.nestedContainer(keyedBy: WinnerKey.self, forKey: .timedOut)
+            .decode(OnlineColor.self, forKey: .winner)
+        {
+            self = .timedOut(winner: winner)
+            return
+        }
         if container.contains(.drawn) {
             self = .drawn
             return
@@ -136,6 +153,10 @@ extension OnlineStatus: Codable {
             var container = encoder.container(keyedBy: OuterKey.self)
             var nested = container.nestedContainer(keyedBy: WinnerKey.self, forKey: .forfeited)
             try nested.encode(winner, forKey: .winner)
+        case .timedOut(let winner):
+            var container = encoder.container(keyedBy: OuterKey.self)
+            var nested = container.nestedContainer(keyedBy: WinnerKey.self, forKey: .timedOut)
+            try nested.encode(winner, forKey: .winner)
         }
     }
 }
@@ -152,6 +173,12 @@ struct OnlineState: Codable, Equatable {
     let whiteRating: Double
     let blackRating: Double
     let opponentOnline: Bool
+    /// The room's time control label (e.g. `"15+10"`).
+    let timeControl: String
+    /// White's remaining time in milliseconds (server-authoritative).
+    let whiteTimeMs: Int
+    /// Black's remaining time in milliseconds (server-authoritative).
+    let blackTimeMs: Int
 
     private enum CodingKeys: String, CodingKey {
         case boardFen = "board_fen"
@@ -162,6 +189,9 @@ struct OnlineState: Codable, Equatable {
         case whiteRating = "white_rating"
         case blackRating = "black_rating"
         case opponentOnline = "opponent_online"
+        case timeControl = "time_control"
+        case whiteTimeMs = "white_time_ms"
+        case blackTimeMs = "black_time_ms"
     }
 }
 
@@ -211,10 +241,32 @@ enum OnlineProtocolError: Error, Equatable {
     case invalidStatus(String)
 }
 
+/// A time-control preset (spec "Server Time Control and Clock"): base time
+/// plus a Fischer increment, mirrored from the server's supported set. The
+/// `label` is the exact wire string sent in `create_room`.
+struct OnlineTimeControl: Equatable, Hashable, Identifiable {
+    let label: String
+    let baseSeconds: Int
+    let incrementSeconds: Int
+
+    var id: String { label }
+
+    static let presets: [OnlineTimeControl] = [
+        OnlineTimeControl(label: "15+10", baseSeconds: 15 * 60, incrementSeconds: 10),
+        OnlineTimeControl(label: "10+0", baseSeconds: 10 * 60, incrementSeconds: 0),
+        OnlineTimeControl(label: "5+0", baseSeconds: 5 * 60, incrementSeconds: 0),
+        OnlineTimeControl(label: "3+2", baseSeconds: 3 * 60, incrementSeconds: 2),
+        OnlineTimeControl(label: "1+0", baseSeconds: 1 * 60, incrementSeconds: 0),
+    ]
+
+    /// The default selection when the create screen opens.
+    static let `default` = presets[0]
+}
+
 /// Client messages (spec: "Online Multiplayer Protocol"): versioned JSON
 /// with a `type` tag, snake_case fields.
 enum OnlineClientMessage: Codable, Equatable {
-    case createRoom(playerID: String)
+    case createRoom(playerID: String, timeControl: String?)
     case joinRoom(playerID: String, roomCode: String)
     case move(uci: String)
     case resign
@@ -225,6 +277,7 @@ enum OnlineClientMessage: Codable, Equatable {
         case v
         case playerID = "player_id"
         case roomCode = "room_code"
+        case timeControl = "time_control"
         case uci
     }
 
@@ -238,7 +291,8 @@ enum OnlineClientMessage: Codable, Equatable {
         switch type {
         case "create_room":
             let playerID = try container.decode(String.self, forKey: .playerID)
-            self = .createRoom(playerID: playerID)
+            let timeControl = try container.decodeIfPresent(String.self, forKey: .timeControl)
+            self = .createRoom(playerID: playerID, timeControl: timeControl)
         case "join_room":
             let playerID = try container.decode(String.self, forKey: .playerID)
             let roomCode = try container.decode(String.self, forKey: .roomCode)
@@ -259,9 +313,12 @@ enum OnlineClientMessage: Codable, Equatable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(kOnlineProtocolVersion, forKey: .v)
         switch self {
-        case .createRoom(let playerID):
+        case .createRoom(let playerID, let timeControl):
             try container.encode("create_room", forKey: .type)
             try container.encode(playerID, forKey: .playerID)
+            if let timeControl {
+                try container.encode(timeControl, forKey: .timeControl)
+            }
         case .joinRoom(let playerID, let roomCode):
             try container.encode("join_room", forKey: .type)
             try container.encode(playerID, forKey: .playerID)

@@ -36,6 +36,9 @@ pub enum Status {
     Drawn,
     Resigned { winner: Color },
     Forfeited { winner: Color },
+    /// Flag fall (spec "A flag fall ends the game..."): the `winner` is the
+    /// opponent of the player whose clock ran out.
+    TimedOut { winner: Color },
 }
 
 impl Status {
@@ -60,6 +63,12 @@ pub struct State {
     pub white_rating: f64,
     pub black_rating: f64,
     pub opponent_online: bool,
+    /// The room's time control label (e.g. `"15+10"`).
+    pub time_control: String,
+    /// White's remaining time in milliseconds (server-authoritative).
+    pub white_time_ms: u64,
+    /// Black's remaining time in milliseconds (server-authoritative).
+    pub black_time_ms: u64,
 }
 
 /// Stable machine-readable error codes (spec "Errors carry a stable code").
@@ -112,6 +121,10 @@ pub enum ClientMessage {
     CreateRoom {
         v: u32,
         player_id: String,
+        /// The chosen time-control label (design D5): absent or unknown
+        /// means the default control, so older clients keep working.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        time_control: Option<String>,
     },
     JoinRoom {
         v: u32,
@@ -217,6 +230,12 @@ mod tests {
             ClientMessage::CreateRoom {
                 v: VERSION,
                 player_id: "p1".into(),
+                time_control: Some("15+10".into()),
+            },
+            ClientMessage::CreateRoom {
+                v: VERSION,
+                player_id: "p2".into(),
+                time_control: None,
             },
             ClientMessage::JoinRoom {
                 v: VERSION,
@@ -251,6 +270,9 @@ mod tests {
             white_rating: 1500.0,
             black_rating: 1500.0,
             opponent_online: true,
+            time_control: "3+2".into(),
+            white_time_ms: 181_000,
+            black_time_ms: 180_000,
         };
         for message in [
             ServerMessage::RoomReady {
@@ -304,11 +326,24 @@ mod tests {
             serde_json::to_value(&ClientMessage::CreateRoom {
                 v: VERSION,
                 player_id: "p1".into(),
+                time_control: Some("15+10".into()),
             })
             .unwrap();
         assert_eq!(value["type"], "create_room");
         assert_eq!(value["v"], 1);
         assert_eq!(value["player_id"], "p1");
+        assert_eq!(value["time_control"], "15+10");
+
+        // A create_room with no control omits the field entirely, so the
+        // wire stays compatible with clients that never send one (D5).
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::CreateRoom {
+                v: VERSION,
+                player_id: "p2".into(),
+                time_control: None,
+            })
+            .unwrap();
+        assert!(value.get("time_control").is_none());
 
         let value: serde_json::Value =
             serde_json::to_value(&ClientMessage::JoinRoom {
@@ -344,6 +379,9 @@ mod tests {
             white_rating: 1500.0,
             black_rating: 1499.0,
             opponent_online: true,
+            time_control: "5+0".into(),
+            white_time_ms: 300_000,
+            black_time_ms: 295_500,
         };
         let value: serde_json::Value = serde_json::to_value(&state).unwrap();
         assert_eq!(value["board_fen"], "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR");
@@ -355,6 +393,9 @@ mod tests {
         assert_eq!(value["white_rating"], 1500.0);
         assert_eq!(value["black_rating"], 1499.0);
         assert_eq!(value["opponent_online"], true);
+        assert_eq!(value["time_control"], "5+0");
+        assert_eq!(value["white_time_ms"], 300_000);
+        assert_eq!(value["black_time_ms"], 295_500);
 
         // ...struct variants are `{"<variant>": {"winner": <color>}}`.
         for (status, variant, winner) in [
@@ -362,6 +403,7 @@ mod tests {
             (Status::Drawn, "drawn", None),
             (Status::Resigned { winner: Color::White }, "resigned", Some("white")),
             (Status::Forfeited { winner: Color::Black }, "forfeited", Some("black")),
+            (Status::TimedOut { winner: Color::White }, "timed_out", Some("white")),
         ] {
             let value: serde_json::Value = serde_json::to_value(status).unwrap();
             match winner {
@@ -398,6 +440,9 @@ mod tests {
                     white_rating: 1500.0,
                     black_rating: 1500.0,
                     opponent_online: false,
+                    time_control: "1+0".into(),
+                    white_time_ms: 60_000,
+                    black_time_ms: 60_000,
                 },
             })
             .unwrap();

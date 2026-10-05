@@ -52,6 +52,9 @@ sealed class OnlineStatus {
     data class Resigned(val winnerColor: OnlineColor) : OnlineStatus()
     data class Forfeited(val winnerColor: OnlineColor) : OnlineStatus()
 
+    /** Flag fall (add-online-time-controls): a player's clock ran out. */
+    data class TimedOut(val winnerColor: OnlineColor) : OnlineStatus()
+
     val isTerminal: Boolean get() = this !is Playing
 
     /** The winner of a decisive result (`null` while playing or drawn). */
@@ -60,8 +63,12 @@ sealed class OnlineStatus {
             is Checkmated -> winnerColor
             is Resigned -> winnerColor
             is Forfeited -> winnerColor
+            is TimedOut -> winnerColor
             Playing, Drawn -> null
         }
+
+    /** Whether this ending was a flag fall (a win/loss on time). */
+    val isFlagFall: Boolean get() = this is TimedOut
 
     companion object {
         /** Decode the `status` JSON value: a plain string (`"playing"`,
@@ -85,6 +92,9 @@ sealed class OnlineStatus {
                     if (json.has("forfeited")) {
                         return Forfeited(winnerFrom(json.getJSONObject("forfeited")))
                     }
+                    if (json.has("timed_out")) {
+                        return TimedOut(winnerFrom(json.getJSONObject("timed_out")))
+                    }
                     throw OnlineProtocolError.InvalidStatus(json.toString())
                 }
                 else -> throw OnlineProtocolError.InvalidStatus(json.toString())
@@ -93,6 +103,26 @@ sealed class OnlineStatus {
 
         private fun winnerFrom(variant: JSONObject): OnlineColor =
             OnlineColor.fromWire(variant.getString("winner"))
+    }
+}
+
+/** A time-control preset (spec "Server Time Control and Clock"): base time
+ * plus a Fischer increment, mirrored from the server's supported set. The
+ * [label] is the exact wire string sent in `create_room`. */
+data class OnlineTimeControl(
+    val label: String,
+    val baseSeconds: Int,
+    val incrementSeconds: Int,
+) {
+    companion object {
+        val presets: List<OnlineTimeControl> = listOf(
+            OnlineTimeControl("15+10", 15 * 60, 10),
+            OnlineTimeControl("10+0", 10 * 60, 0),
+            OnlineTimeControl("5+0", 5 * 60, 0),
+            OnlineTimeControl("3+2", 3 * 60, 2),
+            OnlineTimeControl("1+0", 1 * 60, 0),
+        )
+        val default: OnlineTimeControl = presets[0]
     }
 }
 
@@ -110,6 +140,12 @@ data class OnlineState(
     val whiteRating: Double,
     val blackRating: Double,
     val opponentOnline: Boolean,
+    /** The room's time control label (e.g. `"15+10"`). */
+    val timeControl: String,
+    /** White's remaining time in milliseconds (server-authoritative). */
+    val whiteTimeMs: Int,
+    /** Black's remaining time in milliseconds (server-authoritative). */
+    val blackTimeMs: Int,
 ) {
     companion object {
         fun decode(json: JSONObject): OnlineState {
@@ -126,6 +162,9 @@ data class OnlineState(
                 whiteRating = json.getDouble("white_rating"),
                 blackRating = json.getDouble("black_rating"),
                 opponentOnline = json.getBoolean("opponent_online"),
+                timeControl = json.getString("time_control"),
+                whiteTimeMs = json.getInt("white_time_ms"),
+                blackTimeMs = json.getInt("black_time_ms"),
             )
         }
     }
@@ -216,9 +255,14 @@ sealed class ServerMessage {
 
 /** Encode/decode helpers for client-side messages (design D2). */
 object OnlineCodec {
-    /** `{"v":1,"type":"create_room","player_id":...}` */
-    fun encodeCreateRoom(playerId: String): String =
-        base("create_room").put("player_id", playerId).toString()
+    /** `{"v":1,"type":"create_room","player_id":...,"time_control":...}` */
+    fun encodeCreateRoom(playerId: String, timeControl: String?): String {
+        val message = base("create_room").put("player_id", playerId)
+        if (timeControl != null) {
+            message.put("time_control", timeControl)
+        }
+        return message.toString()
+    }
 
     /** `{"v":1,"type":"join_room","player_id":...,"room_code":...}` */
     fun encodeJoinRoom(playerId: String, roomCode: String): String =

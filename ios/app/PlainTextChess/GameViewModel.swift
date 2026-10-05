@@ -14,6 +14,10 @@ enum GameStatus: Equatable {
     /// lost by the server's reconnect-window forfeit; `winner` is the
     /// connected player's color.
     case forfeited(winner: String)
+    /// Online terminal state (add-online-time-controls): a player's clock ran
+    /// out (flag fall); `winner` is the opponent's color. A flag fall with
+    /// insufficient material ends as `.drawn`, not here.
+    case timedOut(winner: String)
     case failed(String)
 }
 
@@ -56,6 +60,32 @@ enum CpuDifficulty: Int32, CaseIterable {
         default:
             return nil
         }
+    }
+}
+
+/// The online clock as reported by the latest server snapshot
+/// (add-online-time-controls, design D6). `whiteMs`/`blackMs` are the
+/// snapshot's authoritative remaining times captured at `reference`; the
+/// view derives the live display value with `remaining(for:now:)`, which only
+/// interpolates the side-to-move countdown (the waiting side is frozen).
+struct OnlineClock: Equatable {
+    let whiteMs: Int
+    let blackMs: Int
+    let sideToMove: String
+    let reference: Date
+    let isRunning: Bool
+
+    func remaining(for color: String, now: Date) -> Int {
+        let base = color == "w" ? whiteMs : blackMs
+        guard isRunning, color == sideToMove else { return max(0, base) }
+        let elapsed = Int(now.timeIntervalSince(reference) * 1000)
+        return max(0, base - elapsed)
+    }
+
+    /// `m:ss` (drops to `m:ss` at ≥ 10 s, matching the platform clock style).
+    static func format(_ milliseconds: Int) -> String {
+        let seconds = max(0, milliseconds) / 1000
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }
 
@@ -119,6 +149,13 @@ final class GameViewModel: ObservableObject {
     /// ratings in the final state (design D11, step 4).
     @Published private(set) var onlineWhiteRating: Double = 1500
     @Published private(set) var onlineBlackRating: Double = 1500
+
+    /// The server's clock as of the last snapshot (add-online-time-controls,
+    /// design D6): the snapshot times are authoritative; the view interpolates
+    /// the side-to-move countdown between snapshots for a smooth display.
+    @Published private(set) var onlineClock: OnlineClock?
+    /// The room's time control label from the last snapshot (lobby included).
+    @Published private(set) var onlineTimeControl: String = OnlineTimeControl.default.label
 
     /// Game-end dialog visibility (design D2 of add-game-end-dialog): the VM
     /// owns the presentation so the "appears once" rule has no view-layer
@@ -322,7 +359,7 @@ final class GameViewModel: ObservableObject {
     /// `restart()` needs no special-casing because terminal ⇒ gate open (D2).
     var canStartNewGame: Bool {
         switch status {
-        case .checkmated, .drawn, .resigned, .forfeited, .failed:
+        case .checkmated, .drawn, .resigned, .forfeited, .timedOut, .failed:
             return true
         case .starting, .playing:
             return moveList.isEmpty
@@ -404,6 +441,11 @@ final class GameViewModel: ObservableObject {
             // when the server's reconnect window closed.
             return wonOnline(winner) ? "You won.\n\(onlineRatingsLine)"
                                      : "You lost.\n\(onlineRatingsLine)"
+        case .timedOut(let winner):
+            // Online only (add-online-time-controls D4): a flag fall is
+            // stated as a win/loss on time.
+            return wonOnline(winner) ? "You won on time.\n\(onlineRatingsLine)"
+                                     : "You lost on time.\n\(onlineRatingsLine)"
         case .drawn:
             if case .online = gameMode {
                 return "Draw.\n\(onlineRatingsLine)"
@@ -568,6 +610,7 @@ final class GameViewModel: ObservableObject {
     /// configured (the setup sheet stays open and shows the reason).
     @discardableResult
     func startOnlineGame(create: Bool, code: String? = nil,
+                         timeControl: String? = nil,
                          serverURLString: String?) -> Bool {
         guard canStartNewGame else { return false }
         guard let url = Self.onlineServerURL(serverURLString) else {
@@ -579,7 +622,7 @@ final class GameViewModel: ObservableObject {
         resetForOnlineGame()
         makeOnlineConnection(url: url)
         if create {
-            online?.startCreating()
+            online?.startCreating(timeControl: timeControl)
         } else if let code {
             online?.startJoining(code: code)
         }
@@ -644,6 +687,8 @@ final class GameViewModel: ObservableObject {
         onlineSessionReady = false
         onlineYourColor = nil
         onlineOpponentOnline = false
+        onlineClock = nil
+        onlineTimeControl = OnlineTimeControl.default.label
         do {
             board = try FenBoard(board: session.getBoardState(), sideToMove: toMove)
         } catch {
@@ -673,6 +718,18 @@ final class GameViewModel: ObservableObject {
         onlineOpponentOnline = state.opponentOnline
         onlineWhiteRating = state.whiteRating
         onlineBlackRating = state.blackRating
+        onlineTimeControl = state.timeControl
+        // The clock runs while the game is in progress; in the waiting lobby
+        // (no opponent, no moves) the clocks show the base time, inactive.
+        let clockRunning = state.status == .playing
+            && (state.opponentOnline || !state.moveList.isEmpty)
+        onlineClock = OnlineClock(
+            whiteMs: state.whiteTimeMs,
+            blackMs: state.blackTimeMs,
+            sideToMove: state.sideToMove,
+            reference: Date(),
+            isRunning: clockRunning
+        )
         if let code = online?.roomCode {
             onlineRoomCode = code
         }
@@ -718,6 +775,8 @@ final class GameViewModel: ObservableObject {
             status = .resigned(winner: winner.displayName)
         case .forfeited(let winner):
             status = .forfeited(winner: winner.displayName)
+        case .timedOut(let winner):
+            status = .timedOut(winner: winner.displayName)
         }
 
         if state.status.isTerminal {
@@ -788,6 +847,7 @@ final class GameViewModel: ObservableObject {
         onlineJoinError = nil
         onlineSessionReady = false
         onlineOpponentOnline = false
+        onlineClock = nil
         clearOnlineRoomPersistence()
     }
 
@@ -947,7 +1007,7 @@ final class GameViewModel: ObservableObject {
     private func markTerminalIfNeeded() {
         guard !gameEndPresented else { return }
         switch status {
-        case .checkmated, .drawn, .resigned, .forfeited:
+        case .checkmated, .drawn, .resigned, .forfeited, .timedOut:
             gameEndPresented = true
             showGameEndDialog = true
         default:
@@ -992,6 +1052,11 @@ final class GameViewModel: ObservableObject {
                 // add-online-multiplayer: start an online game as the room
                 // creator (White) against the -PLAINTCHESS_ONLINE_URL server.
                 _ = self.startOnlineGame(create: true,
+                                         serverURLString: self.debugOnlineURL)
+            } else if token.hasPrefix("onlinecreate:") {
+                // `onlinecreate:3+2`: create a room at that time control.
+                let control = String(token.dropFirst("onlinecreate:".count))
+                _ = self.startOnlineGame(create: true, timeControl: control,
                                          serverURLString: self.debugOnlineURL)
             } else if token.hasPrefix("onlinejoin:") {
                 // `onlinejoin:AB23CD`: join that room as Black.

@@ -44,6 +44,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
 
@@ -137,6 +138,12 @@ fun GameScreen(debugCpuDelayMs: Long = 0L, onlineUrl: String? = null) {
         Spacer(Modifier.height(12.dp))
         Box(Modifier.padding(horizontal = 16.dp)) { StatusRow(vm) }
         Spacer(Modifier.height(8.dp))
+        if (vm.isOnlineMode) {
+            // Online clocks (add-online-time-controls, design D6): a fixed
+            // height row so the full-width board keeps its exact size.
+            OnlineClockRow(vm)
+            Spacer(Modifier.height(8.dp))
+        }
         // Online waiting banner (add-online-multiplayer D4): the 6-character
         // room code, large and monospaced, with a copy action next to it.
         (vm.onlinePhase as? OnlinePhase.Waiting)?.let { waiting ->
@@ -230,8 +237,9 @@ fun GameScreen(debugCpuDelayMs: Long = 0L, onlineUrl: String? = null) {
                     vm.startGame(mode)
                     showNewGameSheet = false
                 },
-                onOnline = { create, code ->
-                    if (vm.startOnlineGame(create = create, code = code) && create) {
+                onOnline = { create, code, timeControl ->
+                    if (vm.startOnlineGame(create = create, code = code,
+                                           timeControl = timeControl) && create) {
                         // Creating closes the sheet immediately; a join stays
                         // open until the server confirms the seat (auto-close
                         // above) or shows the join error inside the sheet.
@@ -281,12 +289,13 @@ private fun NewGameSetupSheet(
     vm: GameViewModel,
     onDismiss: () -> Unit,
     onConfirm: (GameMode) -> Unit,
-    onOnline: (create: Boolean, code: String?) -> Unit,
+    onOnline: (create: Boolean, code: String?, timeControl: String?) -> Unit,
 ) {
     var isCpu by remember { mutableStateOf(false) }
     var isOnline by remember { mutableStateOf(false) }
     var difficulty by remember { mutableStateOf(CpuDifficulty.MEDIUM) }
     var roomCode by remember { mutableStateOf("") }
+    var timeControl by remember { mutableStateOf(OnlineTimeControl.default) }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -344,6 +353,20 @@ private fun NewGameSetupSheet(
             }
             if (isOnline) {
                 Text(
+                    "Time control",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OnlineTimeControl.presets.forEach { preset ->
+                        FilterChip(
+                            selected = timeControl == preset,
+                            onClick = { timeControl = preset },
+                            label = { Text(preset.label) },
+                        )
+                    }
+                }
+                Text(
                     "Room code",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -364,11 +387,11 @@ private fun NewGameSetupSheet(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
-                        onClick = { onOnline(true, null) },
+                        onClick = { onOnline(true, null, timeControl.label) },
                         modifier = Modifier.weight(1f),
                     ) { Text("Create room") }
                     Button(
-                        onClick = { onOnline(false, roomCode) },
+                        onClick = { onOnline(false, roomCode, null) },
                         enabled = roomCode.isNotEmpty(),
                         modifier = Modifier.weight(1f),
                     ) { Text("Join room") }
@@ -385,6 +408,83 @@ private fun NewGameSetupSheet(
                 }
             }
         }
+    }
+}
+
+/**
+ * Online clocks (add-online-time-controls, design D6): the side on the top
+ * edge of the board first, then the side on the bottom edge, each labeled by
+ * color so the two clocks are never confusable. The side-to-move clock is
+ * emphasized and turns red at ≤ 10 s. A 100 ms tick interpolates the
+ * countdown between authoritative server snapshots.
+ */
+@Composable
+private fun OnlineClockRow(vm: GameViewModel) {
+    val clock = vm.onlineClock ?: return
+    var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(clock) {
+        while (true) {
+            nowMillis = System.currentTimeMillis()
+            delay(100)
+        }
+    }
+    val white = clock.remainingMs("w", nowMillis)
+    val black = clock.remainingMs("b", nowMillis)
+    val topColor = if (vm.boardOrientation == 0) "Black" else "White"
+    val bottomColor = if (vm.boardOrientation == 0) "White" else "Black"
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        ClockCell(
+            color = topColor,
+            milliseconds = if (topColor == "White") white else black,
+            active = clock.isRunning && clock.sideToMove == if (topColor == "White") "w" else "b",
+        )
+        Text(
+            text = vm.onlineTimeControl,
+            style = MaterialTheme.typography.labelMedium,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        ClockCell(
+            color = bottomColor,
+            milliseconds = if (bottomColor == "White") white else black,
+            active = clock.isRunning && clock.sideToMove == if (bottomColor == "White") "w" else "b",
+        )
+    }
+}
+
+@Composable
+private fun ClockCell(color: String, milliseconds: Int, active: Boolean) {
+    val low = milliseconds <= 10_000
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .background(
+                color = if (active) {
+                    MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                } else {
+                    Color.Transparent
+                },
+                shape = RoundedCornerShape(8.dp),
+            )
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        Text(
+            text = color,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = OnlineClock.format(milliseconds),
+            style = MaterialTheme.typography.titleMedium,
+            fontFamily = FontFamily.Monospace,
+            color = if (low) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+        )
     }
 }
 
@@ -485,6 +585,12 @@ private fun StatusRow(vm: GameViewModel) {
             is GameStatus.Forfeited ->
                 Text(
                     text = if (status.winner == "White") "Black forfeits" else "White forfeits",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            is GameStatus.TimedOut ->
+                Text(
+                    text = if (status.winner == "White") "Black ran out of time"
+                    else "White ran out of time",
                     style = MaterialTheme.typography.titleMedium,
                 )
             is GameStatus.Failed ->

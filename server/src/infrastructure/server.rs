@@ -1,21 +1,23 @@
-//! Application state shared by the HTTP/WebSocket handlers: the room
-//! registry (joinable rooms by code), the one-room-per-device index, and the
-//! in-memory rating store (design D3/D5).
+//! Application state shared by the HTTP/WebSocket handlers (design D1,
+//! infrastructure layer): the room registry (joinable rooms by code), the
+//! one-room-per-device index, and the in-memory rating store.
+
+#![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use crate::config::Config;
-use crate::protocol::{ErrorCode, ServerMessage};
-use crate::rating::RatingStore;
-use crate::room::{run as run_room, RoomMsg};
-
-/// 32-character unambiguous alphabet: A-Z without I and O, digits 2-9
-/// (no 0/1, no I/O) so codes stay readable when typed by hand.
-pub const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-pub const CODE_LEN: usize = 6;
+use crate::application::ports::{ChessEngine, Ratings, RoomRegistry, RoomServices, TimeSource};
+use crate::application::room_actor::{run_room, RoomMsg};
+use crate::domain::room::{CODE_ALPHABET, CODE_LEN, is_valid_code};
+use crate::domain::time_control::TimeControl;
+use crate::infrastructure::config::Config;
+use crate::infrastructure::engine::CoreEngine;
+use crate::infrastructure::ratings::RatingStore;
+use crate::interface::protocol::{ErrorCode, ServerMessage};
 
 /// A live connection bound to a room: the mailbox to send the room's
 /// decisions from, and the room's outbound messages to the client.
@@ -26,6 +28,32 @@ pub struct Conn {
     pub out_rx: mpsc::UnboundedReceiver<ServerMessage>,
 }
 
+/// Monotonic wall time in milliseconds (design D2/D9): the production
+/// `TimeSource`. Only differences between marks are meaningful.
+pub struct SystemTimeSource {
+    origin: Instant,
+}
+
+impl SystemTimeSource {
+    pub fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl TimeSource for SystemTimeSource {
+    fn now_ms(&self) -> u64 {
+        Instant::now().duration_since(self.origin).as_millis() as u64
+    }
+}
+
+impl Default for SystemTimeSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct App {
     config: Config,
     /// Joinable rooms, by code. Terminal rooms stay listed until their
@@ -33,16 +61,38 @@ pub struct App {
     rooms: Mutex<HashMap<String, mpsc::UnboundedSender<RoomMsg>>>,
     /// One room per device: player_id -> room code.
     players: Mutex<HashMap<String, String>>,
-    ratings: RatingStore,
+    ratings: Arc<RatingStore>,
+    engine: Arc<dyn ChessEngine>,
+    time: Arc<dyn TimeSource>,
+}
+
+impl RoomRegistry for App {
+    fn remove_room(&self, code: &str) {
+        self.rooms.lock().unwrap().remove(code);
+    }
+
+    /// Forget a device, but only if it is still bound to this room (so a
+    /// late rejection never unbinds the device from a newer room).
+    fn untrack_player_if(&self, player_id: &str, code: &str) {
+        let mut players = self.players.lock().unwrap();
+        if players.get(player_id).is_some_and(|c| c == code) {
+            players.remove(player_id);
+        }
+    }
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
+        let engine: Arc<dyn ChessEngine> = Arc::new(CoreEngine);
+        let ratings = Arc::new(RatingStore::new(Arc::clone(&engine)));
+        let time: Arc<dyn TimeSource> = Arc::new(SystemTimeSource::new());
         Self {
             config,
             rooms: Mutex::new(HashMap::new()),
             players: Mutex::new(HashMap::new()),
-            ratings: RatingStore::new(),
+            ratings,
+            engine,
+            time,
         }
     }
 
@@ -62,10 +112,6 @@ impl App {
         self.rooms.lock().unwrap().contains_key(code)
     }
 
-    pub fn remove_room(&self, code: &str) {
-        self.rooms.lock().unwrap().remove(code);
-    }
-
     fn track_player(&self, player_id: &str, code: &str) {
         self.players
             .lock()
@@ -73,22 +119,38 @@ impl App {
             .insert(player_id.to_string(), code.to_string());
     }
 
-    /// Forget a device, but only if it is still bound to this room (so a
-    /// late rejection never unbinds the device from a newer room).
-    pub fn untrack_player_if(&self, player_id: &str, code: &str) {
-        let mut players = self.players.lock().unwrap();
-        if players.get(player_id).is_some_and(|c| c == code) {
-            players.remove(player_id);
+    pub fn is_valid_code(code: &str) -> bool {
+        is_valid_code(code)
+    }
+
+    /// The ports the room actor needs (design D1): this app owns the
+    /// registry, and it shares the ratings, the engine, and the time source
+    /// with the room it spawns.
+    fn services(&self, this: &Arc<Self>) -> RoomServices {
+        RoomServices {
+            registry: Arc::clone(this) as Arc<dyn RoomRegistry>,
+            ratings: Arc::clone(&self.ratings) as Arc<dyn Ratings>,
+            engine: Arc::clone(&self.engine),
+            time: Arc::clone(&self.time),
+            reconnect_grace: self.config.reconnect_grace,
         }
     }
 
-    pub fn is_valid_code(code: &str) -> bool {
-        code.len() == CODE_LEN && code.bytes().all(|b| CODE_ALPHABET.contains(&b))
+    /// Create a room with the default time control (spec "Server Room
+    /// Management"): unique code, the creator seated White, the room actor
+    /// spawned.
+    pub fn create_room(self: &Arc<Self>, player_id: &str) -> Result<Conn, ServerMessage> {
+        self.create_room_with_time_control(player_id, TimeControl::DEFAULT)
     }
 
-    /// Create a room: unique code, the creator seated White, and the room
-    /// actor spawned.
-    pub fn create_room(self: &Arc<Self>, player_id: &str) -> Result<Conn, ServerMessage> {
+    /// Create a room with an explicit time control (spec "Creating a room
+    /// chooses its time control"), used by the wire path and by tests that
+    /// need short clocks.
+    pub fn create_room_with_time_control(
+        self: &Arc<Self>,
+        player_id: &str,
+        time_control: TimeControl,
+    ) -> Result<Conn, ServerMessage> {
         {
             let players = self.players.lock().unwrap();
             if players.contains_key(player_id) {
@@ -101,8 +163,9 @@ impl App {
 
         let app = Arc::clone(self);
         let actor_code = code.clone();
+        let services = self.services(&app);
         tokio::spawn(async move {
-            run_room(mailbox_rx, app, actor_code).await;
+            run_room(mailbox_rx, services, actor_code, time_control).await;
         });
 
         self.rooms

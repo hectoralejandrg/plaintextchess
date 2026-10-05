@@ -61,7 +61,7 @@ class OnlineConnectionManager(
     /** What the open socket should be told to do when it connects. */
     private sealed class PendingAction {
         object None : PendingAction()
-        object Create : PendingAction()
+        data class Create(val timeControl: String?) : PendingAction()
         data class Join(val code: String) : PendingAction()
     }
 
@@ -77,9 +77,10 @@ class OnlineConnectionManager(
 
     /** Intents */
 
-    /** Connect and create a room (the caller takes the White seat). */
-    fun startCreating() {
-        beginAttempt(OnlinePhase.Connecting, PendingAction.Create, reconnect = false)
+    /** Connect and create a room (the caller takes the White seat) with the
+     * chosen time-control label. */
+    fun startCreating(timeControl: String?) {
+        beginAttempt(OnlinePhase.Connecting, PendingAction.Create(timeControl), reconnect = false)
     }
 
     /** Connect and join an existing room by code. */
@@ -165,7 +166,8 @@ class OnlineConnectionManager(
         // intent can be fired right after newWebSocket (create on first
         // connect, join on a re-attach attempt).
         when (val action = pendingAction) {
-            is PendingAction.Create -> send(OnlineCodec.encodeCreateRoom(deviceID))
+            is PendingAction.Create ->
+                send(OnlineCodec.encodeCreateRoom(deviceID, action.timeControl))
             is PendingAction.Join -> send(OnlineCodec.encodeJoinRoom(deviceID, action.code))
             is PendingAction.None -> Unit
         }
