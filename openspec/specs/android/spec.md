@@ -4,7 +4,6 @@
 Define comprehensive build specifications for the Android chess application, including build configuration, deployment procedures, and platform-specific requirements.
 
 ## Requirements
-
 ### Requirement: Android Build Configuration
 The build system MUST specify consistent configuration for Android application builds across different environments.
 
@@ -15,7 +14,6 @@ The build system MUST specify consistent configuration for Android application b
 #### Scenario: Environment Configuration
 - **WHEN** application needs different build environments (debug, release)
 - **THEN** the build system MUST support environment-specific configurations
-
 ### Requirement: Android Deployment Specifications
 The build system MUST define deployment procedures for Android application distribution.
 
@@ -26,14 +24,12 @@ The build system MUST define deployment procedures for Android application distr
 #### Scenario: Enterprise Distribution
 - **WHEN** application needs enterprise distribution
 - **THEN** the build system MUST support enterprise deployment procedures
-
 ### Requirement: Performance Build Requirements
 The build system MUST enforce performance targets for Android application builds.
 
 #### Scenario: Build Performance Targets
 - **WHEN** Android application is being built
 - **THEN** the build system MUST meet performance requirements
-
 ### Requirement: Android Playable Game Screen
 The repository MUST contain an Android application project that bundles the
 chess core native libraries for the supported ABIs and, at launch, presents a
@@ -73,14 +69,12 @@ errors MUST be surfaced in the UI instead of crashing.
 #### Scenario: FFI failure is rendered in the UI
 - **WHEN** a call into the chess core fails
 - **THEN** the app displays the error in the UI instead of crashing
-
 ### Requirement: Self-Sufficient Android Build via Gradle Wrapper
 The Android app project MUST be buildable with a committed Gradle wrapper so that no global Gradle installation is required; a machine with only a compatible JDK and the Android SDK MUST be able to build the app.
 
 #### Scenario: Wrapper build on a clean machine
 - **WHEN** the wrapper build entry point is run on a machine without a global Gradle installation
 - **THEN** the build completes and produces the app package using the wrapper's pinned Gradle version
-
 ### Requirement: Android Pawn Promotion
 The Android game screen MUST support pawn promotion: when a pawn's destination
 is on the last rank, the app MUST offer a choice between queen, rook, bishop,
@@ -102,7 +96,6 @@ string with the chosen piece's promotion character.
 #### Scenario: Promotion choice is cancellable
 - **WHEN** the user dismisses the selector without picking a piece
 - **THEN** no move is played, the board position does not change, and the previous selection is cleared
-
 ### Requirement: Android Piece Drag and Drop
 The Android game screen MUST support moving pieces by dragging in addition to
 the existing two-tap selection: the user MUST be able to press and drag a
@@ -128,7 +121,6 @@ released over a legal destination.
 #### Scenario: Tap selection still works alongside drag
 - **WHEN** the user taps a piece without dragging
 - **THEN** the two-tap selection behavior is unchanged (select, highlight, tap destination to play)
-
 ### Requirement: Android Move Animation
 The Android game screen MUST animate played moves with a short slide: the
 moved piece MUST travel from its origin square to its destination square, and
@@ -141,16 +133,21 @@ the animation MUST be skipped when the user has disabled system animations.
 #### Scenario: System animations disabled skip the slide
 - **WHEN** the user has disabled system animations (animation duration scale set to none) and a move is played
 - **THEN** the piece appears on the destination square immediately, without the slide animation
-
 ### Requirement: Android Game Mode Selection
 The Android game screen MUST let the player choose, when starting a new game,
 whether the game is two players, against the CPU, or online. When
 the game is against the CPU, the player MUST choose which difficulty to use
 (easy, medium, or hard). When the game is online, the opponent is the
 player on another device connected to the server, and the player's color
-MUST be assigned by the server. Two players MUST be the default selection
-and MUST keep the existing two-player behavior unchanged. The chosen mode
-and difficulty MUST be fixed for the duration of that game.
+MUST be assigned by the server. When the player creates an online game,
+the app MUST let the player pick the room's time control from the
+supported presets (15+10, 10+0, 5+0, 3+2, 1+0), and the chosen control
+MUST be fixed for that room; when the player joins an existing game, the
+app MUST show the room's time control in the waiting state so the player
+can see it before the game starts. Two players MUST be the default
+selection and MUST keep the existing two-player behavior unchanged. The
+chosen mode, difficulty, and time control MUST be fixed for the duration
+of that game.
 
 The New game action MUST be available only while the current game is
 finished (checkmate, draw, or resignation), while no move of the current
@@ -183,10 +180,13 @@ in a disabled state, and MUST NOT start a new game when activated.
 - **WHEN** the player selects online in the new-game sheet
 - **THEN** the app shows two options: create a new game, which connects to the server and shows the room code to share while waiting for the opponent, or join an existing game, which lets the player enter a room code
 
+#### Scenario: Creating an online game chooses the time control
+- **WHEN** the player chooses online, selects create, and picks one of the time-control presets
+- **THEN** the room is created with that time control, the waiting state shows the room code together with the chosen time control, and the clocks display the base time of the control
+
 #### Scenario: Starting an online game defers local play to the server
 - **WHEN** the player confirms create or join for an online game
 - **THEN** the app connects to the online server, no local game is started, and the board and move list show the waiting or server state until the online game begins
-
 ### Requirement: Android CPU Opponent
 In a game against the CPU, the CPU MUST play the black side. When it is the
 CPU's turn, the app MUST indicate that the CPU is thinking, MUST not accept
@@ -222,22 +222,24 @@ that follows. The CPU MUST make no further moves once the game is over.
 #### Scenario: CPU respects the end of the game
 - **WHEN** the game reaches checkmate, stalemate, or another draw condition
 - **THEN** the app displays the game result, and the CPU makes no further moves
-
 ### Requirement: Android Game-End Dialog
-When a game ends, the Android game screen MUST present a modal the moment the
-game status becomes terminal (checkmate, draw, or resignation). The modal
-MUST make the result unambiguous: in a two-player game the outcome MUST state
-which color won on checkmate ("Checkmate! White wins." / "Checkmate! Black
-wins."), which side resigned on resignation ("White resigns. Black wins." /
-"Black resigns. White wins."), or that the game was drawn; in a game against
-the CPU the outcome MUST be stated from the player's perspective (the player
-always plays White), so a White checkmate MUST say the player won, a Black
-checkmate MUST say the player lost, a resignation MUST say the player lost,
-and a draw MUST say the game was drawn. In an online game the outcome MUST
-be stated from the player's perspective, using the color the server assigned
-to the player: a win MUST say the player won (including a win by the
-opponent's forfeit), a loss MUST say the player lost, and a draw MUST say
-the game was drawn. The modal MUST appear exactly once
+When a game ends, the Android game screen MUST present a modal the moment
+the game status becomes terminal (checkmate, draw, resignation, or flag
+fall). The modal MUST make the result unambiguous: in a two-player game
+the outcome MUST state which color won on checkmate ("Checkmate! White
+wins." / "Checkmate! Black wins."), which side resigned on resignation
+("White resigns. Black wins." / "Black resigns. White wins."), or that the
+game was drawn; in a game against the CPU the outcome MUST be stated from
+the player's perspective (the player always plays White), so a White
+checkmate MUST say the player won, a Black checkmate MUST say the player
+lost, a resignation MUST say the player lost, and a draw MUST say the game
+was drawn. In an online game the outcome MUST be stated from the player's
+perspective, using the color the server assigned to the player: a win MUST
+say the player won (including a win by the opponent's forfeit), a loss
+MUST say the player lost, and a draw MUST say the game was drawn. A win or
+loss by flag fall MUST be stated as a win or loss on time ("You won on
+time." / "You lost on time."), and a flag-fall draw MUST say the game was
+drawn. The modal MUST appear exactly once
 per game: after the player dismisses it, it MUST NOT reappear while the game
 remains in that terminal state, and the game's status line MUST keep showing
 the result. In local games (two players or CPU) the modal MUST offer a
@@ -263,7 +265,7 @@ remain ignored as it is at any terminal status.
 
 #### Scenario: Resigning a CPU game
 - **WHEN** in a game against the CPU the player resigns
-- **THEN** the game ends immediately, any in-flight CPU move is discarded, and a modal appears stating that the player lost the game
+- **THEN** the game ends immediately, any in-flight CPU move is discarded, and a modal appears stating that the player lost
 
 #### Scenario: Draw
 - **WHEN** a game ends in a draw (stalemate or another draw condition)
@@ -278,9 +280,12 @@ remain ignored as it is at any terminal status.
 - **THEN** a new game starts from the standard initial position in that same mode, and a new game that later ends presents a fresh game-end modal
 
 #### Scenario: Online game result modal
-- **WHEN** an online game ends by checkmate, resignation, forfeit, or draw
-- **THEN** the modal appears stating the result from the player's perspective ("You won.", "You lost.", or "Draw.") and offers only the dismissal action
+- **WHEN** an online game ends by checkmate, resignation, forfeit, flag fall, or draw
+- **THEN** the modal appears stating the result from the player's perspective ("You won.", "You lost.", "You won on time.", "You lost on time.", or "Draw.") and offers only the dismissal action
 
+#### Scenario: Online game result by flag fall
+- **WHEN** an online game ends because a player's time ran out
+- **THEN** the modal states that the player won on time when the opponent's time ran out, that the player lost on time when the player's own time ran out, or "Draw." when the winner's material was insufficient to checkmate, and offers only the dismissal action
 ### Requirement: Android Game Controls
 The Android game screen MUST offer three game controls with consistent
 availability: "Resign", "Undo", and "Flip board".
@@ -356,7 +361,6 @@ While a game is over, Resign and Undo MUST be unavailable.
 #### Scenario: Resign is available during the opponent's turn
 - **WHEN** in an online game it is the opponent's turn and the player taps Resign
 - **THEN** the app resigns the online game, the server ends the game with the player as the loser, and the game-end modal states that the player lost
-
 ### Requirement: Android Single Active Game Session
 The Android game screen MUST keep at most one active core game session at
 a time, and all board rendering, move execution, legal-move queries,
@@ -386,7 +390,6 @@ its bookkeeping MUST remain unchanged.
 #### Scenario: Undo leaves only the rebuilt session
 - **WHEN** the player taps Undo during play
 - **THEN** the active session is the rebuilt session matching the position before the taken-back move, with no CPU move pending and no trace of the taken-back move in the move list or the board
-
 ### Requirement: Android Online Multiplayer
 The Android game screen MUST support playing an online game against another
 device: the player MUST be able to create a game (the app connects, shows
@@ -444,3 +447,35 @@ the extra MUST be inert.
 #### Scenario: DEBUG builds accept a custom server URL
 - **WHEN** the DEBUG build is launched with the online-URL override intent extra
 - **THEN** the app uses that server URL for online games; in release builds the extra has no effect
+### Requirement: Android Online Clock UI
+The Android game screen MUST display both players' remaining time in
+online games: one clock per player, clearly associated with each side, so
+that the opponent's clock and the player's clock are never confusable.
+The clock of the side to move MUST be visually emphasized so the active
+clock is identifiable at a glance. The displayed time MUST be derived from
+the server's state snapshots, which are the source of truth, with smooth
+local countdown interpolation between snapshots; each new snapshot MUST
+re-synchronize the clocks to its values. While the room is in the lobby
+(the opponent has not joined yet) both clocks MUST show the base time of
+the chosen time control and neither clock MUST be emphasized as active.
+When the reconnecting banner is shown, the clocks MUST keep displaying
+their last known times and MUST resume from the re-attached snapshot's
+remaining times. The clock area MUST NOT change the board's size: the
+board MUST keep the exact full-width size in every online state where
+clocks are visible.
+
+#### Scenario: Clocks display and track the game
+- **WHEN** an online game is in progress
+- **THEN** both clocks are visible showing the player's and the opponent's remaining time, the clock of the side to move is emphasized, the countdown decreases smoothly between snapshots, and each snapshot re-synchronizes both clocks
+
+#### Scenario: The lobby shows the base time
+- **WHEN** the player has created a room and is waiting for the opponent to join
+- **THEN** both clocks show the base time of the chosen time control, neither clock is emphasized as active, and the waiting state shows the chosen time control next to the room code
+
+#### Scenario: Clocks survive a connection drop
+- **WHEN** the connection drops, the reconnecting banner is shown, and the connection is later restored
+- **THEN** the clocks keep displaying their last known times while the banner is shown, and when the game resumes they continue from the remaining times in the re-attached state snapshot
+
+#### Scenario: Clocks never change the board size
+- **WHEN** the game screen moves between the online waiting state, an in-progress state with active clocks, and the reconnecting banner
+- **THEN** the rendered board keeps the exact same full-width size in every one of those states
