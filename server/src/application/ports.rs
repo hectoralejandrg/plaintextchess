@@ -36,6 +36,10 @@ pub trait EngineSession: Send + Sync {
     fn is_checkmate(&self) -> Result<bool, EngineError>;
     /// Whether the position is a draw by the core's rules.
     fn is_draw(&self) -> Result<bool, EngineError>;
+    /// Whether the side (`true` = White) cannot deliver checkmate with its
+    /// material: the flag-fall draw judgment ("A flag fall with insufficient
+    /// material is a draw").
+    fn insufficient_material_for(&self, winner_is_white: bool) -> Result<bool, EngineError>;
 }
 
 /// One rating session: read the current rating and record finished games.

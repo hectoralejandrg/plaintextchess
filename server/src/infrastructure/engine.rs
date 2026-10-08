@@ -48,6 +48,12 @@ impl EngineSession for CoreEngineSession {
     fn is_draw(&self) -> Result<bool, EngineError> {
         self.0.is_draw().map_err(|e| e.to_string())
     }
+
+    fn insufficient_material_for(&self, winner_is_white: bool) -> Result<bool, EngineError> {
+        self.0
+            .insufficient_material_for(winner_is_white)
+            .map_err(|e| e.to_string())
+    }
 }
 
 struct CoreRatingSession(Arc<GameSession>);

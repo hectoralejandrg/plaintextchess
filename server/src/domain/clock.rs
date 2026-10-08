@@ -14,6 +14,10 @@ pub struct Clocks {
     side_to_move: u8,
     /// Monotonic mark at which the side-to-move clock was last settled.
     turn_started_ms: u64,
+    /// Whether the clock is counting. Set to `false` by [`Self::stop`] when the
+    /// game reaches a terminal result, so every later snapshot reports the
+    /// same frozen times.
+    running: bool,
 }
 
 impl Clocks {
@@ -24,6 +28,7 @@ impl Clocks {
             remaining_ms: [base_ms, base_ms],
             side_to_move: first_side,
             turn_started_ms: started_ms,
+            running: true,
         }
     }
 
@@ -36,12 +41,26 @@ impl Clocks {
     /// move has been counting down since `turn_started_ms`; the waiting
     /// side is frozen at its settled value.
     pub fn remaining_ms(self, side: u8, now_ms: u64) -> u64 {
-        if side == self.side_to_move {
+        if self.running && side == self.side_to_move {
             self.remaining_ms[side as usize]
                 .saturating_sub(now_ms.saturating_sub(self.turn_started_ms))
         } else {
             self.remaining_ms[side as usize]
         }
+    }
+
+    /// Freeze the clock because the game just reached a terminal result: the
+    /// side to move's elapsed time is settled one last time and no side counts
+    /// down afterwards, so every snapshot after the ending reports the same
+    /// remaining times regardless of when it is built.
+    pub fn stop(&mut self, now_ms: u64) {
+        if !self.running {
+            return;
+        }
+        let side = self.side_to_move as usize;
+        let elapsed = now_ms.saturating_sub(self.turn_started_ms);
+        self.remaining_ms[side] = self.remaining_ms[side].saturating_sub(elapsed);
+        self.running = false;
     }
 
     /// The monotonic mark at which the side to move's clock reaches zero.
@@ -50,9 +69,10 @@ impl Clocks {
             .saturating_add(self.remaining_ms[self.side_to_move as usize])
     }
 
-    /// Whether the side to move's clock has already reached zero.
+    /// Whether the side to move's clock has already reached zero. A stopped
+    /// clock (game over) is never flagged.
     pub fn is_flagged(self, now_ms: u64) -> bool {
-        now_ms >= self.deadline_ms()
+        self.running && now_ms >= self.deadline_ms()
     }
 
     /// A move by `mover` completes at `now_ms` (design D2): the elapsed
@@ -145,5 +165,23 @@ mod tests {
         let clocks = Clocks::new(10_000, 0, 0);
         assert_eq!(clocks.remaining_ms(0, 10_000 + 250), 0);
         assert_eq!(clocks.remaining_ms(0, 1_000_000), 0);
+    }
+
+    #[test]
+    fn stopping_the_clock_settles_once_and_then_freezes_both_sides() {
+        let mut clocks = Clocks::new(BASE, 0, 0);
+        // White has been thinking for 12 s when the game ends.
+        clocks.stop(12_000);
+        assert_eq!(clocks.remaining_ms(0, 12_000), BASE - 12_000);
+        assert_eq!(
+            clocks.remaining_ms(0, 60_000),
+            BASE - 12_000,
+            "a stopped clock does not keep counting down"
+        );
+        assert_eq!(clocks.remaining_ms(1, 60_000), BASE, "the waiting side stays put");
+        assert!(!clocks.is_flagged(1_000_000), "a stopped clock never flags");
+        // Stopping twice is a no-op (a later snapshot must not settle again).
+        clocks.stop(90_000);
+        assert_eq!(clocks.remaining_ms(0, 90_000), BASE - 12_000);
     }
 }

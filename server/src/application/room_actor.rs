@@ -10,7 +10,6 @@ use crate::application::ports::{EngineSession, RoomServices};
 use crate::domain::clock::Clocks;
 use crate::domain::account::Identity;
 use crate::domain::game_record::FinishedGame;
-use crate::domain::material;
 use crate::domain::rating::{self, DEFAULT_RATING};
 use crate::domain::time_control::TimeControl;
 use crate::interface::protocol::{Color, ErrorCode, ServerMessage, State, Status, VERSION};
@@ -224,6 +223,17 @@ impl Room {
     fn send_state_both(&self) {
         self.send_state(WHITE);
         self.send_state(BLACK);
+    }
+
+    /// Freeze the clocks because the game just ended: without this the side to
+    /// move keeps counting down in every later snapshot, so the terminal times
+    /// would depend on when a snapshot is built and the two clients could even
+    /// disagree.
+    fn stop_clocks(&mut self) {
+        let now_ms = self.now_ms();
+        if let Some(clocks) = self.clocks.as_mut() {
+            clocks.stop(now_ms);
+        }
     }
 
     fn send_room_ready(&self, idx: usize) {
@@ -523,6 +533,7 @@ impl Room {
         );
         self.status = status;
         if self.status.is_terminal() {
+            self.stop_clocks();
             self.apply_terminal_ratings(idx).await;
             self.cancel_grace(); // the game is over: nothing left to time out
         }
@@ -546,6 +557,9 @@ impl Room {
             winner: Self::color_of(winner),
         };
         self.cancel_grace();
+        // Freeze at the moment the result is known, before the (possibly slow)
+        // durable commit, so the clocks reflect the real end of the game.
+        self.stop_clocks();
         self.apply_terminal_ratings(winner).await;
         self.send_state_both();
     }
@@ -564,6 +578,7 @@ impl Room {
                 winner: Self::color_of(winner),
             };
             self.cancel_grace();
+            self.stop_clocks();
             self.apply_terminal_ratings(winner).await;
             self.remove_seat(idx);
             self.send_state_both();
@@ -616,8 +631,10 @@ impl Room {
         };
         let flagged = clocks.side_to_move();
         let winner = 1 - flagged as usize;
-        let fen = self.session.board_state().expect("board state");
-        let drawn = material::insufficient_to_mate(&fen, winner == WHITE);
+        let drawn = self
+            .session
+            .insufficient_material_for(winner == WHITE)
+            .expect("insufficient material check");
         self.status = if drawn {
             Status::Drawn
         } else {
@@ -625,6 +642,7 @@ impl Room {
                 winner: Self::color_of(winner),
             }
         };
+        self.stop_clocks();
         self.apply_terminal_ratings(winner).await;
         self.cancel_grace(); // the game is over: nothing left to time out
         self.send_state_both();
@@ -667,6 +685,7 @@ impl Room {
         self.status = Status::Forfeited {
             winner: Self::color_of(winner),
         };
+        self.stop_clocks();
         self.apply_terminal_ratings(winner).await;
         self.send_state(winner); // final snapshot (forfeited, new ratings)
         self.remove_seat(idx); // the absent player can no longer re-attach
@@ -811,6 +830,12 @@ mod tests {
             Ok(self
                 .draw_after
                 .is_some_and(|n| self.moves.load(Ordering::SeqCst) >= n))
+        }
+
+        fn insufficient_material_for(&self, _winner_is_white: bool) -> Result<bool, EngineError> {
+            // The scripted session always reports a full-material position, so
+            // a flag fall is decisive rather than a draw.
+            Ok(false)
         }
     }
 

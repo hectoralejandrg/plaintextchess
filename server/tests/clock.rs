@@ -289,3 +289,62 @@ async fn a_disconnect_that_outlives_the_grace_is_a_forfeit_even_with_time_left()
         }
     );
 }
+
+/// A game that ends must freeze the clocks: a later snapshot (here triggered
+/// by the opponent leaving the finished room) reports the same times instead
+/// of letting the side that had the move count down after the result — the
+/// drift that made two clients show different readings for the same seat.
+#[tokio::test]
+async fn a_terminal_snapshot_keeps_the_frozen_times_after_later_updates() {
+    let app = app_with_grace(30);
+    let control = TimeControl {
+        base_ms: 5_000,
+        increment_ms: 0,
+    };
+    let (mut a, mut b) = start_timed_game(&app, control).await;
+
+    // White moves: Black is now on the clock.
+    send_move(&a, "e2e4");
+    let _ = next_state(&mut a.out_rx).await;
+    let _ = next_state(&mut b.out_rx).await;
+
+    // White resigns while Black is on the clock: the game is terminal.
+    send(
+        &a,
+        RoomMsg::Resign {
+            identity: a.identity.clone(),
+        },
+    );
+    let terminal = terminal_state(&mut a.out_rx, Duration::from_secs(5)).await;
+    assert_eq!(
+        terminal.status,
+        Status::Resigned {
+            winner: Color::Black
+        }
+    );
+    // Both seats must receive the same frozen clock.
+    let terminal_b = terminal_state(&mut b.out_rx, Duration::from_secs(5)).await;
+    assert_eq!(
+        terminal_b.black_time_ms, terminal.black_time_ms,
+        "both seats must read the same frozen Black time"
+    );
+    assert_eq!(terminal_b.white_time_ms, terminal.white_time_ms);
+
+    // Time passes, then Black leaves the finished room: the server broadcasts
+    // one more snapshot to the seat that is still there.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    send(
+        &b,
+        RoomMsg::Leave {
+            identity: b.identity.clone(),
+            ack: None,
+        },
+    );
+    let after = next_state(&mut a.out_rx).await;
+    assert_eq!(after.status, terminal.status);
+    assert_eq!(
+        after.black_time_ms, terminal.black_time_ms,
+        "the running clock must be frozen once the game ends"
+    );
+    assert_eq!(after.white_time_ms, terminal.white_time_ms);
+}

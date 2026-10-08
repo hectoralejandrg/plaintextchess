@@ -5,7 +5,6 @@
 pub mod account;
 pub mod clock;
 pub mod game_record;
-pub mod material;
 pub mod rating;
 pub mod room;
 pub mod time_control;
