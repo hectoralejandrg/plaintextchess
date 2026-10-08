@@ -28,6 +28,7 @@ The Rust core provides the foundation for the chess application with high-perfor
 - `update_player_rating(opponent_rating, result)` → actualiza el rating con un oponente
 - `get_current_rating()` → devuelve el rating actual del jugador
 - `serialize()` / `deserialize()` → persistencia del rating
+- `state()` / `set_state(snapshot)` → expone y restaura el snapshot completo Glicko-2 (rating, desviación, volatilidad) para persistencia del servidor (no parte de la superficie FFI)
 
 **Requirements:**
 - Debe implementar Glicko-2 con `glicko2` crate
@@ -41,6 +42,8 @@ The Rust core provides the foundation for the chess application with high-perfor
 **APIs Principal:**
 - `serialize()` → exporta el estado completo del juego
 - `deserialize()` → importa el estado del juego
+- `get_rating_state()` → expone el snapshot Glicko-2 completo del jugador de esta sesión (no parte de la FFI, para el consumidor en proceso: la persistencia del servidor)
+- `new_game_session_from_rating_state(snapshot: RatingSnapshot) -> Arc<GameSession>` → constructor de sesión con el rating restaurado desde un snapshot persistido
 
 ### 4. FFI Bindings
 **Responsibility:** Expone Rust al Kotlin (Android) y Swift (iOS)

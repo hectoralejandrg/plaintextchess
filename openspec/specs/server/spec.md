@@ -125,16 +125,14 @@ connected at the flag.
 - **WHEN** a player's time runs out while they are disconnected and they re-attach before the disconnect grace expires
 - **THEN** the game ends by flag fall with the opponent as winner (or as a draw when the opponent's material is insufficient to checkmate), exactly as if they had been connected at the flag
 ### Requirement: Server Online Rating
-The server MUST keep a per-player rating, keyed by the player's persistent
-device identifier, using the core's Glicko2 rating logic. A player the
-server has not seen before MUST start at 1500. When a game ends, the
-server MUST update both players' ratings with the earned point share
-against the opponent's rating: 1.0 for the winner, 0.0 for the loser,
-0.5 for both on a draw, and a flag-fall result MUST be scored the same as
-a win/loss while a flag-fall draw MUST be scored as a draw. Ratings MUST
-be included in state snapshots for both players. Ratings live in memory
-and MUST reset when the server restarts (documented limitation of the
-in-memory MVP).
+The server MUST keep a per-player Glicko-2 rating, keyed by the player's
+persistent device identifier (spec "Server Persistence"), and load the
+full persisted state at startup so ratings survive restarts. Without the
+database the server MUST start with the in-memory default (1500 / 200 / 0.06)
+for each unseen device; with the database (`DATABASE_URL`; default
+`sqlite:./data/chess-server.db`) ratings are loaded at startup from the
+`players` table and committed in a single idempotent transaction at game
+end. Ratings MUST be included in every state snapshot.
 
 #### Scenario: A new player starts at 1500
 - **WHEN** a device identifier the server has not seen before creates or joins a room
@@ -155,14 +153,44 @@ in-memory MVP).
 #### Scenario: A flag fall updates both ratings
 - **WHEN** an online game ends by flag fall
 - **THEN** the server updates the winner's rating up and the timed-out player's rating down against each other using the core's rating logic, and both players see the new ratings in the final snapshot
+### Requirement: Server Persistence
+The server MUST persist the per-device Glicko-2 rating state (rating,
+rating deviation, and volatility) and a record of every finished online game
+in a local SQLite database (local file, WAL mode). The database location MUST
+come from the `DATABASE_URL` environment variable (`sqlite:...`) with a
+built-in default (`sqlite:./data/chess-server.db`); the default's parent
+`data/` directory MUST be created at startup. The database schema MUST be
+managed by versioned migrations that run at startup. Before accepting any
+connection, the server MUST load the persisted rating states into the
+in-memory rating store. When a game reaches a terminal result, the server
+MUST record the finished game in a single idempotent transaction: a game row
+(with a UUIDv4 `game_id` as idempotency key, the wire status name, the
+optional `"white"`/`"black"` winner for decisive results, both device
+identifiers, the move count, each player's pre/post rating, the time control,
+and an `ended_at_ms` wall-clock timestamp stamped at commit time), both
+players' post-game Glicko-2 state (`ON CONFLICT DO UPDATE` guarded by
+`updated_at_ms < excluded.updated_at_ms`), and a `rating_history` row per
+player (`INSERT OR IGNORE`, PK `(device_id, game_id)`). A failed commit MUST
+be logged and MUST not block the delivery of the terminal snapshot to the
+players (design D7: the final snapshot and in-memory ratings are always
+delivered; the crash-loss window is documented as bounded to the millisecond
+between commit and crash).
+
+#### Scenario: A finished online game survives a server restart
+- **WHEN** the server stops and restarts against the same `DATABASE_URL` file
+- **THEN** the persisted `players` table reloads both devices' full Glicko-2 state into the in-memory rating store, and the new game starts from those values (not from the 1500 default)
+
 ### Requirement: Server Health and Configuration
 The server MUST expose an HTTP health endpoint (`GET /healthz`) that
 answers 200 while the server is ready to accept WebSocket connections, and
 MUST serve the online protocol on a WebSocket endpoint. The bind address,
-port, and reconnect grace window MUST come from environment configuration
-(BIND, PORT, RECONNECT_GRACE_SECS) with safe built-in defaults, so the
-same build can run locally and on a hosting platform. The server MUST
-start without a database and terminate cleanly on SIGTERM.
+port, reconnect grace window (`RECONNECT_GRACE_SECS`), and persistence
+database location (`DATABASE_URL`, default `sqlite:./data/chess-server.db`)
+MUST come from environment configuration with safe built-in defaults, so the
+same build can run locally and on a hosting platform. The server MUST start
+without a database and terminate cleanly on SIGTERM. The database's parent
+directory (default `data/`) MUST be created automatically at startup so the
+persistence file can be created on first use.
 
 #### Scenario: The health endpoint reports readiness
 - **WHEN** a client requests `GET /healthz`
