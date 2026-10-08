@@ -398,7 +398,10 @@ game by entering a room code. After the game starts, the app MUST render
 the game from the server's authoritative state: a move MUST be applied
 locally only after the server confirms it, and the board, move list,
 last-move highlight, status line, and game-end dialog MUST reflect the
-server's state. The app MUST show whose turn it is and clearly indicate
+server's state. The app MUST apply the server's incremental updates by
+replaying the move into its local mirror session and updating the clocks,
+side to move, and status; it MUST use the full state snapshot only when it
+connects or re-attaches. The app MUST show whose turn it is and clearly indicate
 when it is the player's own turn. When the player plays a move (by tap or
 drag, including pawn promotion through the existing piece selector), the
 app MUST send the full UCI move to the server and MUST show an error and
@@ -426,7 +429,7 @@ the extra MUST be inert.
 
 #### Scenario: A move is sent to the server and applied on confirmation
 - **WHEN** it is the player's turn and the player plays a move, including a pawn promotion chosen from the existing piece selector
-- **THEN** the app sends the full UCI move to the server, and the move appears on the board, in the move list, and in the last-move highlight only after the server confirms it
+- **THEN** the app sends the full UCI move to the server, and the move appears on the board, in the move list, and in the last-move highlight only after the server's update confirms it
 
 #### Scenario: A rejected move shows the error without changing the position
 - **WHEN** the server rejects the player's move (illegal move, or not the player's turn)
@@ -435,6 +438,10 @@ the extra MUST be inert.
 #### Scenario: The turn indicator shows whose move it is
 - **WHEN** the online game is in progress
 - **THEN** the status area shows whose turn it is and clearly marks the moments when it is the player's own turn
+
+#### Scenario: Incremental updates drive the clocks and status
+- **WHEN** the server applies a move or a terminal result
+- **THEN** the app replays the update into its mirror session and updates the board, move list, side to move, clocks, and status without waiting for a full snapshot
 
 #### Scenario: A connection drop shows reconnecting and re-attaches
 - **WHEN** the WebSocket disconnects during an online game
