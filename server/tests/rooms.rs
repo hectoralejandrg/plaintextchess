@@ -42,6 +42,7 @@ fn send_leave(conn: &Conn) {
         conn,
         RoomMsg::Leave {
             identity: conn.identity.clone(),
+            ack: None,
         },
     );
 }

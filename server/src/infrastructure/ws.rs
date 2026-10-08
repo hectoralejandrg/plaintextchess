@@ -301,9 +301,19 @@ async fn handle_text(
         },
         ClientMessage::Leave { .. } => {
             if let Some(conn) = conn.take() {
+                // Wait for the actor to confirm the leave. It releases the seat
+                // and unbinds the account/device before it signals, so a
+                // CreateRoom/JoinRoom sent right after on this same connection
+                // cannot observe the stale room and be refused with
+                // `already_in_room` (design D8/D10).
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                 let _ = conn.mailbox.send(RoomMsg::Leave {
                     identity: conn.identity,
+                    ack: Some(ack_tx),
                 });
+                // A closed mailbox (room already gone) drops the sender, so this
+                // resolves immediately rather than hanging.
+                let _ = ack_rx.await;
             }
         }
         ClientMessage::Register { .. }

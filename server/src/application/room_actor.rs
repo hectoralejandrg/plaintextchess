@@ -3,7 +3,7 @@
 //! where room state mutates, so seat, turn, and timer logic is free of races.
 //! It depends on the domain layer and on ports only (design D1).
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Instant};
 
 use crate::application::ports::{EngineSession, RoomServices};
@@ -40,8 +40,14 @@ pub enum RoomMsg {
     /// Explicit leave: frees the seat (lobby/finished games) or counts as a
     /// resignation (game in progress), so a player cannot escape a finished
     /// result by just leaving.
+    ///
+    /// When `ack` is present it is signalled after the leave has fully applied
+    /// — the seat released and the account/device entries unbound — so a
+    /// caller that keeps reusing the connection observes the release before
+    /// its next room action instead of racing it (design D8/D10).
     Leave {
         identity: Identity,
+        ack: Option<oneshot::Sender<()>>,
     },
     /// The player's socket closed. The seat is held for the reconnect grace
     /// window (game in progress) or the room is dropped (lobby).
@@ -723,7 +729,12 @@ pub async fn run_room(
                 }) => room.handle_connect(identity, join_code, out).await,
                 Some(RoomMsg::Move { identity, uci }) => room.handle_move(&identity, &uci).await,
                 Some(RoomMsg::Resign { identity }) => room.handle_resign(&identity).await,
-                Some(RoomMsg::Leave { identity }) => room.handle_leave(&identity).await,
+                Some(RoomMsg::Leave { identity, ack }) => {
+                    room.handle_leave(&identity).await;
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
+                    }
+                }
                 Some(RoomMsg::Detach { identity }) => room.handle_detach(&identity),
                 None => break, // both connection tasks gave up: room is dead
             },
@@ -1102,6 +1113,7 @@ mod tests {
             self.tx
                 .send(RoomMsg::Leave {
                     identity: player_id.into(),
+                    ack: None,
                 })
                 .unwrap();
         }
