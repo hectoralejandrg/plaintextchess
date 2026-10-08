@@ -879,7 +879,14 @@ final class GameViewModel: ObservableObject {
     /// replayed into the mirror session, and the UI (board, move list, last
     /// move, status) is driven from the server's data.
     private func applyOnlineSnapshot(_ state: OnlineState) {
-        onlineYourColor = state.yourColor.sideToMoveSquare
+        let color = state.yourColor.sideToMoveSquare
+        if onlineYourColor != color {
+            // A new online game (or a re-attach): seat the player's own color
+            // at the bottom so the board reads from their side. Later
+            // snapshots leave a manual Flip in place.
+            onlineYourColor = color
+            boardOrientation = color == "b" ? 180 : 0
+        }
         onlineOpponentOnline = state.opponentOnline
         onlineWhiteRating = state.whiteRating
         onlineBlackRating = state.blackRating

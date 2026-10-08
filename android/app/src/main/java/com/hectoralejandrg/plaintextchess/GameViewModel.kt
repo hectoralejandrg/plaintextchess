@@ -734,7 +734,14 @@ class GameViewModel(private val context: Context) {
      * replayed into the mirror session, and the UI (board, move list, last
      * move, status) is driven from the server's data. */
     private fun applyOnlineSnapshot(state: OnlineState) {
-        onlineYourColor = state.yourColor.sideToMove
+        val color = state.yourColor.sideToMove
+        if (onlineYourColor != color) {
+            // A new online game (or a re-attach): seat the player's own color
+            // at the bottom so the board reads from their side. Later
+            // snapshots leave a manual Flip in place.
+            onlineYourColor = color
+            boardOrientation = if (color == "b") 180 else 0
+        }
         onlineOpponentOnline = state.opponentOnline
         onlineWhiteRating = state.whiteRating
         onlineBlackRating = state.blackRating
