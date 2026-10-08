@@ -25,6 +25,11 @@ use tokio_tungstenite::WebSocketStream;
 
 type WsClient = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// How long a test waits for a write the server handed to a spawned task. The
+/// auth recorder persists off the reply path, so a durable read can still see
+/// the previous state for a moment, especially on a loaded CI runner.
+const DB_WRITE_BUDGET: Duration = Duration::from_secs(5);
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -68,6 +73,79 @@ impl TempDb {
 
     async fn pool(&self) -> sqlx::SqlitePool {
         sqlx::SqlitePool::connect(&self.url).await.expect("open the test database")
+    }
+
+    /// One string column of the first row, or `None` when there is no row or
+    /// the value is NULL. Unlike [`Self::text`], a missing row is not an error,
+    /// so a poll can retry while the durable write is still in flight.
+    async fn text_or_none(&self, sql: &str) -> Option<String> {
+        let pool = self.pool().await;
+        let value: Option<String> = sqlx::query_scalar(sql)
+            .fetch_optional(&pool)
+            .await
+            .expect(sql)
+            .flatten();
+        pool.close().await;
+        value
+    }
+
+    /// Polls until the first row's column is non-NULL, returning it or `None`
+    /// once `budget` is spent.
+    async fn wait_for_some_text(&self, sql: &str, budget: Duration) -> Option<String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if let Some(value) = self.text_or_none(sql).await {
+                return Some(value);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Polls until the first row's column equals `expected`.
+    async fn wait_for_text(&self, sql: &str, expected: &str, budget: Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if self.text_or_none(sql).await.as_deref() == Some(expected) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Polls until `sql` (a `COUNT(*)`) yields `expected`.
+    async fn wait_for_count(&self, sql: &str, expected: i64, budget: Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if self.count(sql).await == expected {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Polls until the query yields at least `min` rows, returning whatever it
+    /// has when the budget is spent.
+    async fn wait_for_rows(&self, sql: &str, min: usize, budget: Duration) -> Vec<String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let values = self.column(sql).await;
+            if values.len() >= min {
+                return values;
+            }
+            if std::time::Instant::now() >= deadline {
+                return values;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -345,7 +423,7 @@ async fn registration_issues_a_usable_session_without_storing_the_password() {
 
     // The stored password is a hash, not the plaintext.
     let stored = db
-        .text("SELECT password_hash FROM accounts")
+        .wait_for_some_text("SELECT password_hash FROM accounts", DB_WRITE_BUDGET)
         .await
         .expect("the account was persisted");
     assert_ne!(
@@ -358,17 +436,21 @@ async fn registration_issues_a_usable_session_without_storing_the_password() {
     );
 
     // The session row holds only the token's hash.
-    let hashes = db.column("SELECT token_hash FROM sessions").await;
+    let hashes = db
+        .wait_for_rows("SELECT token_hash FROM sessions", 1, DB_WRITE_BUDGET)
+        .await;
     assert_eq!(hashes.len(), 1, "one registration, one session");
     assert_ne!(hashes[0], token, "the token itself is never stored");
     assert_eq!(hashes[0].len(), 64, "SHA-256 in hex is 64 characters");
 
     // The device named at registration is bound to the account on disk.
-    assert_eq!(
-        db.text("SELECT account_id FROM profiles WHERE device_id = 'device-a'")
-            .await
-            .as_deref(),
-        Some(account_id.as_str()),
+    assert!(
+        db.wait_for_text(
+            "SELECT account_id FROM profiles WHERE device_id = 'device-a'",
+            &account_id,
+            DB_WRITE_BUDGET,
+        )
+        .await,
         "the device link is durable"
     );
 }
@@ -394,9 +476,9 @@ async fn a_taken_username_is_refused_however_it_is_cased() {
         (code.as_str(), message.as_str()),
         "the answer must not depend on the casing that was tried"
     );
-    assert_eq!(
-        db.count("SELECT COUNT(*) FROM accounts").await,
-        1,
+    assert!(
+        db.wait_for_count("SELECT COUNT(*) FROM accounts", 1, DB_WRITE_BUDGET)
+            .await,
         "no second account was created"
     );
 }
@@ -460,9 +542,9 @@ async fn login_refuses_a_wrong_password_and_an_unknown_username_identically() {
         "the two refusals must be byte-identical: a client must not be able to \
          tell an existing account from a missing one"
     );
-    assert_eq!(
-        db.count("SELECT COUNT(*) FROM sessions").await,
-        1,
+    assert!(
+        db.wait_for_count("SELECT COUNT(*) FROM sessions", 1, DB_WRITE_BUDGET)
+            .await,
         "only the registration's session exists: neither refusal issued one"
     );
     assert_silent(&mut unknown_user).await;
@@ -487,11 +569,13 @@ async fn login_issues_a_session_and_relinks_the_device() {
         &login(&mut bob_on_phone, "Bob", "another long password", Some("device-phone")).await,
     )
     .0;
-    assert_eq!(
-        db.text("SELECT account_id FROM profiles WHERE device_id = 'device-phone'")
-            .await
-            .as_deref(),
-        Some(bob_id.as_str())
+    assert!(
+        db.wait_for_text(
+            "SELECT account_id FROM profiles WHERE device_id = 'device-phone'",
+            &bob_id,
+            DB_WRITE_BUDGET,
+        )
+        .await
     );
 
     // Ana signs in on it: the link moves.
@@ -500,17 +584,22 @@ async fn login_issues_a_session_and_relinks_the_device() {
         &login(&mut ana_on_phone, "Ana", "correct horse battery", Some("device-phone")).await,
     );
     assert_eq!(account_id, ana_id);
-    assert_eq!(
-        db.text("SELECT account_id FROM profiles WHERE device_id = 'device-phone'")
-            .await
-            .as_deref(),
-        Some(ana_id.as_str()),
+    assert!(
+        db.wait_for_text(
+            "SELECT account_id FROM profiles WHERE device_id = 'device-phone'",
+            &ana_id,
+            DB_WRITE_BUDGET,
+        )
+        .await,
         "the device followed the account that signed in"
     );
-    assert_eq!(
-        db.count("SELECT COUNT(*) FROM profiles WHERE device_id = 'device-phone'")
-            .await,
-        1,
+    assert!(
+        db.wait_for_count(
+            "SELECT COUNT(*) FROM profiles WHERE device_id = 'device-phone'",
+            1,
+            DB_WRITE_BUDGET,
+        )
+        .await,
         "one device holds one account: the link moved rather than shadowing"
     );
 
@@ -534,7 +623,10 @@ async fn a_login_with_an_out_of_range_password_is_a_credential_failure() {
         assert_eq!(code, "invalid_credentials");
         assert_eq!(message, "That username and password do not match an account");
     }
-    assert_eq!(db.count("SELECT COUNT(*) FROM sessions").await, 1);
+    assert!(
+        db.wait_for_count("SELECT COUNT(*) FROM sessions", 1, DB_WRITE_BUDGET)
+            .await
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -604,17 +696,22 @@ async fn logout_revokes_only_the_presented_session() {
     );
 
     // The revocation is on disk, and the device link is untouched.
-    assert_eq!(
-        db.count("SELECT COUNT(*) FROM sessions WHERE revoked_at_ms IS NOT NULL")
-            .await,
-        1,
+    assert!(
+        db.wait_for_count(
+            "SELECT COUNT(*) FROM sessions WHERE revoked_at_ms IS NOT NULL",
+            1,
+            DB_WRITE_BUDGET,
+        )
+        .await,
         "exactly one session row is revoked"
     );
-    assert_eq!(
-        db.text("SELECT account_id FROM profiles WHERE device_id = 'device-phone'")
-            .await
-            .as_deref(),
-        Some(account_id.as_str()),
+    assert!(
+        db.wait_for_text(
+            "SELECT account_id FROM profiles WHERE device_id = 'device-phone'",
+            &account_id,
+            DB_WRITE_BUDGET,
+        )
+        .await,
         "logging out keeps the link but ends the session"
     );
 }
@@ -642,10 +739,13 @@ async fn logout_of_an_unknown_or_already_revoked_token_is_refused() {
         logout(&mut first, &token).await,
         ServerMessage::SessionOk { .. }
     ));
-    assert_eq!(
-        db.count("SELECT COUNT(*) FROM sessions WHERE revoked_at_ms IS NOT NULL")
-            .await,
-        1
+    assert!(
+        db.wait_for_count(
+            "SELECT COUNT(*) FROM sessions WHERE revoked_at_ms IS NOT NULL",
+            1,
+            DB_WRITE_BUDGET,
+        )
+        .await
     );
 
     let mut again = connect(addr).await;
@@ -702,11 +802,9 @@ async fn a_display_name_needs_a_session_and_a_rejected_one_keeps_the_stored_name
         }
         other => panic!("expected profile_updated, got {other:?}"),
     }
-    assert_eq!(
-        db.text("SELECT display_name FROM accounts")
-            .await
-            .as_deref(),
-        Some("Ana T."),
+    assert!(
+        db.wait_for_text("SELECT display_name FROM accounts", "Ana T.", DB_WRITE_BUDGET)
+            .await,
         "the name is durable"
     );
 
@@ -768,9 +866,9 @@ async fn a_refused_authentication_leaves_the_connection_able_to_play() {
     assert!(!code.is_empty());
     assert_eq!(state.your_color, Color::White);
     assert_eq!(state.status, Status::Playing);
-    assert_eq!(
-        db.count("SELECT COUNT(*) FROM accounts").await,
-        1,
+    assert!(
+        db.wait_for_count("SELECT COUNT(*) FROM accounts", 1, DB_WRITE_BUDGET)
+            .await,
         "no refusal created an account"
     );
 }
@@ -1023,11 +1121,13 @@ async fn an_account_re_attaches_from_a_second_device_while_a_replay_is_refused()
 
     // The second device is linked to the account durably, so the profile
     // follows the player.
-    assert_eq!(
-        db.text("SELECT account_id FROM profiles WHERE device_id = 'device-tablet'")
-            .await
-            .as_deref(),
-        Some(account_id.as_str()),
+    assert!(
+        db.wait_for_text(
+            "SELECT account_id FROM profiles WHERE device_id = 'device-tablet'",
+            &account_id,
+            DB_WRITE_BUDGET,
+        )
+        .await,
         "re-attaching from a second device links it"
     );
 }
