@@ -170,6 +170,35 @@ data class OnlineState(
     }
 }
 
+/**
+ * Incremental update after an accepted action (server "Game Authority"): the
+ * applied move, when there is one, plus the fields that can change.
+ */
+data class OnlineUpdate(
+    /** The UCI move just applied; null for a terminal result with no move. */
+    val uci: String?,
+    val sideToMove: String,
+    val status: OnlineStatus,
+    val whiteRating: Double,
+    val blackRating: Double,
+    val opponentOnline: Boolean,
+    val whiteTimeMs: Int,
+    val blackTimeMs: Int,
+) {
+    companion object {
+        fun decode(json: JSONObject): OnlineUpdate = OnlineUpdate(
+            uci = if (json.has("uci") && !json.isNull("uci")) json.getString("uci") else null,
+            sideToMove = json.getString("side_to_move"),
+            status = OnlineStatus.decode(json.get("status")),
+            whiteRating = json.getDouble("white_rating"),
+            blackRating = json.getDouble("black_rating"),
+            opponentOnline = json.getBoolean("opponent_online"),
+            whiteTimeMs = json.getInt("white_time_ms"),
+            blackTimeMs = json.getInt("black_time_ms"),
+        )
+    }
+}
+
 /** Stable machine-readable error codes (spec "Errors carry a stable code"). */
 enum class OnlineErrorCode(val code: String, val displayMessage: String) {
     ROOM_NOT_FOUND("room_not_found", "No open room has that code"),
@@ -225,6 +254,9 @@ sealed class ServerMessage {
     /** Full state snapshot after any accepted action and on re-attach. */
     data class State(val state: OnlineState) : ServerMessage()
 
+    /** Incremental per-move / terminal update (server "Game Authority"). */
+    data class Update(val update: OnlineUpdate) : ServerMessage()
+
     /** Structured business-rule error (the connection stays open). */
     data class Error(val code: String, val message: String) : ServerMessage()
 
@@ -259,6 +291,7 @@ sealed class ServerMessage {
                         state = OnlineState.decode(root.getJSONObject("state")),
                     )
                     "state" -> State(OnlineState.decode(root.getJSONObject("state")))
+                    "update" -> Update(OnlineUpdate.decode(root))
                     "error" -> Error(root.getString("code"), root.getString("message"))
                     "session" -> Session(root.getString("token"))
                     "profile_updated" -> ProfileUpdated

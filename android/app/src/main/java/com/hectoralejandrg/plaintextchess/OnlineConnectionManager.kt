@@ -41,6 +41,8 @@ class OnlineConnectionManager(
 ) {
     /** Every state snapshot, including the initial one in `room_ready`. */
     var onSnapshot: ((OnlineState) -> Unit)? = null
+    /** Incremental in-game updates (server "Game Authority"). */
+    var onUpdate: ((OnlineUpdate) -> Unit)? = null
     /** Structured errors: join-time room errors and transient in-game
      * errors; `code` is null for pure connection-loss failures. */
     var onError: ((OnlineErrorCode?, String) -> Unit)? = null
@@ -217,15 +219,22 @@ class OnlineConnectionManager(
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            // Decode off the main thread (OkHttp's executor), then hop to main
+            // only to publish state.
+            val decoded: ServerMessage? = try {
+                ServerMessage.decode(text)
+            } catch (e: OnlineProtocolError) {
+                null
+            }
             onMain {
                 // Ignore late frames from a replaced socket (re-attach).
                 if (webSocket !== this@OnlineConnectionManager.webSocket) return@onMain
-                try {
-                    handleServerMessage(ServerMessage.decode(text))
-                } catch (e: OnlineProtocolError) {
+                if (decoded == null) {
                     // A malformed frame from the server is a protocol
                     // failure: treat it like a drop.
                     handleSocketDrop()
+                } else {
+                    handleServerMessage(decoded)
                 }
             }
         }
@@ -288,6 +297,12 @@ class OnlineConnectionManager(
                     setPhase(OnlinePhase.InGame)
                 }
                 onSnapshot?.invoke(message.state)
+            }
+            is ServerMessage.Update -> {
+                reconnecting = false
+                activeGame = true
+                setPhase(OnlinePhase.InGame)
+                onUpdate?.invoke(message.update)
             }
             is ServerMessage.Error -> {
                 val code = OnlineErrorCode.fromCode(message.code)

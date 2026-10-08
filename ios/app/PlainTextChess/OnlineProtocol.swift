@@ -403,12 +403,40 @@ enum OnlineClientMessage: Codable, Equatable {
     }
 }
 
+/// Incremental update after an accepted action (server "Game Authority"): the
+/// applied move, when there is one, plus the fields that can change. The full
+/// `OnlineState` stays for connect/re-attach.
+struct OnlineUpdate: Codable, Equatable {
+    /// The UCI move just applied; `nil` for a terminal result with no move.
+    let uci: String?
+    let sideToMove: String
+    let status: OnlineStatus
+    let whiteRating: Double
+    let blackRating: Double
+    let opponentOnline: Bool
+    let whiteTimeMs: Int
+    let blackTimeMs: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case uci
+        case sideToMove = "side_to_move"
+        case status
+        case whiteRating = "white_rating"
+        case blackRating = "black_rating"
+        case opponentOnline = "opponent_online"
+        case whiteTimeMs = "white_time_ms"
+        case blackTimeMs = "black_time_ms"
+    }
+}
+
 /// Server messages: versioned JSON with a `type` tag.
 enum OnlineServerMessage: Codable, Equatable {
     /// The seat is ready: room code, our color, and the initial snapshot.
     case roomReady(roomCode: String, yourColor: OnlineColor, state: OnlineState)
     /// Full state snapshot after any accepted action and on re-attach.
     case state(OnlineState)
+    /// Incremental per-move / terminal update (server "Game Authority").
+    case update(OnlineUpdate)
     /// Structured business-rule error (the connection stays open).
     case error(code: OnlineErrorCode, message: String)
     case session(token: String)
@@ -442,6 +470,8 @@ enum OnlineServerMessage: Codable, Equatable {
         case "state":
             let state = try container.decode(OnlineState.self, forKey: .state)
             self = .state(state)
+        case "update":
+            self = .update(try OnlineUpdate(from: decoder))
         case "error":
             let code = try container.decode(OnlineErrorCode.self, forKey: .code)
             let message = try container.decode(String.self, forKey: .message)
@@ -470,6 +500,9 @@ enum OnlineServerMessage: Codable, Equatable {
         case .state(let state):
             try container.encode("state", forKey: .type)
             try container.encode(state, forKey: .state)
+        case .update(let update):
+            try container.encode("update", forKey: .type)
+            try update.encode(to: encoder)
         case .error(let code, let message):
             try container.encode("error", forKey: .type)
             try container.encode(code, forKey: .code)

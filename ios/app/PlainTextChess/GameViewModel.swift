@@ -721,6 +721,9 @@ final class GameViewModel: ObservableObject {
         manager.onSnapshot = { [weak self] state in
             self?.applyOnlineSnapshot(state)
         }
+        manager.onUpdate = { [weak self] update in
+            self?.applyOnlineUpdate(update)
+        }
         manager.onError = { [weak self] errorCode, message in
             self?.handleOnlineError(code: errorCode, message: message)
         }
@@ -953,6 +956,64 @@ final class GameViewModel: ObservableObject {
 
         if state.status.isTerminal {
             // The game is over: the room will not be resumed on relaunch.
+            clearOnlineRoomPersistence()
+        }
+        onlineSessionReady = true
+        markTerminalIfNeeded()
+    }
+
+    /// Apply an incremental update (server "Game Authority"): replay the move
+    /// into the mirror session and refresh the mutable fields, without the
+    /// full snapshot's board FEN or move list.
+    private func applyOnlineUpdate(_ update: OnlineUpdate) {
+        onlineOpponentOnline = update.opponentOnline
+        onlineWhiteRating = update.whiteRating
+        onlineBlackRating = update.blackRating
+        let clockRunning = update.status == .playing
+            && (update.opponentOnline || !moveList.isEmpty)
+        onlineClock = OnlineClock(
+            whiteMs: update.whiteTimeMs,
+            blackMs: update.blackTimeMs,
+            sideToMove: update.sideToMove,
+            reference: Date(),
+            isRunning: clockRunning
+        )
+
+        if let uci = update.uci {
+            do {
+                try session.playMove(uciMove: uci)
+            } catch {
+                status = .failed("Lost sync with the server")
+                errorMessage = "Lost sync with the server"
+                return
+            }
+            moveList.append(uci)
+            lastMove = LastMove(from: String(uci.prefix(2)),
+                                to: String(uci.dropFirst(2).prefix(2)))
+            clearSelection()
+            errorMessage = nil
+        }
+
+        toMove = update.sideToMove
+        if let rebuilt = try? FenBoard(board: session.getBoardState(), sideToMove: update.sideToMove) {
+            board = rebuilt
+        }
+        switch update.status {
+        case .playing:
+            let inCheck = (try? session.isCheck()) ?? false
+            status = .playing(toMove: update.sideToMove, inCheck: inCheck)
+        case .checkmated(let winner):
+            status = .checkmated(winner: winner.displayName)
+        case .drawn:
+            status = .drawn
+        case .resigned(let winner):
+            status = .resigned(winner: winner.displayName)
+        case .forfeited(let winner):
+            status = .forfeited(winner: winner.displayName)
+        case .timedOut(let winner):
+            status = .timedOut(winner: winner.displayName)
+        }
+        if update.status.isTerminal {
             clearOnlineRoomPersistence()
         }
         onlineSessionReady = true

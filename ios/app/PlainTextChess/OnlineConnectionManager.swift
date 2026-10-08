@@ -37,6 +37,8 @@ final class OnlineConnectionManager: ObservableObject {
 
     /// Every state snapshot, including the initial one in `room_ready`.
     var onSnapshot: ((OnlineState) -> Void)?
+    /// Incremental in-game updates (server "Game Authority").
+    var onUpdate: ((OnlineUpdate) -> Void)?
     /// Structured errors: join-time room errors and transient in-game errors.
     var onError: ((OnlineErrorCode, String) -> Void)?
     /// Phase changes (the view model mirrors these into its own state).
@@ -255,16 +257,30 @@ final class OnlineConnectionManager: ObservableObject {
 
     // MARK: - Incoming frames
 
+    /// Serial queue for JSON decode, off the main thread; the ordered hop back
+    /// to main keeps frame order.
+    private let decodeQueue = DispatchQueue(label: "com.plaintextchess.online.decode")
+
     private func handle(incoming message: URLSessionWebSocketTask.Message) {
         switch message {
         case .string(let json):
-            do {
-                let server = try OnlineCodec.decodeServer(json)
-                handle(serverMessage: server)
-            } catch {
-                // A malformed frame from the server is a protocol failure:
-                // treat it like a drop.
-                handleSocketDrop()
+            decodeQueue.async { [weak self] in
+                guard let self else { return }
+                let decoded: OnlineServerMessage?
+                do {
+                    decoded = try OnlineCodec.decodeServer(json)
+                } catch {
+                    decoded = nil
+                }
+                DispatchQueue.main.async {
+                    if let decoded {
+                        self.handle(serverMessage: decoded)
+                    } else {
+                        // A malformed frame from the server is a protocol
+                        // failure: treat it like a drop.
+                        self.handleSocketDrop()
+                    }
+                }
             }
         default:
             // Binary frames are never sent by the server; a server-side close
@@ -306,6 +322,12 @@ final class OnlineConnectionManager: ObservableObject {
                 setPhase(.inGame)
             }
             onSnapshot?(state)
+
+        case .update(let update):
+            reconnecting = false
+            activeGame = true
+            setPhase(.inGame)
+            onUpdate?(update)
 
         case .error(let code, let message):
             switch code {

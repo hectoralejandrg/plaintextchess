@@ -725,6 +725,7 @@ class GameViewModel(private val context: Context) {
     private fun makeOnlineConnection(url: String) {
         val manager = OnlineConnectionManager(url, GameViewModel.deviceID(context))
         manager.onSnapshot = { state -> applyOnlineSnapshot(state) }
+        manager.onUpdate = { update -> applyOnlineUpdate(update) }
         manager.onError = { code, message -> handleOnlineError(code, message) }
         manager.onPhase = { phase -> handleOnlinePhase(phase) }
         online = manager
@@ -800,6 +801,58 @@ class GameViewModel(private val context: Context) {
 
         if (state.status.isTerminal) {
             // The game is over: the room will not be resumed on relaunch.
+            clearOnlineRoomPersistence()
+        }
+        onlineSessionReady = true
+        markTerminalIfNeeded()
+    }
+
+    /** Apply an incremental update (server "Game Authority"): replay the move
+     * into the mirror session and refresh the mutable fields, without the full
+     * snapshot's board FEN or move list. */
+    private fun applyOnlineUpdate(update: OnlineUpdate) {
+        onlineOpponentOnline = update.opponentOnline
+        onlineWhiteRating = update.whiteRating
+        onlineBlackRating = update.blackRating
+        val clockRunning = update.status == OnlineStatus.Playing &&
+            (update.opponentOnline || moveList.isNotEmpty())
+        onlineClock = OnlineClock(
+            whiteMs = update.whiteTimeMs,
+            blackMs = update.blackTimeMs,
+            sideToMove = update.sideToMove,
+            referenceMillis = System.currentTimeMillis(),
+            isRunning = clockRunning,
+        )
+
+        update.uci?.let { uci ->
+            val played = runCatching { session.playMove(uciMove = uci) }
+            if (played.isFailure) {
+                status = GameStatus.Failed("Lost sync with the server")
+                errorMessage = "Lost sync with the server"
+                return
+            }
+            moveList = moveList + uci
+            lastMove = LastMove(uci.take(2), uci.drop(2).take(2))
+            clearSelection()
+            errorMessage = null
+        }
+
+        toMove = update.sideToMove
+        runCatching { board = FenBoard.parse(session.getBoardState(), update.sideToMove) }
+
+        status = when (val s = update.status) {
+            is OnlineStatus.Playing -> {
+                val inCheck = runCatching { session.isCheck() }.getOrDefault(false)
+                GameStatus.Playing(update.sideToMove, inCheck)
+            }
+            is OnlineStatus.Checkmated -> GameStatus.Checkmated(s.winnerColor.displayName)
+            is OnlineStatus.Drawn -> GameStatus.Drawn
+            is OnlineStatus.Resigned -> GameStatus.Resigned(s.winnerColor.displayName)
+            is OnlineStatus.Forfeited -> GameStatus.Forfeited(s.winnerColor.displayName)
+            is OnlineStatus.TimedOut -> GameStatus.TimedOut(s.winnerColor.displayName)
+        }
+
+        if (update.status.isTerminal) {
             clearOnlineRoomPersistence()
         }
         onlineSessionReady = true
