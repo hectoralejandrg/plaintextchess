@@ -379,6 +379,12 @@ struct ContentView: View {
             index + 1 < args.count
         else { return }
         let moves = args[index + 1].split(separator: " ").map { String($0) }
+        // Online scripts drive the online flow, whose screens live behind the
+        // Login→Home→Game stack: show the Game section so a scripted create or
+        // join is visible (the tokens themselves navigate nothing).
+        if moves.contains(where: { $0.hasPrefix("onlinecreate") || $0.hasPrefix("onlinejoin") }) {
+            path.append(.game)
+        }
         vm.playScript(moves, interval: debugScriptInterval)
     }
 #endif
@@ -873,6 +879,13 @@ struct GameView: View {
                 Text("PlainTextChess")
                     .font(.largeTitle.bold())
                     .padding(.horizontal)
+
+                if vm.isOnlineMode, let color = vm.onlineYourColor {
+                    Text("You are \(color == "w" ? "White" : "Black")")
+                        .font(.subheadline.bold())
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal)
+                }
 
                 StatusRowView(vm: vm)
                     .padding(.horizontal)

@@ -127,6 +127,14 @@ fun GameScreen(vm: GameViewModel = GameViewModel(LocalContext.current)) {
             style = MaterialTheme.typography.headlineLarge,
             modifier = Modifier.padding(horizontal = 16.dp),
         )
+        if (vm.isOnlineMode && vm.onlineYourColor != null) {
+            Text(
+                text = "You are " + if (vm.onlineYourColor == "w") "White" else "Black",
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+        }
         Spacer(Modifier.height(12.dp))
         Box(Modifier.padding(horizontal = 16.dp)) { StatusRow(vm) }
         Spacer(Modifier.height(8.dp))

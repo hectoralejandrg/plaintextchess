@@ -1254,6 +1254,19 @@ final class GameViewModel: ObservableObject {
                 default: self.restart()
                 }
             } else if case .playing = self.status {
+                let confirmed = self.moveList.contains(token)
+                if self.isOnlineMode, !confirmed, let color = self.onlineYourColor {
+                    // The script lists both sides' moves in game order. Skip a
+                    // token that belongs to the opponent (ply parity vs the
+                    // color the server assigned this device), so the run no
+                    // longer assumes the creator is White; our own move is
+                    // attempted until the server confirms it.
+                    let plyIsWhite = self.moveList.count.isMultiple(of: 2)
+                    if plyIsWhite != (color == "w") {
+                        self.playScriptNow(Array(moves.dropFirst()), interval: interval)
+                        return
+                    }
+                }
                 // Drive the same intent path as a real user: select the
                 // origin, then the destination. An illegal destination
                 // exercises the "not a legal move" rejection path. A
@@ -1273,7 +1286,6 @@ final class GameViewModel: ObservableObject {
                 // the list" is a safe confirmation. (`.last` is wrong: by the
                 // next tick the opponent has usually already replied, so the
                 // last entry is their move, not ours.)
-                let confirmed = self.moveList.contains(token)
                 if !confirmed {
                     self.select(from)
                     self.select(to)
