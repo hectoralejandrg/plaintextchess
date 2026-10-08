@@ -418,11 +418,11 @@ the override MUST be inert.
 
 #### Scenario: Creating an online game shows the room code
 - **WHEN** the player chooses online and selects create
-- **THEN** the app connects to the server, displays the 6-character room code with a copy action, and shows the standard start position with a waiting state until the opponent joins
+- **THEN** the app connects to the server, displays the 6-character room code with a copy action, shows the color the server assigned the creator, and shows the standard start position with a waiting state until the opponent joins
 
 #### Scenario: Joining an online game with the room code
 - **WHEN** the player selects join and enters an existing room's code
-- **THEN** the app joins the room, the game starts with the creator playing White and the player playing Black, and the board renders from the server's state snapshot
+- **THEN** the app joins the room, the game starts with each player holding the color the server assigned, and the board renders from the server's state snapshot oriented with the player's own color at the bottom
 
 #### Scenario: An invalid room code is an error
 - **WHEN** the player enters a room code that does not exist, is malformed, or belongs to a full room

@@ -245,4 +245,7 @@ pub struct RoomServices {
     pub reconnect_grace: Duration,
     pub recorder: Arc<dyn GameRecorder>,
     pub auth: SharedAuth,
+    /// Whether the room creator's color is chosen at random (spec "Server Room
+    /// Management"); `false` pins the creator to White (deterministic tests).
+    pub random_colors: bool,
 }

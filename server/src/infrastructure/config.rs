@@ -98,6 +98,11 @@ pub struct Config {
     /// Password hashing cost (spec "Credential and Session Data Protection",
     /// design D5).
     pub argon2: Argon2Params,
+    /// Whether online game colors are assigned at random at room creation
+    /// (spec "Server Room Management"). Production is random; the
+    /// deterministic test config pins the creator to White so the room tests
+    /// stay stable.
+    pub random_colors: bool,
 }
 
 /// Read an optional unsigned integer for a security-relevant variable: an
@@ -163,6 +168,7 @@ impl Config {
             database_url: Some(database_url),
             session_ttl_secs,
             argon2,
+            random_colors: true,
         })
     }
 
@@ -190,6 +196,7 @@ impl Config {
             database_url: None,
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             argon2: Argon2Params::default(),
+            random_colors: false,
         }
     }
 }

@@ -425,6 +425,7 @@ impl App {
             reconnect_grace: self.config.reconnect_grace,
             recorder: Arc::clone(&self.recorder),
             auth: Arc::clone(&self.auth) as Arc<dyn PlayerAuth>,
+            random_colors: self.config.random_colors,
         }
     }
 

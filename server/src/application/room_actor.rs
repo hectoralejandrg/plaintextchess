@@ -17,6 +17,16 @@ use crate::interface::protocol::{Color, ErrorCode, ServerMessage, State, Status,
 const WHITE: usize = 0;
 const BLACK: usize = 1;
 
+/// The seat the room creator is placed in: a coin flip when `random_colors`,
+/// otherwise White (the deterministic default the tests pin).
+fn creator_seat(random_colors: bool) -> usize {
+    if random_colors && rand::random::<bool>() {
+        BLACK
+    } else {
+        WHITE
+    }
+}
+
 /// Messages to the room actor. The connection handlers forward these; the
 /// actor makes every decision.
 #[derive(Debug)]
@@ -113,7 +123,7 @@ impl Room {
     }
 
     fn started(&self) -> bool {
-        self.seats[BLACK].is_some()
+        self.seats[WHITE].is_some() && self.seats[BLACK].is_some()
     }
 
     fn alive(&self) -> bool {
@@ -376,14 +386,17 @@ impl Room {
         let account_id = identity.account_id().map(str::to_string);
 
         if join_code.is_none() {
-            // Creator: first message of a freshly spawned room.
-            self.seats[WHITE] = Some(Seat {
+            // Creator: first message of a freshly spawned room. Its color is
+            // chosen at random (spec "Server Room Management") and reported in
+            // the ready snapshot.
+            let seat = creator_seat(self.services.random_colors);
+            self.seats[seat] = Some(Seat {
                 player_id,
                 account_id,
                 out,
                 connected: true,
             });
-            self.send_room_ready(WHITE);
+            self.send_room_ready(seat);
             return;
         }
 
@@ -425,16 +438,18 @@ impl Room {
             return;
         }
 
-        // Seat is occupied by someone else.
-        if self.seats[BLACK].is_some() {
-            // Hijack guard (spec "Server Disconnect, Reconnect, and
-            // Forfeit"): a connection with no session presenting *another*
-            // player's device identifier must not be able to take their seat.
-            // `seat_index_of` refuses a device match on an account-owned seat,
-            // so reaching here with a device id that names a seat means the
-            // seat belongs to an account this connection cannot prove. The
-            // seated player, the clocks, and the status are left exactly as
-            // they were.
+        // The other seat belongs to someone else only when the room is full.
+        let Some(seat) = [WHITE, BLACK]
+            .into_iter()
+            .find(|&seat| self.seats[seat].is_none())
+        else {
+            // Hijack guard (spec "Server Disconnect, Reconnect, and Forfeit"):
+            // a connection with no session presenting *another* player's device
+            // identifier must not be able to take their seat. `seat_index_of`
+            // refuses a device match on an account-owned seat, so reaching here
+            // with a device id that names a seat means the seat belongs to an
+            // account this connection cannot prove. The seated player, the
+            // clocks, and the status are left exactly as they were.
             if let Some(idx) = self.seat_of_device(&player_id) {
                 tracing::warn!(
                     room_code = %self.code,
@@ -444,17 +459,15 @@ impl Room {
                         .and_then(|s| s.account_id.as_deref()),
                     "refused an unauthenticated re-attach to an account-owned seat"
                 );
-                let _ = out.send(ServerMessage::error(ErrorCode::RoomFull));
-                self.services.registry.untrack_if(&identity, &self.code);
-                return;
             }
             let _ = out.send(ServerMessage::error(ErrorCode::RoomFull));
             self.services.registry.untrack_if(&identity, &self.code);
             return;
-        }
+        };
 
-        // New Black player: the game starts and both clocks start at base.
-        self.seats[BLACK] = Some(Seat {
+        // New player: the game starts and both clocks start at base, with
+        // White to move regardless of which seat each player holds.
+        self.seats[seat] = Some(Seat {
             player_id,
             account_id,
             out,
@@ -465,8 +478,8 @@ impl Room {
             WHITE as u8,
             self.now_ms(),
         ));
-        self.send_room_ready(BLACK);
-        self.send_state(WHITE);
+        self.send_room_ready(seat);
+        self.send_state(1 - seat);
     }
 
     /// The seat a raw device identifier names, ignoring any account. Used
@@ -482,15 +495,15 @@ impl Room {
         let Some(idx) = self.seat_index_of(identity) else {
             return;
         };
+        if self.status.is_terminal() {
+            self.send_error(idx, ErrorCode::GameOver);
+            return;
+        }
         if !self.seats[idx].as_ref().is_some_and(|s| s.connected) {
             return;
         }
         if !self.started() {
             self.send_error(idx, ErrorCode::NotConnected);
-            return;
-        }
-        if self.status.is_terminal() {
-            self.send_error(idx, ErrorCode::GameOver);
             return;
         }
         let to_move = if self.move_list.len().is_multiple_of(2) {
@@ -544,12 +557,12 @@ impl Room {
         let Some(idx) = self.seat_index_of(identity) else {
             return;
         };
-        if !self.started() {
-            self.send_error(idx, ErrorCode::NotConnected);
-            return;
-        }
         if self.status.is_terminal() {
             self.send_error(idx, ErrorCode::GameOver);
+            return;
+        }
+        if !self.started() {
+            self.send_error(idx, ErrorCode::NotConnected);
             return;
         }
         let winner = 1 - idx;
@@ -792,6 +805,27 @@ mod tests {
         RatingSession, TimeSource,
     };
     use crate::domain::rating::RatingState;
+
+    /// The creator's color: random when enabled, White by default (the pin the
+    /// deterministic room tests rely on).
+    #[test]
+    fn the_creator_color_is_random_when_enabled_and_white_by_default() {
+        assert_eq!(creator_seat(false), WHITE);
+        assert_eq!(creator_seat(false), WHITE, "disabled randomness is always White");
+        let mut saw_white = false;
+        let mut saw_black = false;
+        for _ in 0..256 {
+            match creator_seat(true) {
+                WHITE => saw_white = true,
+                BLACK => saw_black = true,
+                _ => unreachable!("a seat is White or Black"),
+            }
+        }
+        assert!(
+            saw_white && saw_black,
+            "both colors must occur across repeated rooms when randomness is enabled"
+        );
+    }
 
     const ROOM_CODE: &str = "TESTROOM";
     const P_WHITE: &str = "device-a";
@@ -1050,6 +1084,7 @@ mod tests {
                 reconnect_grace: Duration::from_millis(300),
                 recorder: Arc::clone(&recorder) as Arc<dyn GameRecorder>,
                 auth: Arc::new(crate::infrastructure::auth::PlayerAuthStore::new()),
+                random_colors: false,
             };
 
             let (tx, rx) = mpsc::unbounded_channel();
