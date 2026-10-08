@@ -813,15 +813,22 @@ struct HomeView: View {
                         .textInputAutocapitalization(.characters)
                     HStack(spacing: 8) {
                         Button(action: {
-                            _ = vm.startOnlineGame(create: true, code: nil, timeControl: timeControl.label, serverURLString: effectiveOnlineURL)
+                            // `startOnlineGame` opens the connection and asks the
+                            // server for a room; on success move to the Game
+                            // section so the player watches the board while the
+                            // room is prepared (parity with Android HomeView).
+                            if vm.startOnlineGame(create: true, code: nil, timeControl: timeControl.label, serverURLString: effectiveOnlineURL) {
+                                onStartGame()
+                            }
                         }) {
                             Text("Create room").frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
                         Button(action: {
                             let code = roomCode.uppercased()
-                            if code.count == 6 {
-                                _ = vm.startOnlineGame(create: false, code: code, timeControl: nil, serverURLString: effectiveOnlineURL)
+                            if code.count == 6,
+                               vm.startOnlineGame(create: false, code: code, timeControl: nil, serverURLString: effectiveOnlineURL) {
+                                onStartGame()
                             }
                         }) {
                             Text("Join room").frame(maxWidth: .infinity)
