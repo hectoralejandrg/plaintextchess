@@ -142,7 +142,7 @@ struct BoardView: View {
         let aRow = orientation == 0 ? row : 7 - row
         let aCol = orientation == 0 ? col : 7 - col
         let name = FenBoard.squareName(row: aRow, col: aCol)
-        let piece = vm.board.grid[aRow][aCol]
+        let piece = vm.displayedBoard.grid[aRow][aCol]
         let isLight = (aRow + aCol).isMultiple(of: 2)
         let isSelected = vm.selectedSquare == name
         let isLegalTarget = vm.legalTargets.contains(name)
@@ -235,7 +235,7 @@ struct BoardView: View {
     private func dragOverlay(cell: CGFloat) -> some View {
         if let from = dragFrom, let loc = dragLocation,
            let (row, col) = FenBoard.parseSquare(from) {
-            let piece = vm.board.grid[row][col]
+            let piece = vm.displayedBoard.grid[row][col]
             if !piece.isEmpty {
                 pieceImage(piece, size: cell * 1.05)
                     .position(loc)
@@ -325,7 +325,7 @@ struct BoardView: View {
     private func promotedPiece(_ promo: GameViewModel.PendingPromotion,
                                piece: String) -> String {
         guard let (row, col) = FenBoard.parseSquare(promo.from) else { return piece }
-        let pawn = vm.board.grid[row][col]
+        let pawn = vm.displayedBoard.grid[row][col]
         return pawn == pawn.uppercased() ? piece.uppercased() : piece
     }
 
@@ -343,7 +343,7 @@ struct BoardView: View {
         #endif
         guard duration > 0,
               let (toRow, toCol) = FenBoard.parseSquare(lastMove.to) else { return }
-        let piece = vm.board.grid[toRow][toCol]
+        let piece = vm.displayedBoard.grid[toRow][toCol]
         guard !piece.isEmpty else { return }
 
         slide = MoveSlide(piece: piece, from: lastMove.from, to: lastMove.to)

@@ -136,6 +136,13 @@ struct ContentView: View {
                 path.append(.home)
             }
         }
+        .onChange(of: vm.onlinePhase) { phase in
+            // Online: the creator waits on Home; both players move to the Game
+            // section once the server reports the game is under way.
+            if case .inGame = phase, path.last != .game {
+                path.append(.game)
+            }
+        }
     }
 
     // MARK: - Status row
@@ -819,28 +826,37 @@ struct HomeView: View {
                         .textInputAutocapitalization(.characters)
                     HStack(spacing: 8) {
                         Button(action: {
-                            // `startOnlineGame` opens the connection and asks the
-                            // server for a room; on success move to the Game
-                            // section so the player watches the board while the
-                            // room is prepared (parity with Android HomeView).
-                            if vm.startOnlineGame(create: true, code: nil, timeControl: timeControl.label, serverURLString: effectiveOnlineURL) {
-                                onStartGame()
-                            }
+                            // Create stays on Home showing the room code; the
+                            // app moves to the Game section when the opponent
+                            // joins (the root observes `onlinePhase`).
+                            _ = vm.startOnlineGame(create: true, code: nil, timeControl: timeControl.label, serverURLString: effectiveOnlineURL)
                         }) {
                             Text("Create room").frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
+                        .disabled(vm.onlinePhase.isWaiting)
                         Button(action: {
                             let code = roomCode.uppercased()
-                            if code.count == 6,
-                               vm.startOnlineGame(create: false, code: code, timeControl: nil, serverURLString: effectiveOnlineURL) {
-                                onStartGame()
+                            if code.count == 6 {
+                                _ = vm.startOnlineGame(create: false, code: code, timeControl: nil, serverURLString: effectiveOnlineURL)
                             }
                         }) {
                             Text("Join room").frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(roomCode.uppercased().count != 6)
+                    }
+                    if case .waiting(let code) = vm.onlinePhase {
+                        VStack(spacing: 6) {
+                            Text("Room code").font(.caption).foregroundColor(.secondary)
+                            HStack(spacing: 12) {
+                                Text(code).font(.title2.monospaced().bold())
+                                Button("Copy") { UIPasteboard.general.string = code }
+                            }
+                            Text("Waiting for the opponent to join…").font(.footnote)
+                            Button("Cancel") { vm.cancelOnlineWaiting() }
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                     if let joinErr = vm.onlineJoinError {
                         Text(joinErr).font(.footnote).foregroundColor(.red)
@@ -868,41 +884,23 @@ struct GameView: View {
     @ObservedObject var vm: GameViewModel
     let effectiveOnlineURL: String?
 
-    @State private var showNewGameSheet = false
     private let debugAnimScale = 1.0
     private let debugDrag: DragTest? = nil
+
+    /// The side rendered on the bottom edge: the player's own color online,
+    /// White locally.
+    private var playerColor: String { vm.isOnlineMode ? (vm.onlineYourColor ?? "w") : "w" }
+    private var opponentColor: String { playerColor == "w" ? "b" : "w" }
 
     var body: some View {
         GeometryReader { proxy in
             let boardSide = proxy.size.width
-            VStack(alignment: .leading, spacing: 10) {
-                Text("PlainTextChess")
-                    .font(.largeTitle.bold())
-                    .padding(.horizontal)
-
-                if vm.isOnlineMode, let color = vm.onlineYourColor {
-                    Text("You are \(color == "w" ? "White" : "Black")")
-                        .font(.subheadline.bold())
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal)
-                }
-
-                StatusRowView(vm: vm)
-                    .padding(.horizontal)
-
-                if vm.isOnlineMode {
-                    ClockRowView(vm: vm)
-                        .padding(.horizontal)
-                }
-
-                if case .waiting(let code) = vm.onlinePhase {
-                    WaitingBannerView(code: code)
-                        .padding(.horizontal)
-                }
-
-                BoardView(vm: vm,
-                          animScale: debugAnimScale,
-                          dragTest: debugDrag)
+            VStack(alignment: .leading, spacing: 8) {
+                topBar
+                Spacer(minLength: 8)
+                MoveStripView(vm: vm).padding(.horizontal)
+                PlayerRowView(vm: vm, side: opponentColor).padding(.horizontal)
+                BoardView(vm: vm, animScale: debugAnimScale, dragTest: debugDrag)
                     .frame(width: boardSide, height: boardSide)
                     .overlay {
                         if vm.onlineReconnecting {
@@ -913,15 +911,172 @@ struct GameView: View {
                                 .background(.thinMaterial, in: Capsule())
                         }
                     }
-
-                MoveListView(vm: vm)
-                    .padding(.horizontal)
-
-                ControlsView(vm: vm)
-                    .padding(.horizontal)
+                PlayerRowView(vm: vm, side: playerColor).padding(.horizontal)
+                if vm.isViewingHistory {
+                    Text("Viewing history — board is read-only")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal)
+                }
+                Spacer(minLength: 8)
+                StatusRowView(vm: vm).padding(.horizontal)
+                GameActionBar(vm: vm).padding(.horizontal)
+                if case .waiting(let code) = vm.onlinePhase {
+                    WaitingBannerView(code: code).padding(.horizontal)
+                }
             }
-            .padding(.vertical)
+            .padding(.vertical, 8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .alert("Game over", isPresented: $vm.showGameEndDialog) {
+            if !vm.isOnlineMode {
+                Button("Play again") { vm.restart() }
+            }
+            Button("Done", role: .cancel) { vm.dismissGameEnd() }
+        } message: {
+            Text(vm.gameEndMessage ?? "The game is over.")
+        }
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 10) {
+            Text(vm.isOnlineMode ? vm.onlineTimeControl : "Local")
+                .font(.subheadline.bold())
+            Spacer()
+        }
+        .padding(.horizontal)
+    }
+}
+
+/// One side's name, rating, and (when the game has a time control) clock.
+struct PlayerRowView: View {
+    @ObservedObject var vm: GameViewModel
+    let side: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "wifi").font(.caption).foregroundColor(.secondary)
+            Text(name).font(.subheadline.bold())
+            if let rating {
+                Text("\(Int(rating))").font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+            clock
+        }
+    }
+
+    private var name: String {
+        if vm.isOnlineMode {
+            if side == vm.onlineYourColor {
+                if let display = vm.authDisplayName, !display.isEmpty { return display }
+                return "You"
+            }
+            return "Opponent"
+        }
+        if side == "w" { return "You" }
+        return vm.isCpuMode ? "CPU" : "Opponent"
+    }
+
+    private var rating: Double? {
+        guard vm.isOnlineMode else { return nil }
+        return side == "w" ? vm.onlineWhiteRating : vm.onlineBlackRating
+    }
+
+    @ViewBuilder private var clock: some View {
+        if let clock = vm.onlineClock {
+            TimelineView(.periodic(from: .now, by: 0.1)) { context in
+                let active = clock.isRunning && clock.sideToMove == side
+                Text(OnlineClock.format(clock.remaining(for: side, now: context.date)))
+                    .font(.headline.monospacedDigit())
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(active ? Color.accentColor.opacity(0.2) : Color.secondary.opacity(0.1))
+                    .cornerRadius(8)
+            }
+        }
+    }
+}
+
+/// A compact horizontal list of the played plies; tapping one navigates.
+/// Auto-scrolls to the newest ply as moves arrive.
+struct MoveStripView: View {
+    @ObservedObject var vm: GameViewModel
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                if vm.moveList.isEmpty {
+                    Text("No moves yet").font(.footnote).foregroundColor(.secondary)
+                } else {
+                    HStack(spacing: 6) {
+                        ForEach(Array(vm.moveList.enumerated()), id: \.offset) { index, uci in
+                            let ply = index + 1
+                            Button { vm.goToPly(ply) } label: {
+                                Text(uci)
+                                    .font(.footnote.monospaced())
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        vm.shownPly == ply
+                                            ? Color.accentColor.opacity(0.25)
+                                            : Color.secondary.opacity(0.12)
+                                    )
+                                    .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                            .id(index)
+                        }
+                    }
+                }
+            }
+            .frame(height: 28)
+            .onChange(of: vm.moveList.count) { _ in
+                guard let last = vm.moveList.indices.last else { return }
+                withAnimation { proxy.scrollTo(last, anchor: .trailing) }
+            }
+        }
+    }
+}
+
+/// The bottom icon toolbar: a menu plus resign and history navigation.
+struct GameActionBar: View {
+    @ObservedObject var vm: GameViewModel
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Menu {
+                Button { vm.flipBoard() } label: { Label("Flip board", systemImage: "arrow.up.arrow.down") }
+                if !vm.isOnlineMode {
+                    Button { vm.undo() } label: { Label("Undo", systemImage: "arrow.uturn.backward") }
+                        .disabled(!vm.canUndo)
+                    Button { vm.newGame() } label: { Label("New game", systemImage: "arrow.counterclockwise") }
+                        .disabled(!vm.canStartNewGame)
+                }
+            } label: {
+                Image(systemName: "line.3.horizontal")
+                    .font(.title3)
+                    .frame(maxWidth: .infinity)
+            }
+
+            Button { vm.resign() } label: {
+                Image(systemName: "flag").font(.title3).frame(maxWidth: .infinity)
+            }
+            .disabled(!vm.canResign)
+
+            Button { vm.stepBack() } label: {
+                Image(systemName: "chevron.left").font(.title3).frame(maxWidth: .infinity)
+            }
+            .disabled(vm.shownPly == 0)
+
+            Button { vm.goLive() } label: {
+                Image(systemName: "arrow.right.to.line").font(.title3).frame(maxWidth: .infinity)
+            }
+            .disabled(!vm.isViewingHistory)
+
+            Button { vm.stepForward() } label: {
+                Image(systemName: "chevron.right").font(.title3).frame(maxWidth: .infinity)
+            }
+            .disabled(vm.shownPly >= vm.moveList.count)
         }
     }
 }
@@ -942,15 +1097,12 @@ struct StatusRowView: View {
                 case .starting:
                     Text(vm.isOnlineMode ? "Connecting to online server…" : "Creating session…").font(.headline)
                 case .playing(let toMove, let inCheck):
-                    if vm.isOnlineMode, toMove == vm.onlineYourColor {
-                        Text("Your move").font(.headline.bold())
-                    } else if vm.isOnlineMode {
-                        Text("Opponent to move").font(.headline)
-                    } else {
+                    // Online: whose turn it is is shown by the active clock.
+                    if !vm.isOnlineMode {
                         Text(toMove == "w" ? "White to move" : "Black to move").font(.headline)
                     }
                     if inCheck {
-                        Text("— Check!").font(.headline).foregroundColor(.red)
+                        Text(vm.isOnlineMode ? "Check!" : "— Check!").font(.headline).foregroundColor(.red)
                     }
                 case .checkmated(let winner):
                     Text("Checkmate! \(winner) wins").font(.headline)

@@ -122,6 +122,12 @@ class GameViewModel(private val context: Context) {
     var lastMove by mutableStateOf<LastMove?>(null)
         private set
     var moveList by mutableStateOf<List<String>>(emptyList())
+
+    /** Move-history browsing: null = live position. */
+    var viewPly by mutableStateOf<Int?>(null)
+        private set
+    private var historyCache: List<FenBoard> = emptyList()
+    private var historyCacheCount = -1
         private set
     var errorMessage by mutableStateOf<String?>(null)
         private set
@@ -245,6 +251,10 @@ class GameViewModel(private val context: Context) {
     val isOnlineMode: Boolean
         get() = gameMode is GameMode.Online
 
+    /** True when the current game is against the CPU (player labels). */
+    val isCpuMode: Boolean
+        get() = gameMode is GameMode.Cpu
+
     /** Bumped on every [startGame] so an in-flight CPU move from an older game
      * is discarded instead of applied (design D5). */
     private var cpuGeneration = 0
@@ -289,6 +299,8 @@ class GameViewModel(private val context: Context) {
      * selection and shows "not a legal move" feedback.
      */
     fun select(squareName: String) {
+        // Move-history browsing: the board is read-only while a past ply shows.
+        if (isViewingHistory) return
         // Locked while the CPU is thinking (design D5): no selection, no move.
         if (cpuThinking) return
         val current = status
@@ -414,6 +426,8 @@ class GameViewModel(private val context: Context) {
         // Single-active-game rule (enforce-single-active-game D1): never
         // replace a game that is still in progress.
         if (!canStartNewGame) return
+        // A fresh game starts at the live position (redesign-game-screen).
+        viewPly = null
         // A local game replaces any open online session
         // (add-online-multiplayer D7/D8): close the socket and forget the
         // persisted room.
@@ -596,6 +610,8 @@ class GameViewModel(private val context: Context) {
      */
     fun undo() {
         if (!canUndo) return
+        // Undo changes the length: drop any stale history view.
+        viewPly = null
         val kept =
             if (gameMode is GameMode.Cpu && moveList.size % 2 == 0) moveList.drop(2)
             else moveList.dropLast(1)
@@ -634,6 +650,54 @@ class GameViewModel(private val context: Context) {
 
     // endregion
 
+    // region Move-history navigation (redesign-game-screen)
+
+    /** The board to render: live, or the position at [viewPly]. */
+    val displayedBoard: FenBoard
+        get() {
+            val ply = viewPly
+            if (ply == null || ply < 0 || ply >= moveList.size) return board
+            val boards = historyBoards()
+            return if (ply < boards.size) boards[ply] else board
+        }
+
+    /** True while the board shows a past position (input is disabled). */
+    val isViewingHistory: Boolean
+        get() = viewPly?.let { it < moveList.size } ?: false
+
+    /** The ply the strip highlights (0 = start, moveList.size = live). */
+    val shownPly: Int
+        get() = viewPly ?: moveList.size
+
+    fun goToPly(ply: Int) {
+        val clamped = ply.coerceIn(0, moveList.size)
+        viewPly = if (clamped >= moveList.size) null else clamped
+    }
+
+    fun goLive() { viewPly = null }
+    fun stepBack() { goToPly((viewPly ?: moveList.size) - 1) }
+    fun stepForward() { goToPly((viewPly ?: moveList.size) + 1) }
+
+    /** Board snapshots per ply (index 0 = start), cached until the list changes. */
+    private fun historyBoards(): List<FenBoard> {
+        if (historyCacheCount == moveList.size && historyCache.size == moveList.size + 1) {
+            return historyCache
+        }
+        val scratch = newGameSession(initialRating = 1500.0)
+        val boards = ArrayList<FenBoard>()
+        runCatching { FenBoard.parse(scratch.getBoardState(), "w") }.getOrNull()?.let { boards.add(it) }
+        moveList.forEachIndexed { index, uci ->
+            runCatching { scratch.playMove(uciMove = uci) }
+            val side = if ((index + 1) % 2 == 0) "w" else "b"
+            runCatching { FenBoard.parse(scratch.getBoardState(), side) }.getOrNull()?.let { boards.add(it) }
+        }
+        historyCache = boards
+        historyCacheCount = moveList.size
+        return boards
+    }
+
+    // endregion
+
     // region Online multiplayer (add-online-multiplayer D2/D4/D7/D8)
 
     /**
@@ -645,6 +709,7 @@ class GameViewModel(private val context: Context) {
     fun startOnlineGame(create: Boolean, code: String? = null,
                         timeControl: String? = null): Boolean {
         if (!canStartNewGame) return false
+        viewPly = null
         val url = resolvedServerURL() ?: run {
             onlineJoinError = "No online server configured."
             return false
@@ -701,6 +766,7 @@ class GameViewModel(private val context: Context) {
         gameMode = GameMode.Online
         cpuGeneration += 1
         cpuThinking = false
+        viewPly = null
         gameEndPresented = false
         gameEndDismissed = false
         showGameEndDialog = false
@@ -923,6 +989,11 @@ class GameViewModel(private val context: Context) {
     }
 
     /** Close and forget the online session (add-online-multiplayer D7/D8). */
+    /** Leave the room the player is waiting in (the Create flow was cancelled). */
+    fun cancelOnlineWaiting() {
+        teardownOnlineSession()
+    }
+
     private fun teardownOnlineSession() {
         online?.teardown()
         online = null

@@ -35,7 +35,11 @@ The repository MUST contain an iOS application project that compiles against
 `ChessCore.xcframework` and, at launch, presents a playable two-player chess
 game: an 8×8 board rendered from the core's board state, piece selection
 restricted to the core's legal moves, live game status (whose move, check,
-checkmate, draw), a move list, and a new-game action. FFI errors MUST be
+checkmate, draw), and a new-game action. The game screen MUST lay the game
+out as a top bar (the time control and an overflow menu), a compact
+horizontal move strip, an opponent row and a player row (each showing that
+side's name and, when known, its rating, plus its clock when the game has a
+time control), the board, and a bottom action bar. FFI errors MUST be
 surfaced in the UI instead of crashing.
 
 #### Scenario: App build for the simulator
@@ -69,6 +73,37 @@ surfaced in the UI instead of crashing.
 #### Scenario: FFI failure is rendered in the UI
 - **WHEN** a call into the chess core fails
 - **THEN** the app displays the error in the UI instead of crashing
+
+#### Scenario: The game screen shows the new layout
+- **WHEN** a game is on screen
+- **THEN** the screen shows a top bar with the time control and an overflow menu, a horizontal move strip, an opponent row above the board and a player row below it, and a bottom action bar
+
+### Requirement: iOS Move History Navigation
+The iOS game screen MUST let the player browse the played moves. The move
+strip MUST list every played move and highlight the ply currently shown.
+Tapping a ply, or the previous/next controls, MUST render the board at that
+ply. While a position other than the live one is shown, move input MUST be
+disabled and the UI MUST indicate that the board is not live; a control MUST
+return to the live position. Moves applied afterwards (locally or from the
+server) MUST be appended to the strip without changing the ply being viewed
+unless the live position was already shown. Navigation MUST work the same in
+local, CPU, and online games.
+
+#### Scenario: Browsing to an earlier position
+- **WHEN** the player taps the previous control or an earlier ply in the move strip
+- **THEN** the board shows that position, the strip highlights that ply, and move input is disabled
+
+#### Scenario: Returning to the live position
+- **WHEN** the player advances to the last ply or taps the jump-to-live control
+- **THEN** the board shows the live position, the not-live indicator clears, and move input is re-enabled
+
+#### Scenario: Jumping to a specific ply
+- **WHEN** the player taps a ply in the move strip
+- **THEN** the board renders the position after that ply and the strip highlights it
+
+#### Scenario: New moves while reviewing history
+- **WHEN** a move is applied while an earlier position is shown
+- **THEN** the move is appended to the move strip, the viewed position does not change, and the UI stays marked as not live until the player returns to live
 ### Requirement: iOS XCFramework Simulator Support
 The iOS build MUST produce `ChessCore.xcframework` containing both the device slice and the Apple-simulator slice, so the framework can be linked by app builds targeting either destination.
 
@@ -421,7 +456,7 @@ the override MUST be inert.
 
 #### Scenario: Creating an online game shows the room code
 - **WHEN** the player chooses online and selects create
-- **THEN** the app connects to the server, displays the 6-character room code with a copy action, shows the color the server assigned the creator, and shows the standard start position with a waiting state until the opponent joins
+- **THEN** the app connects to the server, shows the 6-character room code with a copy action and a waiting state where the player created it, keeps the player there until an opponent joins, and moves both players to the game section when the opponent enters the code; only one room may be pending at a time
 
 #### Scenario: Joining an online game with the room code
 - **WHEN** the player selects join and enters an existing room's code

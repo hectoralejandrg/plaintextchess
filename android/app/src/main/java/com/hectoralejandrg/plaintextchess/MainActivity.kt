@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -25,6 +26,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -118,45 +125,23 @@ fun GameScreen(vm: GameViewModel = GameViewModel(LocalContext.current)) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(vertical = 16.dp),
+            .padding(vertical = 8.dp),
         verticalArrangement = Arrangement.Top,
     ) {
-        Text(
-            "PlainTextChess",
-            style = MaterialTheme.typography.headlineLarge,
-            modifier = Modifier.padding(horizontal = 16.dp),
-        )
-        if (vm.isOnlineMode && vm.onlineYourColor != null) {
-            Text(
-                text = "You are " + if (vm.onlineYourColor == "w") "White" else "Black",
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
-        }
-        Spacer(Modifier.height(12.dp))
-        Box(Modifier.padding(horizontal = 16.dp)) { StatusRow(vm) }
-        Spacer(Modifier.height(8.dp))
-        if (vm.isOnlineMode) {
-            // Online clocks (add-online-time-controls, design D6): a fixed
-            // height row so the full-width board keeps its exact size.
-            OnlineClockRow(vm)
-            Spacer(Modifier.height(8.dp))
-        }
-        // Online waiting banner (add-online-multiplayer D4): the 6-character
-        // room code, large and monospaced, with a copy action next to it.
-        (vm.onlinePhase as? OnlinePhase.Waiting)?.let { waiting ->
-            WaitingBanner(
-                code = waiting.code,
-                onCopy = { copyToClipboard(context, waiting.code) },
-            )
-            Spacer(Modifier.height(8.dp))
-        }
+        GameTopBar(vm)
+        // The board block is centred vertically between the top bar and the
+        // controls.
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            verticalArrangement = Arrangement.Center,
+        ) {
+            MoveStrip(vm)
+        PlayerRow(vm, opponentColorOf(vm))
         // The board always spans the full screen width; the reconnection
-        // badge overlays it without taking layout space (add-online-multiplayer
-        // D7): the last known position stays on screen while the manager
-        // re-attaches.
+        // badge overlays it without taking layout space: the last known
+        // position stays on screen while the manager re-attaches.
         Box(Modifier.fillMaxWidth()) {
             BoardView(vm, Modifier.fillMaxWidth())
             if (vm.onlineReconnecting) {
@@ -174,9 +159,17 @@ fun GameScreen(vm: GameViewModel = GameViewModel(LocalContext.current)) {
                 )
             }
         }
-        Spacer(Modifier.height(8.dp))
-        Box(Modifier.padding(horizontal = 16.dp)) { MoveList(vm) }
-        Spacer(Modifier.height(8.dp))
+        PlayerRow(vm, playerColorOf(vm))
+        if (vm.isViewingHistory) {
+            Text(
+                text = "Viewing history — board is read-only",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+        }
+        }
+        Box(Modifier.padding(horizontal = 16.dp)) { StatusRow(vm) }
         vm.errorMessage?.let { message ->
             Text(
                 text = message,
@@ -184,50 +177,19 @@ fun GameScreen(vm: GameViewModel = GameViewModel(LocalContext.current)) {
                 color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.padding(horizontal = 16.dp),
             )
-            Spacer(Modifier.height(8.dp))
         }
-        // Game controls (add-game-end-dialog D6): secondary actions above the
-        // prominent New game action, with the spec's availability rules.
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            OutlinedButton(
-                onClick = { vm.undo() },
-                enabled = vm.canUndo,
-                modifier = Modifier.weight(1f),
-            ) { Text("Undo") }
-            OutlinedButton(
-                onClick = { vm.resign() },
-                enabled = vm.canResign,
-                modifier = Modifier.weight(1f),
-            ) { Text("Resign") }
-            OutlinedButton(
-                onClick = { vm.flipBoard() },
-                modifier = Modifier.weight(1f),
-            ) { Text("Flip board") }
-        }
-        Spacer(Modifier.height(8.dp))
-        // New game is available only when the current game is finished, has
-        // no move played yet, or failed (enforce-single-active-game D1): it
-        // stays visible but greyed out mid-game and starts nothing when
-        // tapped.
-        Button(
-            onClick = {
-                // Reset the online-join handshake flags so a stale "ready"
-                // from a previous attempt cannot auto-dismiss this sheet
-                // (add-online-multiplayer D4).
-                vm.resetOnlineSheetState()
-                showNewGameSheet = true
-            },
-            enabled = vm.canStartNewGame,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-        ) {
-            Text("New game")
+        GameActionBar(vm, onNewGame = {
+            // Reset the online-join handshake flags so a stale "ready" from a
+            // previous attempt cannot auto-dismiss this sheet.
+            vm.resetOnlineSheetState()
+            showNewGameSheet = true
+        })
+        // Online waiting banner: the 6-character room code with a copy action.
+        (vm.onlinePhase as? OnlinePhase.Waiting)?.let { waiting ->
+            WaitingBanner(
+                code = waiting.code,
+                onCopy = { copyToClipboard(context, waiting.code) },
+            )
         }
         if (showNewGameSheet) {
             NewGameSetupSheet(
@@ -545,6 +507,183 @@ private fun copyToClipboard(context: Context, text: String) {
     clipboard.setPrimaryClip(ClipData.newPlainText("Room code", text))
 }
 
+/** The side on the bottom edge: the player's own color online, White locally. */
+private fun playerColorOf(vm: GameViewModel): String =
+    if (vm.isOnlineMode) (vm.onlineYourColor ?: "w") else "w"
+
+private fun opponentColorOf(vm: GameViewModel): String =
+    if (playerColorOf(vm) == "w") "b" else "w"
+
+private fun playerNameOf(vm: GameViewModel, side: String): String {
+    if (vm.isOnlineMode) {
+        return if (side == vm.onlineYourColor) "You" else "Opponent"
+    }
+    if (side == "w") return "You"
+    return if (vm.isCpuMode) "CPU" else "Opponent"
+}
+
+@Composable
+private fun GameTopBar(vm: GameViewModel) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = if (vm.isOnlineMode) vm.onlineTimeControl else "Local",
+            style = MaterialTheme.typography.titleMedium,
+        )
+    }
+}
+
+@Composable
+private fun MoveStrip(vm: GameViewModel) {
+    if (vm.moveList.isEmpty()) {
+        Text(
+            text = "No moves yet",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+        return
+    }
+    // Auto-scroll to the newest ply as moves arrive.
+    val listState = rememberLazyListState()
+    LaunchedEffect(vm.moveList.size) {
+        if (vm.moveList.isNotEmpty()) {
+            listState.animateScrollToItem(vm.moveList.lastIndex)
+        }
+    }
+    LazyRow(
+        state = listState,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        itemsIndexed(vm.moveList) { index, uci ->
+            val ply = index + 1
+            val selected = vm.shownPly == ply
+            Box(
+                modifier = Modifier
+                    .background(
+                        if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
+                        else MaterialTheme.colorScheme.surfaceVariant,
+                        RoundedCornerShape(6.dp),
+                    )
+                    .clickable { vm.goToPly(ply) }
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            ) {
+                Text(
+                    text = uci,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlayerRow(vm: GameViewModel, side: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(playerNameOf(vm, side), style = MaterialTheme.typography.titleSmall)
+        if (vm.isOnlineMode) {
+            val rating = if (side == "w") vm.onlineWhiteRating else vm.onlineBlackRating
+            Text(
+                text = rating.toInt().toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.weight(1f))
+        vm.onlineClock?.let { clock ->
+            var now by remember { mutableStateOf(System.currentTimeMillis()) }
+            LaunchedEffect(clock) {
+                while (true) {
+                    now = System.currentTimeMillis()
+                    delay(100)
+                }
+            }
+            val active = clock.isRunning && clock.sideToMove == side
+            Text(
+                text = OnlineClock.format(clock.remainingMs(side, now)),
+                style = MaterialTheme.typography.titleMedium,
+                fontFamily = FontFamily.Monospace,
+                modifier = Modifier
+                    .background(
+                        if (active) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                        else Color.Transparent,
+                        RoundedCornerShape(8.dp),
+                    )
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun GameActionBar(vm: GameViewModel, onNewGame: () -> Unit) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box {
+            IconBox(symbol = "☰") { menuOpen = true }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Flip board") },
+                    onClick = { menuOpen = false; vm.flipBoard() },
+                )
+                if (!vm.isOnlineMode) {
+                    DropdownMenuItem(
+                        text = { Text("Undo") },
+                        enabled = vm.canUndo,
+                        onClick = { menuOpen = false; vm.undo() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("New game") },
+                        enabled = vm.canStartNewGame,
+                        onClick = { menuOpen = false; onNewGame() },
+                    )
+                }
+            }
+        }
+        IconBox(symbol = "⚑", enabled = vm.canResign) { vm.resign() }
+        IconBox(symbol = "‹", enabled = vm.shownPly > 0) { vm.stepBack() }
+        IconBox(symbol = "»", enabled = vm.isViewingHistory) { vm.goLive() }
+        IconBox(symbol = "›", enabled = vm.shownPly < vm.moveList.size) { vm.stepForward() }
+    }
+}
+
+@Composable
+private fun IconBox(symbol: String, enabled: Boolean = true, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .clickable(enabled = enabled) { onClick() },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = symbol,
+            style = MaterialTheme.typography.headlineSmall,
+            color = if (enabled) MaterialTheme.colorScheme.onSurface
+            else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f),
+        )
+    }
+}
+
 @Composable
 private fun StatusRow(vm: GameViewModel) {
     when {
@@ -569,21 +708,17 @@ private fun StatusRow(vm: GameViewModel) {
                 )
             is GameStatus.Playing ->
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    val onlineOwnTurn =
-                        vm.isOnlineMode && status.toMove == vm.onlineYourColor
-                    val onlineOpponentTurn = vm.isOnlineMode && !onlineOwnTurn
-                    Text(
-                        text = when {
-                            onlineOwnTurn -> "Your move"
-                            onlineOpponentTurn -> "Opponent to move"
-                            else -> if (status.toMove == "w") "White to move" else "Black to move"
-                        },
-                        style = MaterialTheme.typography.titleMedium,
-                    )
+                    // Online: whose turn it is is shown by the active clock.
+                    if (!vm.isOnlineMode) {
+                        Text(
+                            text = if (status.toMove == "w") "White to move" else "Black to move",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                    }
                     if (status.inCheck) {
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            text = "— Check!",
+                            text = if (vm.isOnlineMode) "Check!" else "— Check!",
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.error,
                         )
@@ -662,6 +797,16 @@ fun AppNavHost(debugCpuDelayMs: Long = 0L, onlineUrl: String? = null) {
         model.debugOnlineURL = onlineUrl
         model.restoreOnlineSessionIfNeeded()
         model
+    }
+
+    // Online: the creator waits on Home; both move to the Game section once
+    // the server reports the game is under way.
+    LaunchedEffect(vm.onlinePhase) {
+        if (vm.onlinePhase is OnlinePhase.InGame &&
+            navController.currentDestination?.route != "game"
+        ) {
+            navController.navigate("game")
+        }
     }
 
     NavHost(navController = navController, startDestination = "login") {
@@ -772,6 +917,7 @@ fun HomeScreen(
     var roomCode by remember { mutableStateOf("") }
     var timeControl by remember { mutableStateOf(OnlineTimeControl.default) }
     var authDisplayName by remember { mutableStateOf("") }
+    val context = LocalContext.current
 
     Column(
         modifier = Modifier
@@ -861,19 +1007,37 @@ fun HomeScreen(
                 modifier = Modifier.fillMaxWidth()
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = {
-                    vm.startOnlineGame(true, null, timeControl.label)
-                    onStartGame()
-                }) { Text("Create room") }
+                Button(
+                    onClick = { vm.startOnlineGame(true, null, timeControl.label) },
+                    enabled = vm.onlinePhase !is OnlinePhase.Waiting,
+                ) { Text("Create room") }
                 Button(
                     onClick = {
                         if (roomCode.isNotEmpty()) {
                             vm.startOnlineGame(false, roomCode, null)
-                            onStartGame()
                         }
                     },
                     enabled = roomCode.isNotEmpty()
                 ) { Text("Join room") }
+            }
+            (vm.onlinePhase as? OnlinePhase.Waiting)?.let { waiting ->
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text("Room code", style = MaterialTheme.typography.labelSmall)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = waiting.code,
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        TextButton(onClick = { copyToClipboard(context, waiting.code) }) { Text("Copy") }
+                    }
+                    Text("Waiting for the opponent to join…", style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = { vm.cancelOnlineWaiting() }) { Text("Cancel") }
+                }
             }
             vm.onlineJoinError?.let { error ->
                 Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)

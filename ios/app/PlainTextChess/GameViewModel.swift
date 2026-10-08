@@ -121,6 +121,15 @@ final class GameViewModel: ObservableObject {
     /// is locked and the status row shows "CPU is thinking…".
     @Published private(set) var cpuThinking = false
 
+    // MARK: Move-history navigation (redesign-game-screen)
+
+    /// The ply the player is viewing: `nil` means the live position. While it
+    /// points at an earlier ply the board renders that position and input is
+    /// disabled.
+    @Published private(set) var viewPly: Int?
+    private var historyCache: [FenBoard] = []
+    private var historyCacheCount = -1
+
     // MARK: Online multiplayer state (add-online-multiplayer D4/D7/D8).
 
     /// Connection phase mirrored from the `OnlineConnectionManager` (SwiftUI
@@ -233,6 +242,14 @@ final class GameViewModel: ObservableObject {
         return false
     }
 
+    /// Whether the current game is against the CPU (for the player labels).
+    var isCpuMode: Bool {
+        if case .cpu = gameMode {
+            return true
+        }
+        return false
+    }
+
     /// Game-end dialog bookkeeping (design D2 of add-game-end-dialog): the
     /// modal is presented once per game and never re-presented after the
     /// player dismisses it; `startGame` resets both flags.
@@ -280,6 +297,8 @@ final class GameViewModel: ObservableObject {
     /// highlighted destination to play. Tapping a non-legal square keeps the
     /// selection and shows "not a legal move" feedback.
     func select(_ squareName: String) {
+        // Move-history browsing: the board is read-only while a past ply shows.
+        if isViewingHistory { return }
         // Locked while the CPU is thinking (design D5): no selection, no move.
         guard !cpuThinking else { return }
         guard case .playing(let toMove, _) = status else { return }
@@ -401,6 +420,8 @@ final class GameViewModel: ObservableObject {
         gameMode = mode
         cpuGeneration += 1
         cpuThinking = false
+        // A fresh game starts at the live position (redesign-game-screen).
+        viewPly = nil
         // Game-end dialog: a fresh game gets a fresh dialog (design D2).
         gameEndPresented = false
         gameEndDismissed = false
@@ -614,12 +635,66 @@ final class GameViewModel: ObservableObject {
         } catch {
             errorMessage = "Undo failed: \(error)"
         }
+        // Undo changes the length: drop any stale history view.
+        viewPly = nil
     }
 
     /// Flip the board orientation (design D6): 0 = White on the bottom,
     /// 180 = rotated. Display-only: the game state is untouched.
     func flipBoard() {
         boardOrientation = boardOrientation == 0 ? 180 : 0
+    }
+
+    // MARK: Move-history navigation (redesign-game-screen)
+
+    /// The board to render: the live board, or the cached position at
+    /// `viewPly` while the player browses an earlier ply.
+    var displayedBoard: FenBoard {
+        guard let ply = viewPly, ply >= 0, ply < moveList.count else { return board }
+        let boards = historyBoards()
+        return ply < boards.count ? boards[ply] : board
+    }
+
+    /// True while the board shows a past position: move input is disabled.
+    var isViewingHistory: Bool {
+        if let ply = viewPly { return ply < moveList.count }
+        return false
+    }
+
+    /// The ply the strip highlights (0 = start, `moveList.count` = live).
+    var shownPly: Int { viewPly ?? moveList.count }
+
+    func goToPly(_ ply: Int) {
+        let clamped = max(0, min(ply, moveList.count))
+        viewPly = clamped >= moveList.count ? nil : clamped
+    }
+
+    func goLive() { viewPly = nil }
+    func stepBack() { goToPly((viewPly ?? moveList.count) - 1) }
+    func stepForward() { goToPly((viewPly ?? moveList.count) + 1) }
+
+    /// Board snapshots per ply (index 0 = start), rebuilt from the move list and
+    /// cached until the list changes.
+    private func historyBoards() -> [FenBoard] {
+        if historyCacheCount == moveList.count, historyCache.count == moveList.count + 1 {
+            return historyCache
+        }
+        let scratch = newGameSession(initialRating: 1500.0)
+        var boards: [FenBoard] = []
+        if let start = try? FenBoard(board: scratch.getBoardState(), sideToMove: "w") {
+            boards.append(start)
+        }
+        for (index, uci) in moveList.enumerated() {
+            _ = try? scratch.playMove(uciMove: uci)
+            let side = (index + 1).isMultiple(of: 2) ? "w" : "b"
+            if let fen = try? scratch.getBoardState(),
+               let fenBoard = try? FenBoard(board: fen, sideToMove: side) {
+                boards.append(fenBoard)
+            }
+        }
+        historyCache = boards
+        historyCacheCount = moveList.count
+        return boards
     }
 
     // MARK: - Online multiplayer (add-online-multiplayer D4/D7/D8)
@@ -693,6 +768,7 @@ final class GameViewModel: ObservableObject {
         gameMode = .online
         cpuGeneration += 1
         cpuThinking = false
+        viewPly = nil
         gameEndPresented = false
         gameEndDismissed = false
         showGameEndDialog = false
@@ -1070,6 +1146,11 @@ final class GameViewModel: ObservableObject {
     }
 
     /// Close and forget the online session (add-online-multiplayer D7/D8).
+    /// Leave the room the player is waiting in (the Create flow was cancelled).
+    func cancelOnlineWaiting() {
+        teardownOnlineSession()
+    }
+
     private func teardownOnlineSession() {
         online?.teardown()
         online = nil

@@ -154,7 +154,7 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
             if (!animationsEnabled) return@LaunchedEffect
             val square = FenBoard.parseSquare(lastMove.to) ?: return@LaunchedEffect
             val (row, col) = square
-            val piece = vm.board.grid[row][col]
+            val piece = vm.displayedBoard.grid[row][col]
             if (piece.isEmpty()) return@LaunchedEffect
             slide = MoveSlide(piece, lastMove.from, lastMove.to)
             slideProgress.snapTo(0f)
@@ -243,7 +243,7 @@ fun BoardView(vm: GameViewModel, modifier: Modifier = Modifier) {
         val liftPos = dragPos
         if (liftFrom != null && liftPos != null) {
             FenBoard.parseSquare(liftFrom)?.let { (row, col) ->
-                val piece = vm.board.grid[row][col]
+                val piece = vm.displayedBoard.grid[row][col]
                 if (piece.isNotEmpty()) {
                     val liftSize = cell * 1.05f
                     Image(
@@ -361,7 +361,7 @@ private fun PromotionCard(vm: GameViewModel, promo: GameViewModel.PendingPromoti
 /** Whether the promoting pawn is white (color of the piece on `from`). */
 private fun isWhitePromotion(vm: GameViewModel, promo: GameViewModel.PendingPromotion): Boolean {
     val square = FenBoard.parseSquare(promo.from) ?: return true
-    val piece = vm.board.grid[square.first][square.second]
+    val piece = vm.displayedBoard.grid[square.first][square.second]
     return piece.isNotEmpty() && piece == piece.uppercase()
 }
 
@@ -377,7 +377,7 @@ private fun SquareCell(
     displayCol: Int = col,
 ) {
     val name = FenBoard.squareName(row, col)
-    val piece = vm.board.grid[row][col]
+    val piece = vm.displayedBoard.grid[row][col]
     val isLight = (row + col) % 2 == 0
     val isSelected = vm.selectedSquare == name
     val isLegalTarget = vm.legalTargets.contains(name)
