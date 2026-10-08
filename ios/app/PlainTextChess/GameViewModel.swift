@@ -157,6 +157,26 @@ final class GameViewModel: ObservableObject {
     /// The room's time control label from the last snapshot (lobby included).
     @Published private(set) var onlineTimeControl: String = OnlineTimeControl.default.label
 
+    // MARK: - Auth state (add-auth-ui-clients)
+
+    /// Session token issued by a successful register/login; `nil` while the
+    /// player is a guest (`device_id` play stays the default identity).
+    @Published private(set) var authToken: String?
+    /// The profile display name the signed-in player last set via
+    /// `set_profile` (iOS task 3.2); `nil` until one is accepted.
+    @Published private(set) var authDisplayName: String?
+    /// The last register/login failure, shown in the new-game sheet (e.g.
+    /// the server's generic `invalid_credentials` message).
+    @Published private(set) var authError: String?
+    /// The auth reply expected next: register/login store the issued token,
+    /// logout clears it (task 3.1), set_profile records the display name
+    /// (task 3.2).
+    private enum AuthPendingAction { case login, register, logout, setProfile }
+    private var pendingAuthAction: AuthPendingAction = .login
+    /// The trimmed `display_name` submitted for the `set_profile` in flight,
+    /// recorded on `profile_updated` (task 3.2).
+    private var pendingDisplayName: String?
+
     /// Game-end dialog visibility (design D2 of add-game-end-dialog): the VM
     /// owns the presentation so the "appears once" rule has no view-layer
     /// race. `ContentView` binds the alert to this flag.
@@ -707,7 +727,152 @@ final class GameViewModel: ObservableObject {
         manager.onPhase = { [weak self] phase in
             self?.handleOnlinePhase(phase)
         }
+        manager.onAuthResult = { [weak self] success, payload in
+            self?.handleAuthResult(success: success, payload: payload)
+        }
         online = manager
+    }
+
+    // MARK: - Auth (add-auth-ui-clients)
+
+    /// Log in with an existing account (task 2.3): the server answers
+    /// `Session` (token) or `invalid_credentials` carrying the generic
+    /// message. No-op while already signed in; guest play is unaffected.
+    func doLogin(username: String, password: String, serverURLString: String?) {
+        guard authToken == nil else { return }
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        pendingAuthAction = .login
+        online?.startLogin(username: username, password: password)
+    }
+
+    /// Register a new account (task 2.1): the server answers `Session`
+    /// (token) or `username_taken`. Same connection rules as `doLogin`.
+    func doRegister(username: String, password: String, serverURLString: String?) {
+        guard authToken == nil else { return }
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        pendingAuthAction = .register
+        online?.startRegister(username: username, password: password)
+    }
+
+    /// Log out (task 3.1): sends the token, expects `session_ok`, and
+    /// clears the token on success. The server only revokes the token —
+    /// the connection stays open, so guest play continues on the same
+    /// socket. A refusal (`session_expired`) keeps the token and shows the
+    /// server's message in the sheet.
+    func doLogout(serverURLString: String?) {
+        guard let token = authToken else { return }
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        pendingAuthAction = .logout
+        online?.startLogout(token: token)
+    }
+
+    /// Update the profile display name (task 3.2): validates locally with
+    /// the server's rules (trim, 1...32 characters, no control characters),
+    /// then sends `set_profile` and expects `profile_updated`. A refusal
+    /// (`not_authenticated`, `invalid_display_name`) keeps the token and
+    /// shows the server's message in the sheet.
+    func doSetProfile(displayName: String, serverURLString: String?) {
+        guard authToken != nil else { return }
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 32 else {
+            authError = "Display name must be 1–32 characters long."
+            return
+        }
+        guard !trimmed.unicodeScalars.contains(where: {
+            CharacterSet.controlCharacters.contains($0)
+        }) else {
+            authError = "Display name cannot contain control characters."
+            return
+        }
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        pendingAuthAction = .setProfile
+        pendingDisplayName = trimmed
+        online?.startSetProfile(displayName: trimmed)
+    }
+
+    /// Apply the reply of the auth action in flight: register/login store
+    /// the issued token; logout clears it; any refusal keeps the connection
+    /// open (guest play continues) and surfaces the server's message in
+    /// the sheet.
+    private func handleAuthResult(success: Bool, payload: String?) {
+        switch pendingAuthAction {
+        case .login, .register:
+            if success {
+                if let token = payload {
+                    authToken = token
+                }
+                authError = nil
+            } else {
+                authError = payload ?? "Authentication failed"
+            }
+        case .logout:
+            if success {
+                authToken = nil
+                authError = nil
+            } else {
+                authError = payload ?? "Logout failed"
+            }
+        case .setProfile:
+            if success {
+                authDisplayName = pendingDisplayName
+                pendingDisplayName = nil
+                authError = nil
+            } else {
+                pendingDisplayName = nil
+                authError = payload ?? "Could not update profile"
+            }
+        }
+    }
+
+    /// A usable socket for authentication: reuse the open online connection
+    /// when there is one, otherwise open a plain connection with no room.
+    /// Game state is untouched either way: the local board, the guest
+    /// `device_id`, and any persisted room for relaunch recovery all stay as
+    /// they are (auth-ui spec "Existing clients remain unaffected").
+    private func ensureAuthConnection(serverURLString: String?) -> Bool {
+        if let manager = online {
+            switch manager.phase {
+            case .connecting, .waiting, .inGame, .reconnecting:
+                // A live connection already carries the auth callbacks
+                // (`makeOnlineConnection` wires them).
+                return true
+            case .idle, .failed:
+                break
+            }
+        }
+        guard let url = Self.onlineServerURL(serverURLString) else { return false }
+        // Replace a dead connection. Room persistence is kept: it is
+        // game-recovery bookkeeping, not auth state.
+        online?.teardown()
+        let manager = OnlineConnectionManager(url: url, deviceID: Self.deviceID)
+        manager.onAuthResult = { [weak self] success, payload in
+            self?.handleAuthResult(success: success, payload: payload)
+        }
+        manager.onError = { [weak self] _, message in
+            // Auth-only connection: a drop or refusal is an auth problem,
+            // and the game-level callbacks are deliberately not wired so a
+            // failed sign-in can never mark the local game as failed.
+            self?.authError = message
+        }
+        online = manager
+        manager.startAuth()
+        return true
     }
 
     /// Apply a server snapshot (add-online-multiplayer D2/D3): new moves are

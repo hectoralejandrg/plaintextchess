@@ -5,6 +5,29 @@
 /// "A new player starts at 1500").
 pub const DEFAULT_RATING: f64 = 1500.0;
 
+/// The full Glicko-2 state of a device's rating session (spec "Server
+/// Persistence"): rating, rating deviation, and volatility. This is what
+/// the server persists at game end and reloads at startup.
+///
+/// `Default` is the state of a device the server has never seen, matching
+/// the core's `RatingManager::new` (1500 / 200 / 0.06).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RatingState {
+    pub rating: f64,
+    pub rating_deviation: f64,
+    pub volatility: f64,
+}
+
+impl Default for RatingState {
+    fn default() -> Self {
+        Self {
+            rating: DEFAULT_RATING,
+            rating_deviation: 200.0,
+            volatility: 0.06,
+        }
+    }
+}
+
 /// The point share a terminal winner scores against the loser: 1.0 for a
 /// decisive result (checkmate, resignation, forfeit, flag fall), 0.5 for a
 /// draw (including a flag-fall draw).

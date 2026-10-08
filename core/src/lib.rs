@@ -2,6 +2,8 @@ pub mod domain;
 
 use std::sync::{Arc, Mutex};
 
+use domain::rating::RatingSnapshot;
+
 /// Errors exposed across the FFI boundary.
 /// Surface defined in `openspec/specs/shared/ffi-contracts.md`.
 #[derive(uniffi::Error, Debug)]
@@ -50,6 +52,15 @@ pub fn new_game_session(initial_rating: f64) -> Arc<GameSession> {
         board_manager: Mutex::new(domain::BoardManager::new()),
         rating_manager: Mutex::new(domain::RatingManager::new(initial_rating)),
     })
+}
+
+/// Create a fresh game session (standard start position) whose player's
+/// full Glicko-2 state is restored from `snapshot` (crate-level
+/// constructor for in-process consumers, not part of the FFI surface).
+pub fn new_game_session_from_rating_state(snapshot: RatingSnapshot) -> Arc<GameSession> {
+    let session = new_game_session(snapshot.rating);
+    session.rating_manager.lock().unwrap().set_state(snapshot);
+    session
 }
 
 #[uniffi::export]
@@ -141,6 +152,51 @@ impl GameSession {
             }
             self.rating_manager.lock().unwrap().deserialize(rating_part);
         }
+    }
+
+    /// The player's full Glicko-2 state: the snapshot an in-process
+    /// consumer (the online server) persists and restores across restarts.
+    /// Crate-level; not part of the FFI surface.
+    pub fn get_rating_state(&self) -> RatingSnapshot {
+        self.rating_manager.lock().unwrap().state()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rating_state_round_trips_through_a_fresh_session() {
+        let session = new_game_session(1500.0);
+        session.update_player_rating(1500.0, 1.0).expect("rating update");
+        session.update_player_rating(1550.0, 0.5).expect("rating update");
+        let snapshot = session.get_rating_state();
+        assert!(snapshot.rating > 1500.0, "a win plus a draw must gain rating");
+        assert!(snapshot.rating_deviation < 200.0, "RD must tighten after games");
+
+        let restored = new_game_session_from_rating_state(snapshot);
+        assert_eq!(
+            restored.get_rating_state(),
+            snapshot,
+            "the restored session's Glicko-2 state matches the snapshot exactly"
+        );
+
+        // The board is the standard start position (no moves carried over).
+        let fresh = new_game_session(0.0);
+        assert_eq!(
+            restored.get_board_state().expect("board state"),
+            fresh.get_board_state().expect("board state"),
+            "a restored session starts from the standard start position"
+        );
+
+        // Subsequent rating updates continue from the restored state.
+        restored.update_player_rating(1400.0, 1.0).expect("rating update");
+        assert_ne!(
+            restored.get_rating_state().rating,
+            snapshot.rating,
+            "rating updates continue from the restored state"
+        );
     }
 }
 

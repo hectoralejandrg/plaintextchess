@@ -1,12 +1,12 @@
-//! In-memory per-device rating sessions (spec "Server Online Rating",
+//! Per-device Glicko-2 rating sessions (spec "Server Online Rating",
 //! design D5 of add-online-multiplayer): the application's `Ratings` port
-//! backed by the engine's Glicko-2 sessions. Reset when the server restarts
-//! (documented limitation of the in-memory MVP).
+//! backed by the engine's Glicko-2 sessions. Ratings persist in SQLite
+//! (loaded at server startup, committed at game end, design D1/D4).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::application::ports::{ChessEngine, Ratings, RatingSession};
+use crate::application::ports::{ChessEngine, Ratings, RatingSession, RatingState};
 use crate::domain::rating::DEFAULT_RATING;
 
 /// In-memory per-device rating sessions.
@@ -32,6 +32,23 @@ impl RatingStore {
             .or_insert_with(|| self.engine.new_rating_session(DEFAULT_RATING))
             .current_rating()
             .expect("rating read")
+    }
+
+    /// The device's full Glicko-2 state, if a session exists for it
+    /// (unknown devices are not created here, unlike `rating_of`).
+    pub fn rating_state(&self, player_id: &str) -> Option<RatingState> {
+        let sessions = self.sessions.read().unwrap();
+        sessions.get(player_id).map(|s| s.state().expect("state read"))
+    }
+
+    /// Seed a device's rating session from a persisted state (startup
+    /// load, spec "Server Persistence"). Replaces any in-memory session.
+    pub fn seed(&self, device_id: &str, state: RatingState) {
+        let mut sessions = self.sessions.write().unwrap();
+        sessions.insert(
+            device_id.to_string(),
+            self.engine.new_rating_session_state(&state),
+        );
     }
 
     /// Record a finished game: the winner scores `score` (1.0 for a decisive
@@ -70,6 +87,10 @@ impl Ratings for RatingStore {
 
     fn apply_result(&self, winner: &str, loser: &str, score: f64) {
         RatingStore::apply_result(self, winner, loser, score)
+    }
+
+    fn rating_state(&self, player_id: &str) -> Option<RatingState> {
+        RatingStore::rating_state(self, player_id)
     }
 }
 
@@ -149,5 +170,44 @@ mod tests {
             store.rating_of("device-a") < DEFAULT_RATING,
             "a device that keeps losing drops below the default"
         );
+    }
+
+    #[test]
+    fn seeding_a_non_default_state_is_read_back() {
+        let store = store();
+        let seeded = RatingState {
+            rating: 1800.0,
+            rating_deviation: 150.0,
+            volatility: 0.03,
+        };
+        store.seed("device-seed", seeded);
+        assert_eq!(store.rating_of("device-seed"), 1800.0);
+        assert_eq!(store.rating_state("device-seed"), Some(seeded));
+        // Unknown devices have no session: no state, but a default rating.
+        assert_eq!(store.rating_state("device-unknown"), None);
+        assert_eq!(store.rating_of("device-unknown"), DEFAULT_RATING);
+    }
+
+    #[test]
+    fn apply_result_continues_from_the_seeded_state() {
+        let store = store();
+        store.seed(
+            "device-seed",
+            RatingState {
+                rating: 2000.0,
+                rating_deviation: 200.0,
+                volatility: 0.06,
+            },
+        );
+        // A win against an unrival (1500) must start from 2000, not 1500.
+        store.apply_result("device-seed", "device-rival", 1.0);
+        let state = store.rating_state("device-seed").expect("seeded state");
+        assert!(
+            state.rating > 2000.0,
+            "the winner gains from its seeded 2000, got {state:?}"
+        );
+        assert!(state.rating_deviation < 200.0, "RD tightens after a game");
+        // The rival (never seen) lost from the default 1500.
+        assert!(store.rating_of("device-rival") < DEFAULT_RATING);
     }
 }

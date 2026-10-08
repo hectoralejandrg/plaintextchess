@@ -93,104 +93,48 @@ struct ContentView: View {
         return url.isEmpty ? nil : url
     }
 
+    enum Route: Hashable {
+        case home
+        case game
+    }
+
+    @State private var path: [Route] = []
+
     var body: some View {
-        GeometryReader { proxy in
-            // The board always spans the full container width and keeps that
-            // exact size in every state. A fixed square frame derived from
-            // the screen width can never be squeezed by the dynamic siblings
-            // (waiting banner, error footnote, growing move list), so the
-            // board never resizes. The chrome around it is budgeted so the
-            // worst simultaneous content still fits around a full-width
-            // board on an iPhone 16 Pro (472.7 pt available): the move list
-            // is capped at 96 pt, the stack spacing is 10 pt, and the
-            // waiting banner keeps a 10 pt inset, leaving slack for Dynamic
-            // Type / rendering differences.
-            let boardSide = proxy.size.width
-            VStack(alignment: .leading, spacing: 10) {
-                Text("PlainTextChess")
-                    .font(.largeTitle.bold())
-                    .padding(.horizontal)
-
-                statusRow
-                    .padding(.horizontal)
-
-                if vm.isOnlineMode {
-                    // Online clocks (add-online-time-controls, design D6): a
-                    // fixed-height row so the full-width board keeps its exact
-                    // size in every online state.
-                    clockRow
-                        .padding(.horizontal)
-                }
-
-                if case .waiting(let code) = vm.onlinePhase {
-                    // Online waiting state (add-online-multiplayer D4): the room
-                    // code, with a copy action, while the opponent is still away.
-                    waitingBanner(code: code)
-                        .padding(.horizontal)
-                }
-
-                BoardView(vm: vm,
-                          animScale: debugAnimScale,
-                          dragTest: debugDrag)
-                    .frame(width: boardSide, height: boardSide)
-                    .overlay {
-                        // Reconnect banner (add-online-multiplayer D7): the last
-                        // known position stays on screen behind it.
-                        if vm.onlineReconnecting {
-                            Text("Reconnecting…")
-                                .font(.callout.bold())
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .background(.thinMaterial, in: Capsule())
-                        }
+        NavigationStack(path: $path) {
+            LoginView(vm: vm, effectiveOnlineURL: effectiveOnlineURL,
+                      onAuth: { path.append(.home) },
+                      onGuest: { path.append(.home) })
+                .navigationDestination(for: Route.self) { route in
+                    switch route {
+                    case .home:
+                        HomeView(vm: vm, effectiveOnlineURL: effectiveOnlineURL,
+                                 onStartGame: { path.append(.game) },
+                                 onLogout: {
+                                     vm.doLogout(serverURLString: effectiveOnlineURL)
+                                     path.removeAll()
+                                 },
+                                 onGoToLogin: { path.removeAll() })
+                    case .game:
+                        GameView(vm: vm, effectiveOnlineURL: effectiveOnlineURL)
                     }
-
-                moveList
-                    .padding(.horizontal)
-
-                controls
-                    .padding(.horizontal)
-            }
-            .padding(.vertical)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        }
-        // The sheet also closes itself once the server confirms an online
-        // seat (`onlineSessionReady`); opening it resets the handshake flag.
-        .sheet(isPresented: Binding(
-            get: { showNewGameSheet && !vm.onlineSessionReady },
-            set: { showNewGameSheet = $0 }
-        )) {
-            NewGameSetupView(
-                hasServerURL: effectiveOnlineURL != nil,
-                joinError: vm.onlineJoinError
-            ) { choice in
-                switch choice {
-                case .twoPlayers:
-                    vm.startGame(.twoPlayers)
-                case .cpu(let difficulty):
-                    vm.startGame(.cpu(difficulty))
-                case .onlineCreate(let timeControl):
-                    _ = vm.startOnlineGame(create: true, timeControl: timeControl,
-                                           serverURLString: effectiveOnlineURL)
-                case .onlineJoin(let code):
-                    _ = vm.startOnlineGame(create: false, code: code,
-                                           serverURLString: effectiveOnlineURL)
                 }
-            }
+                .onAppear {
+                    vm.restoreOnlineSessionIfNeeded(serverURLString: effectiveOnlineURL)
+                    #if DEBUG
+                    vm.setDebugCpuDelay(debugCpuDelay)
+                    vm.setDebugOnlineURL(effectiveOnlineURL)
+                    if case .cpu = debugMode {
+                        vm.startGame(debugMode)
+                    }
+                    startDebugScriptIfNeeded()
+                    #endif
+                }
         }
-        .onAppear {
-            // Relaunch recovery (add-online-multiplayer D8, E2E 5.2): re-attach
-            // to a persisted in-progress room within the server's window.
-            vm.restoreOnlineSessionIfNeeded(serverURLString: effectiveOnlineURL)
-            #if DEBUG
-            vm.setDebugCpuDelay(debugCpuDelay)
-            vm.setDebugOnlineURL(effectiveOnlineURL)
-            if case .cpu = debugMode {
-                // Start directly in a CPU game for scripted verification.
-                vm.startGame(debugMode)
+        .onChange(of: vm.authToken) { token in
+            if token != nil && path.last != .home {
+                path.append(.home)
             }
-            startDebugScriptIfNeeded()
-            #endif
         }
     }
 
@@ -447,6 +391,10 @@ enum NewGameChoice: Equatable {
     case cpu(CpuDifficulty)
     case onlineCreate(timeControl: String)
     case onlineJoin(code: String)
+    case register(username: String, password: String)
+    case login(username: String, password: String)
+    case logout
+    case setProfile(displayName: String)
 }
 
 /// New-game setup sheet (design D4 + add-online-multiplayer D4): choose the
@@ -475,10 +423,23 @@ struct NewGameSetupView: View {
     @State private var onlineAction: OnlineAction = .create
     @State private var roomCode = ""
     @State private var timeControl: OnlineTimeControl = .default
+    /// Sign-in fields (add-auth-ui-clients): kept while the sheet reports a
+    /// failure so the player can correct them without retyping.
+    @State private var authUsername = ""
+    @State private var authPassword = ""
+    /// Profile display-name field (task 3.2): submitted via `set_profile`.
+    @State private var authDisplayNameInput = ""
     /// Whether an online server URL is configured for this build.
     let hasServerURL: Bool
     /// A join-time error from the last attempt (the sheet stays open on it).
     let joinError: String?
+    /// The session token after a successful register/login (nil = guest).
+    let authToken: String?
+    /// The display name recorded after a `profile_updated` reply (task 3.2).
+    let authDisplayName: String?
+    /// A register/login failure from the last attempt (the form stays open
+    /// on it, e.g. the server's generic invalid_credentials message).
+    let authError: String?
     let onStart: (NewGameChoice) -> Void
     @Environment(\.dismiss) private var dismiss
 
@@ -572,6 +533,8 @@ struct NewGameSetupView: View {
                 }
             }
 
+            accountSection
+
             Spacer(minLength: 0)
 
             Button(action: start) {
@@ -587,6 +550,92 @@ struct NewGameSetupView: View {
             .font(.footnote)
         }
         .padding()
+    }
+
+    /// Optional sign-in section (add-auth-ui-clients): username/password
+    /// with Register and Login while a guest; once the server issues a
+    /// token, the same section shows the session instead. Failures
+    /// (username_taken, invalid_credentials) render here and keep the form
+    /// open, mirroring how join errors keep the join form open.
+    @ViewBuilder
+    private var accountSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Account")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+            if let authToken {
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Signed in")
+                            .font(.callout.bold())
+                        Text(authToken)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                    }
+                    Spacer()
+                    Button("Copy") {
+                        UIPasteboard.general.string = authToken
+                    }
+                    .buttonStyle(.bordered)
+                    Button("Log out") {
+                        onStart(.logout)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(10)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                if let authDisplayName {
+                    Text("Display name: \(authDisplayName)")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                HStack(spacing: 8) {
+                    TextField("Display name", text: $authDisplayNameInput)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                    Button("Update") {
+                        onStart(.setProfile(displayName: authDisplayNameInput))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(authDisplayNameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                if let authError {
+                    Text(authError)
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                }
+            } else {
+                TextField("Username", text: $authUsername)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                SecureField("Password", text: $authPassword)
+                    .textFieldStyle(.roundedBorder)
+                HStack(spacing: 8) {
+                    Button(action: {
+                        onStart(.register(username: authUsername,
+                                          password: authPassword))
+                    }) {
+                        Text("Register")
+                            .frame(maxWidth: .infinity)
+                    }
+                    Button(action: {
+                        onStart(.login(username: authUsername,
+                                       password: authPassword))
+                    }) {
+                        Text("Login")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(authUsername.isEmpty || authPassword.isEmpty)
+                if let authError {
+                    Text(authError)
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                }
+            }
+        }
     }
 
     private func start() {
@@ -606,6 +655,425 @@ struct NewGameSetupView: View {
                 // seat, or shows the join error (see the type's doc).
                 onStart(.onlineJoin(code: roomCode.uppercased()))
             }
+        }
+    }
+}
+
+struct LoginView: View {
+    @ObservedObject var vm: GameViewModel
+    let effectiveOnlineURL: String?
+    let onAuth: () -> Void
+    let onGuest: () -> Void
+
+    @State private var username = ""
+    @State private var password = ""
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("PlainTextChess")
+                .font(.largeTitle.bold())
+                .padding(.bottom, 20)
+
+            TextField("Username", text: $username)
+                .textFieldStyle(.roundedBorder)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+
+            SecureField("Password", text: $password)
+                .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 8) {
+                Button(action: {
+                    vm.doRegister(username: username, password: password, serverURLString: effectiveOnlineURL)
+                }) {
+                    Text("Register")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(username.isEmpty || password.isEmpty)
+                .buttonStyle(.borderedProminent)
+
+                Button(action: {
+                    vm.doLogin(username: username, password: password, serverURLString: effectiveOnlineURL)
+                }) {
+                    Text("Login")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(username.isEmpty || password.isEmpty)
+                .buttonStyle(.borderedProminent)
+            }
+
+            Button(action: { onGuest() }) {
+                Text("Play as guest")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+
+            if let error = vm.authError {
+                Text(error)
+                    .font(.footnote)
+                    .foregroundColor(.red)
+            }
+        }
+        .padding()
+        .onChange(of: vm.authToken) { token in
+            if token != nil {
+                onAuth()
+            }
+        }
+    }
+}
+
+struct HomeView: View {
+    @ObservedObject var vm: GameViewModel
+    let effectiveOnlineURL: String?
+    let onStartGame: () -> Void
+    let onLogout: () -> Void
+    let onGoToLogin: () -> Void
+    @State private var isCpu = false
+    @State private var isOnline = false
+    @State private var difficulty: CpuDifficulty = .medium
+    @State private var roomCode = ""
+    @State private var timeControl: OnlineTimeControl = .default
+    @State private var authDisplayNameInput = ""
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if vm.authToken != nil {
+                    Text("Signed in")
+                        .font(.headline)
+                    if let name = vm.authDisplayName {
+                        Text("Display name: \(name)")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                    HStack(spacing: 8) {
+                        TextField("Display name", text: $authDisplayNameInput)
+                            .textFieldStyle(.roundedBorder)
+                            .autocorrectionDisabled()
+                        Button("Update") {
+                            vm.doSetProfile(displayName: authDisplayNameInput, serverURLString: effectiveOnlineURL)
+                        }
+                        .disabled(authDisplayNameInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .buttonStyle(.borderedProminent)
+                    }
+                    Button(action: onLogout) {
+                        Text("Logout")
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Text("Playing as guest")
+                        .font(.headline)
+                    Button(action: onGoToLogin) {
+                        Text("Login / Register")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                if let error = vm.authError {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                }
+
+                Text("Mode selection")
+                    .font(.headline)
+                Picker("Opponent", selection: $isCpu) {
+                    Text("Two players").tag(false)
+                    Text("CPU").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: isCpu) { new in if new { isOnline = false } }
+
+                if isCpu {
+                    Picker("Difficulty", selection: $difficulty) {
+                        ForEach(CpuDifficulty.allCases, id: \.self) { level in
+                            Text(level.displayName).tag(level)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                Picker("Online", selection: $isOnline) {
+                    Text("Local").tag(false)
+                    Text("Online").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: isOnline) { new in if new { isCpu = false } }
+
+                if isOnline {
+                    Picker("Time control", selection: $timeControl) {
+                        ForEach(OnlineTimeControl.presets) { preset in
+                            Text(preset.label).tag(preset)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    TextField("Room code (6 chars)", text: $roomCode)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.characters)
+                    HStack(spacing: 8) {
+                        Button(action: {
+                            _ = vm.startOnlineGame(create: true, code: nil, timeControl: timeControl.label, serverURLString: effectiveOnlineURL)
+                        }) {
+                            Text("Create room").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button(action: {
+                            let code = roomCode.uppercased()
+                            if code.count == 6 {
+                                _ = vm.startOnlineGame(create: false, code: code, timeControl: nil, serverURLString: effectiveOnlineURL)
+                            }
+                        }) {
+                            Text("Join room").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(roomCode.uppercased().count != 6)
+                    }
+                    if let joinErr = vm.onlineJoinError {
+                        Text(joinErr).font(.footnote).foregroundColor(.red)
+                    }
+                } else {
+                    Button(action: {
+                        if isCpu {
+                            vm.startGame(.cpu(difficulty))
+                        } else {
+                            vm.startGame(.twoPlayers)
+                        }
+                        onStartGame()
+                    }) {
+                        Text("Start game").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding()
+        }
+    }
+}
+
+struct GameView: View {
+    @ObservedObject var vm: GameViewModel
+    let effectiveOnlineURL: String?
+
+    @State private var showNewGameSheet = false
+    private let debugAnimScale = 1.0
+    private let debugDrag: DragTest? = nil
+
+    var body: some View {
+        GeometryReader { proxy in
+            let boardSide = proxy.size.width
+            VStack(alignment: .leading, spacing: 10) {
+                Text("PlainTextChess")
+                    .font(.largeTitle.bold())
+                    .padding(.horizontal)
+
+                StatusRowView(vm: vm)
+                    .padding(.horizontal)
+
+                if vm.isOnlineMode {
+                    ClockRowView(vm: vm)
+                        .padding(.horizontal)
+                }
+
+                if case .waiting(let code) = vm.onlinePhase {
+                    WaitingBannerView(code: code)
+                        .padding(.horizontal)
+                }
+
+                BoardView(vm: vm,
+                          animScale: debugAnimScale,
+                          dragTest: debugDrag)
+                    .frame(width: boardSide, height: boardSide)
+                    .overlay {
+                        if vm.onlineReconnecting {
+                            Text("Reconnecting…")
+                                .font(.callout.bold())
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .background(.thinMaterial, in: Capsule())
+                        }
+                    }
+
+                MoveListView(vm: vm)
+                    .padding(.horizontal)
+
+                ControlsView(vm: vm)
+                    .padding(.horizontal)
+            }
+            .padding(.vertical)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+    }
+}
+
+struct StatusRowView: View {
+    @ObservedObject var vm: GameViewModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if vm.onlineReconnecting {
+                Text("Reconnecting…").font(.headline).foregroundColor(.orange)
+            } else if case .waiting = vm.onlinePhase {
+                Text("Waiting for opponent to join…").font(.headline)
+            } else if vm.cpuThinking {
+                Text("CPU is thinking…").font(.headline)
+            } else {
+                switch vm.status {
+                case .starting:
+                    Text(vm.isOnlineMode ? "Connecting to online server…" : "Creating session…").font(.headline)
+                case .playing(let toMove, let inCheck):
+                    if vm.isOnlineMode, toMove == vm.onlineYourColor {
+                        Text("Your move").font(.headline.bold())
+                    } else if vm.isOnlineMode {
+                        Text("Opponent to move").font(.headline)
+                    } else {
+                        Text(toMove == "w" ? "White to move" : "Black to move").font(.headline)
+                    }
+                    if inCheck {
+                        Text("— Check!").font(.headline).foregroundColor(.red)
+                    }
+                case .checkmated(let winner):
+                    Text("Checkmate! \(winner) wins").font(.headline)
+                case .drawn:
+                    Text("Game drawn").font(.headline)
+                case .resigned(let winner):
+                    Text((winner == "White" ? "Black" : "White") + " resigns").font(.headline)
+                case .forfeited(let winner):
+                    Text((winner == "White" ? "Black" : "White") + " forfeits").font(.headline)
+                case .timedOut(let winner):
+                    Text((winner == "White" ? "Black" : "White") + " ran out of time").font(.headline)
+                case .failed:
+                    Text("Game unavailable").font(.headline).foregroundColor(.red)
+                }
+            }
+            Spacer()
+        }
+    }
+}
+
+struct ClockRowView: View {
+    @ObservedObject var vm: GameViewModel
+
+    var body: some View {
+        if let clock = vm.onlineClock {
+            TimelineView(.periodic(from: .now, by: 0.1)) { context in
+                let white = clock.remaining(for: "w", now: context.date)
+                let black = clock.remaining(for: "b", now: context.date)
+                let topColor = vm.boardOrientation == 0 ? "Black" : "White"
+                let bottomColor = vm.boardOrientation == 0 ? "White" : "Black"
+                HStack(spacing: 8) {
+                    ClockCellView(color: topColor,
+                                 milliseconds: topColor == "White" ? white : black,
+                                 active: clock.isRunning && clock.sideToMove == (topColor == "White" ? "w" : "b"))
+                    Spacer()
+                    Text(vm.onlineTimeControl)
+                        .font(.caption.monospaced())
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    ClockCellView(color: bottomColor,
+                                 milliseconds: bottomColor == "White" ? white : black,
+                                 active: clock.isRunning && clock.sideToMove == (bottomColor == "White" ? "w" : "b"))
+                }
+                .frame(height: 34)
+            }
+        }
+    }
+}
+
+struct ClockCellView: View {
+    let color: String
+    let milliseconds: Int
+    let active: Bool
+
+    var body: some View {
+        let low = milliseconds <= 10_000
+        return VStack(spacing: 0) {
+            Text(color).font(.caption2).foregroundColor(.secondary)
+            Text(OnlineClock.format(milliseconds)).font(.headline.monospacedDigit()).foregroundColor(low ? .red : .primary)
+        }
+        .frame(minWidth: 74)
+        .padding(.vertical, 2)
+        .background(RoundedRectangle(cornerRadius: 8).fill(active ? Color.accentColor.opacity(0.18) : Color.clear))
+    }
+}
+
+struct WaitingBannerView: View {
+    let code: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Room code").font(.caption).foregroundColor(.secondary)
+                Text(code).font(.title3.monospaced().bold())
+            }
+            Spacer()
+            Button("Copy") {
+                UIPasteboard.general.string = code
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+struct MoveListView: View {
+    @ObservedObject var vm: GameViewModel
+
+    var body: some View {
+        if vm.moveList.isEmpty {
+            Text("No moves yet").font(.caption).foregroundColor(.secondary)
+        } else {
+            ScrollView {
+                LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], spacing: 4) {
+                    ForEach(Array(vm.moveList.enumerated()), id: \.offset) { index, uci in
+                        HStack(spacing: 4) {
+                            if index.isMultiple(of: 2) {
+                                Text("\(index / 2 + 1).").font(.caption.monospacedDigit())
+                            }
+                            Text(uci).font(.caption.monospaced())
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 96)
+        }
+    }
+}
+
+struct ControlsView: View {
+    @ObservedObject var vm: GameViewModel
+    @State private var showNewGameSheet = false
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if let error = vm.errorMessage {
+                Text(error).font(.footnote).foregroundColor(.red)
+            }
+            HStack(spacing: 8) {
+                Button(action: { vm.undo() }) {
+                    Label("Undo", systemImage: "arrow.uturn.backward").frame(maxWidth: .infinity)
+                }.disabled(!vm.canUndo).buttonStyle(.bordered)
+
+                Button(action: { vm.resign() }) {
+                    Label("Resign", systemImage: "flag").frame(maxWidth: .infinity)
+                }.disabled(!vm.canResign).buttonStyle(.bordered)
+
+                Button(action: { vm.flipBoard() }) {
+                    Label("Flip board", systemImage: "arrow.up.arrow.down").frame(maxWidth: .infinity)
+                }.buttonStyle(.bordered)
+            }
+            Button(action: { showNewGameSheet = true }) {
+                Label("New game", systemImage: "arrow.counterclockwise").frame(maxWidth: .infinity)
+            }.buttonStyle(.borderedProminent).disabled(!vm.canStartNewGame)
+        }
+        .alert("Game over", isPresented: $vm.showGameEndDialog) {
+            if !vm.isOnlineMode {
+                Button("Play again") { vm.restart() }
+            }
+            Button("Done", role: .cancel) { vm.dismissGameEnd() }
+        } message: {
+            Text(vm.gameEndMessage ?? "The game is over.")
         }
     }
 }

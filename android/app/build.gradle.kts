@@ -57,6 +57,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.activity:activity-compose:1.9.0")
+    implementation("androidx.navigation:navigation-compose:2.7.7")
     // CPU move computation (milestone 3) runs off the main thread via
     // Dispatchers.Default and applies on the main dispatcher.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

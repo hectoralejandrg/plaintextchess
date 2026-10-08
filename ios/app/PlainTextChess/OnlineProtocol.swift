@@ -206,8 +206,18 @@ enum OnlineErrorCode: String, Codable, Equatable, CaseIterable {
     case gameOver = "game_over"
     case notConnected = "not_connected"
     case forfeit = "forfeit"
+    /// Authentication codes (add-auth-ui-clients); the client must know them
+    /// or an auth error frame would fail to decode and drop the connection.
+    case usernameTaken = "username_taken"
+    case invalidCredentials = "invalid_credentials"
+    case notAuthenticated = "not_authenticated"
+    case sessionExpired = "session_expired"
+    case invalidRequest = "invalid_request"
+    case invalidDisplayName = "invalid_display_name"
 
-    /// Human-readable fallback when the server's message is missing.
+    /// Human-readable fallback when the server's message is missing. The auth
+    /// entries mirror the server's texts (`ErrorCode::message`), so a refused
+    /// login shows the same generic message the spec pins.
     var displayMessage: String {
         switch self {
         case .roomNotFound:
@@ -228,6 +238,18 @@ enum OnlineErrorCode: String, Codable, Equatable, CaseIterable {
             return "The game has not started yet"
         case .forfeit:
             return "The opponent did not reconnect in time"
+        case .usernameTaken:
+            return "That username is already registered"
+        case .invalidCredentials:
+            return "That username and password do not match an account"
+        case .notAuthenticated:
+            return "This connection is not signed in"
+        case .sessionExpired:
+            return "This session has expired; log in again"
+        case .invalidRequest:
+            return "A field failed validation"
+        case .invalidDisplayName:
+            return "A display name must be 1 to 32 characters with no control characters"
         }
     }
 }
@@ -269,6 +291,10 @@ enum OnlineClientMessage: Codable, Equatable {
     case createRoom(playerID: String, timeControl: String?)
     case joinRoom(playerID: String, roomCode: String)
     case move(uci: String)
+    case register(username: String, password: String, deviceID: String?)
+    case login(username: String, password: String, deviceID: String?)
+    case logout(token: String)
+    case setProfile(token: String, displayName: String)
     case resign
     case leave
 
@@ -278,6 +304,11 @@ enum OnlineClientMessage: Codable, Equatable {
         case playerID = "player_id"
         case roomCode = "room_code"
         case timeControl = "time_control"
+        case username
+        case password
+        case token
+        case displayName = "display_name"
+        case deviceID = "device_id"
         case uci
     }
 
@@ -304,6 +335,23 @@ enum OnlineClientMessage: Codable, Equatable {
             self = .resign
         case "leave":
             self = .leave
+        case "register":
+            let username = try container.decode(String.self, forKey: .username)
+            let password = try container.decode(String.self, forKey: .password)
+            let deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID)
+            self = .register(username: username, password: password, deviceID: deviceID)
+        case "login":
+            let username = try container.decode(String.self, forKey: .username)
+            let password = try container.decode(String.self, forKey: .password)
+            let deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID)
+            self = .login(username: username, password: password, deviceID: deviceID)
+        case "logout":
+            let token = try container.decode(String.self, forKey: .token)
+            self = .logout(token: token)
+        case "set_profile":
+            let token = try container.decode(String.self, forKey: .token)
+            let displayName = try container.decode(String.self, forKey: .displayName)
+            self = .setProfile(token: token, displayName: displayName)
         default:
             throw OnlineProtocolError.unknownMessageType(type)
         }
@@ -330,6 +378,27 @@ enum OnlineClientMessage: Codable, Equatable {
             try container.encode("resign", forKey: .type)
         case .leave:
             try container.encode("leave", forKey: .type)
+        case .register(let username, let password, let deviceID):
+            try container.encode("register", forKey: .type)
+            try container.encode(username, forKey: .username)
+            try container.encode(password, forKey: .password)
+            if let deviceID {
+                try container.encode(deviceID, forKey: .deviceID)
+            }
+        case .login(let username, let password, let deviceID):
+            try container.encode("login", forKey: .type)
+            try container.encode(username, forKey: .username)
+            try container.encode(password, forKey: .password)
+            if let deviceID {
+                try container.encode(deviceID, forKey: .deviceID)
+            }
+        case .logout(let token):
+            try container.encode("logout", forKey: .type)
+            try container.encode(token, forKey: .token)
+        case .setProfile(let token, let displayName):
+            try container.encode("set_profile", forKey: .type)
+            try container.encode(token, forKey: .token)
+            try container.encode(displayName, forKey: .displayName)
         }
     }
 }
@@ -342,6 +411,9 @@ enum OnlineServerMessage: Codable, Equatable {
     case state(OnlineState)
     /// Structured business-rule error (the connection stays open).
     case error(code: OnlineErrorCode, message: String)
+    case session(token: String)
+    case profileUpdated
+    case sessionOk
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -351,6 +423,7 @@ enum OnlineServerMessage: Codable, Equatable {
         case state
         case code
         case message
+        case token
     }
 
     init(from decoder: Decoder) throws {
@@ -373,6 +446,13 @@ enum OnlineServerMessage: Codable, Equatable {
             let code = try container.decode(OnlineErrorCode.self, forKey: .code)
             let message = try container.decode(String.self, forKey: .message)
             self = .error(code: code, message: message)
+        case "session":
+            let token = try container.decode(String.self, forKey: .token)
+            self = .session(token: token)
+        case "profile_updated":
+            self = .profileUpdated
+        case "session_ok":
+            self = .sessionOk
         default:
             throw OnlineProtocolError.unknownMessageType(type)
         }
@@ -394,6 +474,13 @@ enum OnlineServerMessage: Codable, Equatable {
             try container.encode("error", forKey: .type)
             try container.encode(code, forKey: .code)
             try container.encode(message, forKey: .message)
+        case .session(let token):
+            try container.encode("session", forKey: .type)
+            try container.encode(token, forKey: .token)
+        case .profileUpdated:
+            try container.encode("profile_updated", forKey: .type)
+        case .sessionOk:
+            try container.encode("session_ok", forKey: .type)
         }
     }
 }

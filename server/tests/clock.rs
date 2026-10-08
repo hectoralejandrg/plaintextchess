@@ -32,7 +32,7 @@ fn send_move(conn: &Conn, uci: &str) {
     send(
         conn,
         RoomMsg::Move {
-            player_id: conn.player_id.clone(),
+            identity: conn.identity.clone(),
             uci: uci.to_string(),
         },
     );
@@ -42,7 +42,7 @@ fn detach(conn: &Conn) {
     send(
         conn,
         RoomMsg::Detach {
-            player_id: conn.player_id.clone(),
+            identity: conn.identity.clone(),
         },
     );
 }

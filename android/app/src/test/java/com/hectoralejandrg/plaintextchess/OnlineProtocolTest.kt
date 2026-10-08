@@ -83,6 +83,55 @@ class OnlineProtocolTest {
         }
     }
 
+    // MARK: - Auth wire forms (add-auth-ui-clients)
+
+    @Test
+    fun clientRegisterAndLoginWireForms() {
+        for ((json, expectedType) in listOf(
+            OnlineCodec.encodeRegister("alice", "correct horse") to "register",
+            OnlineCodec.encodeLogin("alice", "correct horse") to "login",
+        )) {
+            val obj = JSONObject(json)
+            assertEquals(expectedType, obj.getString("type"))
+            assertEquals(1, obj.getInt("v"))
+            assertEquals("alice", obj.getString("username"))
+            assertEquals("correct horse", obj.getString("password"))
+            assertFalse("an unknown device must be absent, not null", obj.has("device_id"))
+        }
+    }
+
+    @Test
+    fun clientRegisterAndLoginCarryTheDeviceID() {
+        for (json in listOf(
+            OnlineCodec.encodeRegister("alice", "pw12345678", "device-9"),
+            OnlineCodec.encodeLogin("alice", "pw12345678", "device-9"),
+        )) {
+            assertEquals("device-9", JSONObject(json).getString("device_id"))
+        }
+    }
+
+    @Test
+    fun serverSessionDecodesTheToken() {
+        val session = ServerMessage.decode("""{"v":1,"type":"session","token":"tok_abc"}""")
+        assertEquals("tok_abc", (session as ServerMessage.Session).token)
+    }
+
+    @Test
+    fun invalidCredentialsCarriesTheGenericMessage() {
+        // The generic message must not reveal which half was wrong (spec
+        // "Login and Session Issuance") and matches the server + iOS clients.
+        assertEquals(
+            "That username and password do not match an account",
+            OnlineErrorCode.INVALID_CREDENTIALS.displayMessage,
+        )
+        val error = ServerMessage.decode(
+            """{"v":1,"type":"error","code":"invalid_credentials","message":"""" +
+                """That username and password do not match an account"}""",
+        ) as ServerMessage.Error
+        assertEquals("invalid_credentials", error.code)
+        assertEquals(OnlineErrorCode.INVALID_CREDENTIALS.displayMessage, error.message)
+    }
+
     // MARK: - Server messages
 
     @Test

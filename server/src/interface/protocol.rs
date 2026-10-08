@@ -83,6 +83,27 @@ pub enum ErrorCode {
     GameOver,
     NotConnected,
     Forfeit,
+    /// The username is taken, compared case-insensitively (spec "Player
+    /// Account Registration").
+    UsernameTaken,
+    /// The username does not exist or the password is wrong. One code and one
+    /// message for both, so a caller cannot learn which usernames are
+    /// registered (spec "Login and Session Issuance").
+    InvalidCredentials,
+    /// The connection has no usable session (spec "Authentication Wire
+    /// Messages").
+    NotAuthenticated,
+    /// The presented session's lifetime has elapsed. Distinct from
+    /// `NotAuthenticated` because the client is told the difference between
+    /// "never signed in" and "your sign-in aged out", and neither renews it
+    /// (spec "Session Lifetime, Reuse, and Revocation").
+    SessionExpired,
+    /// A field failed its format check. The message names the offending field
+    /// (spec "Player Account Registration", "Profile Display Name").
+    InvalidRequest,
+    /// The display name is outside 1 to 32 trimmed characters or contains a
+    /// control character (spec "Profile Display Name").
+    InvalidDisplayName,
 }
 
 impl ErrorCode {
@@ -97,8 +118,20 @@ impl ErrorCode {
             ErrorCode::GameOver => "game_over",
             ErrorCode::NotConnected => "not_connected",
             ErrorCode::Forfeit => "forfeit",
+            ErrorCode::UsernameTaken => "username_taken",
+            ErrorCode::InvalidCredentials => "invalid_credentials",
+            ErrorCode::NotAuthenticated => "not_authenticated",
+            ErrorCode::SessionExpired => "session_expired",
+            ErrorCode::InvalidRequest => "invalid_request",
+            ErrorCode::InvalidDisplayName => "invalid_display_name",
         }
     }
+
+    /// The generic credential-failure message. Deliberately says nothing about
+    /// which half of the credential pair was wrong, and reveals nothing about
+    /// whether the username exists (spec "Login and Session Issuance").
+    pub const GENERIC_CREDENTIAL_MESSAGE: &'static str =
+        "That username and password do not match an account";
 
     pub fn message(&self) -> &'static str {
         match self {
@@ -111,6 +144,25 @@ impl ErrorCode {
             ErrorCode::GameOver => "The game is already over",
             ErrorCode::NotConnected => "The game has not started yet",
             ErrorCode::Forfeit => "The opponent did not reconnect in time",
+            ErrorCode::UsernameTaken => "That username is already registered",
+            ErrorCode::InvalidCredentials => Self::GENERIC_CREDENTIAL_MESSAGE,
+            ErrorCode::NotAuthenticated => "This connection is not signed in",
+            ErrorCode::SessionExpired => "This session has expired; log in again",
+            ErrorCode::InvalidRequest => "A field failed validation",
+            ErrorCode::InvalidDisplayName => {
+                "A display name must be 1 to 32 characters with no control characters"
+            }
+        }
+    }
+
+    /// An error with a custom message, for the validation codes whose whole
+    /// job is to say which field and why (spec "a validation error naming the
+    /// offending field").
+    pub fn with_message(self, message: impl Into<String>) -> ServerMessage {
+        ServerMessage::Error {
+            v: VERSION,
+            code: self.as_str().to_string(),
+            message: message.into(),
         }
     }
 }
@@ -125,11 +177,21 @@ pub enum ClientMessage {
         /// means the default control, so older clients keep working.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         time_control: Option<String>,
+        /// A session token stored from an earlier login (spec "Guest Play
+        /// Fallback"): present resolves the connection to its account,
+        /// absent leaves it a guest. Optional so a client that never
+        /// authenticates sends nothing and behaves exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     JoinRoom {
         v: u32,
         player_id: String,
         room_code: String,
+        /// A stored session token, with the same meaning as on
+        /// `CreateRoom`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     Move {
         v: u32,
@@ -141,6 +203,45 @@ pub enum ClientMessage {
     Leave {
         v: u32,
     },
+    /// Create an account and sign in to it (spec "Player Account
+    /// Registration").
+    Register {
+        v: u32,
+        username: String,
+        password: String,
+        /// The device to bind to the new account (spec "Device-to-Account
+        /// Profile Linkage"). Optional: absent, the device is bound by the
+        /// first `create_room`/`join_room` that carries this connection's
+        /// token, so a client that authenticates before choosing a device id
+        /// still ends up linked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
+    },
+    /// Exchange a username and password for a session (spec "Login and
+    /// Session Issuance").
+    Login {
+        v: u32,
+        username: String,
+        password: String,
+        /// The device to bind to the account, with the same meaning and the
+        /// same fallback as on `Register`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
+    },
+    /// Revoke the presented session, and only it (spec "Session Lifetime,
+    /// Reuse, and Revocation"). The device-to-account link survives.
+    Logout {
+        v: u32,
+        token: String,
+    },
+    /// Set the account's display name (spec "Profile Display Name").
+    SetProfile {
+        v: u32,
+        display_name: String,
+        /// The session being used; a display-name change is
+        /// authenticated-only.
+        token: String,
+    },
 }
 
 impl ClientMessage {
@@ -150,7 +251,11 @@ impl ClientMessage {
             | ClientMessage::JoinRoom { v, .. }
             | ClientMessage::Move { v, .. }
             | ClientMessage::Resign { v }
-            | ClientMessage::Leave { v } => *v,
+            | ClientMessage::Leave { v }
+            | ClientMessage::Register { v, .. }
+            | ClientMessage::Login { v, .. }
+            | ClientMessage::Logout { v, .. }
+            | ClientMessage::SetProfile { v, .. } => *v,
         }
     }
 }
@@ -173,6 +278,34 @@ pub enum ServerMessage {
         v: u32,
         code: String,
         message: String,
+    },
+    /// A newly issued session (spec "Login and Session Issuance"). Carries
+    /// the token exactly once: the server stores only its hash, so this
+    /// response is the sole chance to hand it to the client.
+    Session {
+        v: u32,
+        account_id: String,
+        username: String,
+        /// The account's display name, defaulting to the username.
+        display_name: String,
+        token: String,
+        expires_at_ms: i64,
+    },
+    /// A session that ended without a replacement (spec "Session Lifetime,
+    /// Reuse, and Revocation"). Carries no token so a client cannot mistake
+    /// it for a fresh sign-in.
+    SessionOk {
+        v: u32,
+        account_id: String,
+        username: String,
+        display_name: String,
+        expires_at_ms: i64,
+    },
+    /// The account's new display name (spec "Profile Display Name").
+    ProfileUpdated {
+        v: u32,
+        account_id: String,
+        display_name: String,
     },
 }
 
@@ -197,6 +330,7 @@ pub enum DecodeError {
 
 const KNOWN_TYPES: &[&str] = &[
     "create_room", "join_room", "move", "resign", "leave",
+    "register", "login", "logout", "set_profile",
 ];
 
 /// Decode one incoming text frame. Business rules (turn, legality, room
@@ -231,16 +365,19 @@ mod tests {
                 v: VERSION,
                 player_id: "p1".into(),
                 time_control: Some("15+10".into()),
+                token: None,
             },
             ClientMessage::CreateRoom {
                 v: VERSION,
                 player_id: "p2".into(),
                 time_control: None,
+                token: None,
             },
             ClientMessage::JoinRoom {
                 v: VERSION,
                 player_id: "p2".into(),
                 room_code: "AB23CD".into(),
+                token: None,
             },
             ClientMessage::Move {
                 v: VERSION,
@@ -256,6 +393,43 @@ mod tests {
             let json = serde_json::to_string(&message).unwrap();
             let back = decode_incoming(&json).unwrap();
             assert_eq!(back, message);
+        }
+    }
+
+    /// The authentication messages round-trip too (design D11).
+    #[test]
+    fn auth_client_messages_round_trip() {
+        for message in [
+            ClientMessage::Register {
+                v: VERSION,
+                username: "Ana".into(),
+                password: "correct horse battery".into(),
+                device_id: Some("device-a".into()),
+            },
+            ClientMessage::Register {
+                v: VERSION,
+                username: "Bob".into(),
+                password: "correct horse battery".into(),
+                device_id: None,
+            },
+            ClientMessage::Login {
+                v: VERSION,
+                username: "Ana".into(),
+                password: "correct horse battery".into(),
+                device_id: None,
+            },
+            ClientMessage::Logout {
+                v: VERSION,
+                token: "a-token".into(),
+            },
+            ClientMessage::SetProfile {
+                v: VERSION,
+                display_name: "Ana T.".into(),
+                token: "a-token".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&message).unwrap();
+            assert_eq!(decode_incoming(&json).unwrap(), message);
         }
     }
 
@@ -286,6 +460,26 @@ mod tests {
                 state: state.clone(),
             },
             ServerMessage::error(ErrorCode::NotYourTurn),
+            ServerMessage::Session {
+                v: VERSION,
+                account_id: "account-1".into(),
+                username: "Ana".into(),
+                display_name: "Ana".into(),
+                token: "a-token".into(),
+                expires_at_ms: 1_700_000_000_000,
+            },
+            ServerMessage::SessionOk {
+                v: VERSION,
+                account_id: "account-1".into(),
+                username: "Ana".into(),
+                display_name: "Ana T.".into(),
+                expires_at_ms: 1_700_000_000_000,
+            },
+            ServerMessage::ProfileUpdated {
+                v: VERSION,
+                account_id: "account-1".into(),
+                display_name: "Ana T.".into(),
+            },
         ] {
             let json = serde_json::to_string(&message).unwrap();
             let back: ServerMessage = serde_json::from_str(&json).unwrap();
@@ -316,6 +510,102 @@ mod tests {
         );
     }
 
+    /// Every authentication message type decodes, and a type the server does
+    /// not know is still refused with 4000 rather than silently ignored
+    /// (task 5.3).
+    #[test]
+    fn the_auth_message_types_decode_and_unknown_types_are_still_refused() {
+        assert_eq!(
+            decode_incoming(r#"{"type":"register","v":1,"username":"Ana","password":"passw0rd"}"#),
+            Ok(ClientMessage::Register {
+                v: VERSION,
+                username: "Ana".into(),
+                password: "passw0rd".into(),
+                device_id: None,
+            })
+        );
+        assert_eq!(
+            decode_incoming(
+                r#"{"type":"login","v":1,"username":"Ana","password":"passw0rd","device_id":"d1"}"#
+            ),
+            Ok(ClientMessage::Login {
+                v: VERSION,
+                username: "Ana".into(),
+                password: "passw0rd".into(),
+                device_id: Some("d1".into()),
+            })
+        );
+        assert_eq!(
+            decode_incoming(r#"{"type":"logout","v":1,"token":"t"}"#),
+            Ok(ClientMessage::Logout {
+                v: VERSION,
+                token: "t".into(),
+            })
+        );
+        assert_eq!(
+            decode_incoming(
+                r#"{"type":"set_profile","v":1,"display_name":"Ana T.","token":"t"}"#
+            ),
+            Ok(ClientMessage::SetProfile {
+                v: VERSION,
+                display_name: "Ana T.".into(),
+                token: "t".into(),
+            })
+        );
+
+        // Still refused: an unknown type, and a bad version on a new type.
+        assert_eq!(
+            decode_incoming(r#"{"type":"sign_in","v":1,"username":"Ana"}"#),
+            Err(DecodeError::UnknownType),
+            "`sign_in` is not a type this protocol speaks"
+        );
+        assert_eq!(
+            decode_incoming(r#"{"type":"login","v":2,"username":"Ana","password":"passw0rd"}"#),
+            Err(DecodeError::UnsupportedVersion),
+            "the new types obey the version check like every other message"
+        );
+        assert_eq!(
+            decode_incoming(r#"{"type":"login","v":1,"username":"Ana"}"#),
+            Err(DecodeError::Malformed),
+            "a login without a password is malformed"
+        );
+    }
+
+    /// An unknown username and a wrong password are indistinguishable on the
+    /// wire: same code, same message (spec "Login and Session Issuance").
+    #[test]
+    fn a_credential_failure_is_the_same_wire_message_every_time() {
+        let unknown_username = ServerMessage::error(ErrorCode::InvalidCredentials);
+        let wrong_password = ServerMessage::error(ErrorCode::InvalidCredentials);
+        assert_eq!(unknown_username, wrong_password);
+
+        let value: serde_json::Value = serde_json::to_value(&unknown_username).unwrap();
+        assert_eq!(value["code"], "invalid_credentials");
+        assert_eq!(
+            value["message"],
+            ErrorCode::GENERIC_CREDENTIAL_MESSAGE,
+            "the message must not hint at which half was wrong"
+        );
+        let generic = ErrorCode::GENERIC_CREDENTIAL_MESSAGE.to_lowercase();
+        for word in ["username", "taken", "exists", "password", "wrong"] {
+            assert!(
+                !generic.contains(&format!("{word} is"))
+                    && !generic.contains(&format!("no such {word}"))
+                    && !generic.contains(&format!("incorrect {word}"))
+                    && !generic.contains(&format!("wrong {word}")),
+                "the generic message must not disclose which field failed: {generic}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_validation_error_carries_its_own_message() {
+        let message = ErrorCode::InvalidRequest.with_message("username must be 3 to 24 characters");
+        let value: serde_json::Value = serde_json::to_value(&message).unwrap();
+        assert_eq!(value["code"], "invalid_request");
+        assert_eq!(value["message"], "username must be 3 to 24 characters");
+    }
+
     /// Pins the exact JSON shape of the wire format (the iOS/Android codecs
     /// are written against these field names, so a change here is a protocol
     /// change and must fail this test).
@@ -327,6 +617,7 @@ mod tests {
                 v: VERSION,
                 player_id: "p1".into(),
                 time_control: Some("15+10".into()),
+                token: None,
             })
             .unwrap();
         assert_eq!(value["type"], "create_room");
@@ -341,19 +632,97 @@ mod tests {
                 v: VERSION,
                 player_id: "p2".into(),
                 time_control: None,
+                token: None,
             })
             .unwrap();
         assert!(value.get("time_control").is_none());
+
+        // Same rule for the token: absent means "guest", and the field is
+        // omitted rather than sent as null, so a client built before
+        // authentication existed produces a byte-identical frame.
+        assert!(
+            value.get("token").is_none(),
+            "a guest must not have to send a token field at all"
+        );
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::CreateRoom {
+                v: VERSION,
+                player_id: "p3".into(),
+                time_control: None,
+                token: Some("a-token".into()),
+            })
+            .unwrap();
+        assert_eq!(value["token"], "a-token");
 
         let value: serde_json::Value =
             serde_json::to_value(&ClientMessage::JoinRoom {
                 v: VERSION,
                 player_id: "p2".into(),
                 room_code: "AB23CD".into(),
+                token: None,
             })
             .unwrap();
         assert_eq!(value["type"], "join_room");
         assert_eq!(value["room_code"], "AB23CD");
+        assert!(value.get("token").is_none());
+
+        // Authentication messages: `type` tag + `v` + fields, inline.
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::Register {
+                v: VERSION,
+                username: "Ana".into(),
+                password: "correct horse battery".into(),
+                device_id: Some("device-a".into()),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "register");
+        assert_eq!(value["username"], "Ana");
+        assert_eq!(value["password"], "correct horse battery");
+        assert_eq!(value["device_id"], "device-a");
+
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::Register {
+                v: VERSION,
+                username: "Ana".into(),
+                password: "correct horse battery".into(),
+                device_id: None,
+            })
+            .unwrap();
+        assert!(
+            value.get("device_id").is_none(),
+            "the device is optional: a client that has not chosen one omits it"
+        );
+
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::Login {
+                v: VERSION,
+                username: "Ana".into(),
+                password: "correct horse battery".into(),
+                device_id: Some("device-a".into()),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "login");
+        assert_eq!(value["username"], "Ana");
+        assert_eq!(value["device_id"], "device-a");
+
+        let value: serde_json::Value = serde_json::to_value(&ClientMessage::Logout {
+            v: VERSION,
+            token: "a-token".into(),
+        })
+        .unwrap();
+        assert_eq!(value["type"], "logout");
+        assert_eq!(value["token"], "a-token");
+
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::SetProfile {
+                v: VERSION,
+                display_name: "Ana T.".into(),
+                token: "a-token".into(),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "set_profile");
+        assert_eq!(value["display_name"], "Ana T.");
+        assert_eq!(value["token"], "a-token");
 
         let value: serde_json::Value =
             serde_json::to_value(&ClientMessage::Move {
@@ -454,6 +823,49 @@ mod tests {
         assert_eq!(value["type"], "error");
         assert_eq!(value["code"], "room_full");
         assert!(value["message"].is_string());
+
+        // The issued session is the only place a token appears, so its wire
+        // form is pinned here like every other shape.
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::Session {
+            v: VERSION,
+            account_id: "account-1".into(),
+            username: "Ana".into(),
+            display_name: "Ana".into(),
+            token: "a-token".into(),
+            expires_at_ms: 1_700_000_000_000i64,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "session");
+        assert_eq!(value["account_id"], "account-1");
+        assert_eq!(value["username"], "Ana");
+        assert_eq!(value["display_name"], "Ana");
+        assert_eq!(value["token"], "a-token");
+        assert_eq!(value["expires_at_ms"], 1_700_000_000_000i64);
+
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::SessionOk {
+            v: VERSION,
+            account_id: "account-1".into(),
+            username: "Ana".into(),
+            display_name: "Ana T.".into(),
+            expires_at_ms: 1_700_000_000_000i64,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "session_ok");
+        assert_eq!(value["display_name"], "Ana T.");
+        assert!(
+            value.get("token").is_none(),
+            "a logout must not look like a fresh sign-in"
+        );
+
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::ProfileUpdated {
+            v: VERSION,
+            account_id: "account-1".into(),
+            display_name: "Ana T.".into(),
+        })
+        .unwrap();
+        assert_eq!(value["type"], "profile_updated");
+        assert_eq!(value["account_id"], "account-1");
+        assert_eq!(value["display_name"], "Ana T.");
     }
 
     #[test]
@@ -468,10 +880,59 @@ mod tests {
             ErrorCode::GameOver,
             ErrorCode::NotConnected,
             ErrorCode::Forfeit,
+            ErrorCode::UsernameTaken,
+            ErrorCode::InvalidCredentials,
+            ErrorCode::NotAuthenticated,
+            ErrorCode::SessionExpired,
+            ErrorCode::InvalidRequest,
+            ErrorCode::InvalidDisplayName,
         ] {
             let message = ServerMessage::error(code);
             let json = serde_json::to_string(&message).unwrap();
             assert!(json.contains(format!(r#""code":"{}""#, code.as_str()).as_str()));
+        }
+    }
+
+    /// The protocol version did not move (design D11): a bump would close
+    /// every deployed socket with 4000, so authentication had to be purely
+    /// additive.
+    #[test]
+    fn the_protocol_version_is_unchanged() {
+        assert_eq!(VERSION, 1);
+        for json in [
+            r#"{"type":"create_room","v":1,"player_id":"p"}"#,
+            r#"{"type":"join_room","v":1,"player_id":"p","room_code":"AB23CD"}"#,
+            r#"{"type":"move","v":1,"uci":"e2e4"}"#,
+            r#"{"type":"resign","v":1}"#,
+            r#"{"type":"leave","v":1}"#,
+            r#"{"type":"register","v":1,"username":"Ana","password":"passw0rd"}"#,
+            r#"{"type":"login","v":1,"username":"Ana","password":"passw0rd"}"#,
+            r#"{"type":"logout","v":1,"token":"t"}"#,
+            r#"{"type":"set_profile","v":1,"display_name":"Ana","token":"t"}"#,
+        ] {
+            assert!(
+                decode_incoming(json).is_ok(),
+                "`{json}` must decode at the current version"
+            );
+        }
+    }
+
+    /// A client that never authenticates sends exactly the frames it sent
+    /// before (spec scenario "Existing clients are unaffected").
+    #[test]
+    fn a_guest_only_client_sends_the_pre_existing_frames() {
+        for json in [
+            r#"{"type":"create_room","v":1,"player_id":"p1","time_control":"15+10"}"#,
+            r#"{"type":"create_room","v":1,"player_id":"p1"}"#,
+            r#"{"type":"join_room","v":1,"player_id":"p2","room_code":"AB23CD"}"#,
+            r#"{"type":"move","v":1,"uci":"e2e4"}"#,
+            r#"{"type":"resign","v":1}"#,
+            r#"{"type":"leave","v":1}"#,
+        ] {
+            assert!(
+                decode_incoming(json).is_ok(),
+                "`{json}` decoded before authentication and must still decode"
+            );
         }
     }
 }

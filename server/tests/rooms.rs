@@ -22,7 +22,7 @@ fn send_move(conn: &Conn, uci: &str) {
     send(
         conn,
         RoomMsg::Move {
-            player_id: conn.player_id.clone(),
+            identity: conn.identity.clone(),
             uci: uci.to_string(),
         },
     );
@@ -32,7 +32,7 @@ fn send_resign(conn: &Conn) {
     send(
         conn,
         RoomMsg::Resign {
-            player_id: conn.player_id.clone(),
+            identity: conn.identity.clone(),
         },
     );
 }
@@ -41,7 +41,7 @@ fn send_leave(conn: &Conn) {
     send(
         conn,
         RoomMsg::Leave {
-            player_id: conn.player_id.clone(),
+            identity: conn.identity.clone(),
         },
     );
 }
@@ -50,7 +50,7 @@ fn send_detach(conn: &Conn) {
     send(
         conn,
         RoomMsg::Detach {
-            player_id: conn.player_id.clone(),
+            identity: conn.identity.clone(),
         },
     );
 }

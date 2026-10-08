@@ -41,6 +41,11 @@ final class OnlineConnectionManager: ObservableObject {
     var onError: ((OnlineErrorCode, String) -> Void)?
     /// Phase changes (the view model mirrors these into its own state).
     var onPhase: ((OnlinePhase) -> Void)?
+    /// Auth result (add-auth-ui-clients): `true` carries the token issued by
+    /// register/login (`nil` for a logout/profile confirmation); `false`
+    /// carries the server's error message (e.g. the generic
+    /// `invalid_credentials` text).
+    var onAuthResult: ((Bool, String?) -> Void)?
 
     /// Server reconnect window: the server's default grace is 120 s, so we
     /// keep retrying a little past it before giving up.
@@ -57,6 +62,12 @@ final class OnlineConnectionManager: ObservableObject {
     private var retryWorkItem: DispatchWorkItem?
     private var retryBackoff: TimeInterval = 1
     private var retryDeadline: Date?
+    /// Session token issued by register/login; used for logout/set_profile.
+    private var token: String? = nil
+    /// True while a register/login (or later logout/set_profile) reply is
+    /// expected, so unrelated structured errors (e.g. a join failure) are
+    /// never reported as auth results.
+    private var awaitingAuthResult = false
 
     private enum PendingAction {
         case none
@@ -116,6 +127,47 @@ final class OnlineConnectionManager: ObservableObject {
         send(.leave)
     }
 
+    // MARK: - Auth (add-auth-ui-clients)
+
+    /// Open a plain connection with no room, so `register`/`login` can run
+    /// before any game. No `create_room`/`join_room` is sent: guest play
+    /// (`device_id`) and the seated-flag handshake stay untouched.
+    func startAuth() {
+        beginAttempt(phase: .connecting, action: .none, reconnect: false)
+    }
+
+    /// Send a register request; the reply arrives as `onAuthResult(true,
+    /// token)` or `onAuthResult(false, message)` (e.g. `username_taken`).
+    func startRegister(username: String, password: String) {
+        awaitingAuthResult = true
+        send(.register(username: username, password: password, deviceID: deviceID))
+    }
+
+    /// Send a login request; the reply arrives as `onAuthResult(true,
+    /// token)` or `onAuthResult(false, message)` (`invalid_credentials`
+    /// carries the server's generic message).
+    func startLogin(username: String, password: String) {
+        awaitingAuthResult = true
+        send(.login(username: username, password: password, deviceID: deviceID))
+    }
+
+    /// Send a logout request; the reply is `session_ok` → `onAuthResult(
+    /// true, nil)`. The server only revokes the token here: the socket is
+    /// kept open, so guest play can continue on this connection.
+    func startLogout(token: String) {
+        awaitingAuthResult = true
+        send(.logout(token: token))
+    }
+
+    /// Send a set_profile request; the reply is `profile_updated` →
+    /// `onAuthResult(true, nil)` or a refusal (`not_authenticated`,
+    /// `invalid_display_name`) → `onAuthResult(false, message)`. The token
+    /// is filled in from the manager's stored value.
+    func startSetProfile(displayName: String) {
+        awaitingAuthResult = true
+        send(.setProfile(token: "", displayName: displayName))
+    }
+
     /// Close the session and clear all state (the caller owns this manager
     /// from here on; callbacks stop).
     func teardown() {
@@ -123,6 +175,7 @@ final class OnlineConnectionManager: ObservableObject {
         retryWorkItem = nil
         retryDeadline = nil
         pendingAction = .none
+        awaitingAuthResult = false
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         activeGame = false
@@ -264,6 +317,28 @@ final class OnlineConnectionManager: ObservableObject {
                 // Transient in-game error: surface it, keep the session.
                 onError?(code, message)
             }
+            if awaitingAuthResult {
+                // A refused register/login (e.g. `invalid_credentials`):
+                // report the server's message and stop expecting a reply.
+                awaitingAuthResult = false
+                onAuthResult?(false, message)
+            }
+        case .session(let tokenStr):
+            self.token = tokenStr
+            if awaitingAuthResult {
+                awaitingAuthResult = false
+                onAuthResult?(true, tokenStr)
+            }
+        case .profileUpdated:
+            if awaitingAuthResult {
+                awaitingAuthResult = false
+                onAuthResult?(true, nil)
+            }
+        case .sessionOk:
+            if awaitingAuthResult {
+                awaitingAuthResult = false
+                onAuthResult?(true, nil)
+            }
         }
     }
 
@@ -323,7 +398,15 @@ final class OnlineConnectionManager: ObservableObject {
 
     private func send(_ message: OnlineClientMessage) {
         guard let task else { return }
-        guard let json = try? OnlineCodec.encodeClient(message) else { return }
+        let msgToSend: OnlineClientMessage = switch message {
+        case .logout(let token):
+            .logout(token: self.token ?? "")
+        case .setProfile(let token, let displayName):
+            .setProfile(token: self.token ?? "", displayName: displayName)
+        default:
+            message
+        }
+        guard let json = try? OnlineCodec.encodeClient(msgToSend) else { return }
         task.send(.string(json)) { [weak self] error in
             // A send failure surfaces as a drop in the receive loop; nothing
             // to do here besides not crashing on the error value.
@@ -341,6 +424,7 @@ final class OnlineConnectionManager: ObservableObject {
         task?.cancel(with: .normalClosure, reason: nil)
         task = nil
         pendingAction = .none
+        awaitingAuthResult = false
         activeGame = false
         reconnecting = false
         roomCode = nil

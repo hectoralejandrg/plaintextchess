@@ -180,7 +180,16 @@ enum class OnlineErrorCode(val code: String, val displayMessage: String) {
     ILLEGAL_MOVE("illegal_move", "That move is not legal in the current position"),
     GAME_OVER("game_over", "The game is already over"),
     NOT_CONNECTED("not_connected", "The game has not started yet"),
-    FORFEIT("forfeit", "The opponent did not reconnect in time");
+    FORFEIT("forfeit", "The opponent did not reconnect in time"),
+    USERNAME_TAKEN("username_taken", "That username is already registered"),
+    INVALID_CREDENTIALS("invalid_credentials", "That username and password do not match an account"),
+    NOT_AUTHENTICATED("not_authenticated", "This connection is not signed in"),
+    SESSION_EXPIRED("session_expired", "This session has expired; log in again"),
+    INVALID_REQUEST("invalid_request", "A field failed validation"),
+    INVALID_DISPLAY_NAME(
+        "invalid_display_name",
+        "A display name must be 1 to 32 characters with no control characters",
+    );
 
     companion object {
         /** Codes that end the join attempt instead of surfacing in-game:
@@ -219,6 +228,15 @@ sealed class ServerMessage {
     /** Structured business-rule error (the connection stays open). */
     data class Error(val code: String, val message: String) : ServerMessage()
 
+    /** Authentication session issued (register/login). */
+    data class Session(val token: String) : ServerMessage()
+
+    /** Profile display name updated (set_profile). */
+    data object ProfileUpdated : ServerMessage()
+
+    /** Session revoked (logout). */
+    data object SessionOk : ServerMessage()
+
     companion object {
         /** Decode one server JSON text frame; throws [OnlineProtocolError]
          * for malformed JSON, unknown types, or unsupported versions. */
@@ -242,6 +260,9 @@ sealed class ServerMessage {
                     )
                     "state" -> State(OnlineState.decode(root.getJSONObject("state")))
                     "error" -> Error(root.getString("code"), root.getString("message"))
+                    "session" -> Session(root.getString("token"))
+                    "profile_updated" -> ProfileUpdated
+                    "session_ok" -> SessionOk
                     else -> throw OnlineProtocolError.UnknownType(type)
                 }
             } catch (e: JSONException) {
@@ -280,6 +301,42 @@ object OnlineCodec {
 
     /** `{"v":1,"type":"leave"}` */
     fun encodeLeave(): String = base("leave").toString()
+
+    /** `{"v":1,"type":"register","username":"...","password":"...",` +
+     * `"device_id":"..."}` — `device_id` links the account to this device
+     * and is omitted only when unknown (spec "client links the device"). */
+    fun encodeRegister(username: String, password: String, deviceId: String? = null): String {
+        val message = base("register")
+            .put("username", username)
+            .put("password", password)
+        if (deviceId != null) {
+            message.put("device_id", deviceId)
+        }
+        return message.toString()
+    }
+
+    /** `{"v":1,"type":"login","username":"...","password":"...",` +
+     * `"device_id":"..."}` (same `device_id` rules as [encodeRegister]). */
+    fun encodeLogin(username: String, password: String, deviceId: String? = null): String {
+        val message = base("login")
+            .put("username", username)
+            .put("password", password)
+        if (deviceId != null) {
+            message.put("device_id", deviceId)
+        }
+        return message.toString()
+    }
+
+    /** `{"v":1,"type":"logout","token":"..."}` */
+    fun encodeLogout(token: String): String =
+        base("logout").put("token", token).toString()
+
+    /** `{"v":1,"type":"set_profile","token":"...","display_name":"..."}` */
+    fun encodeSetProfile(token: String, displayName: String): String =
+        base("set_profile")
+            .put("token", token)
+            .put("display_name", displayName)
+            .toString()
 
     private fun base(type: String): JSONObject =
         JSONObject().put("v", ONLINE_PROTOCOL_VERSION).put("type", type)

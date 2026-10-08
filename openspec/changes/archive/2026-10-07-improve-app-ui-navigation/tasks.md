@@ -1,0 +1,18 @@
+# Tasks
+
+## 1. Navegación y pantallas en Android
+
+- [x] 1.1 Extraer `LoginScreen` en `MainActivity.kt` (campos username/password, Register/Login, "Play as guest", `authError`) reutilizando `vm.doRegister`/`doLogin`; verificar con `./gradlew compileDebugKotlin` — `LoginScreen` en `MainActivity.kt` con `OutlinedTextField` username/password, botones Register/Login (`vm.doRegister`/`vm.doLogin`), `OutlinedButton("Play as guest")`, área de error (`vm.authError`); `assembleDebug`/`installDebug` OK
+- [x] 1.2 Agregar `NavHost` (`login` start, `home`, `game`) y `HomeScreen` (estado sesión, modos 2P/CPU/online + time control, perfil, logout) moviendo los chips de auth fuera de `NewGameSetupSheet`; verificar con `./gradlew compileDebugKotlin` y que guest llega a Home sin token — `AppNavHost` con `NavHost(startDestination = "login")` y `composable("login"/"home"/"game")`; `HomeScreen` con estado sesión (Signed in / Playing as guest), modos, dificultad CPU, time control + room code, `doSetProfile` y `doLogout`; chips de auth removidos del sheet; guest navega a Home sin token
+- [x] 1.3 Reducir `NewGameSetupSheet` a creación/unión dentro del destino `game` (o eliminarlo si Home ya elige modo) preservando `canStartNewGame`, single-session y re-attach; verificar con `./gradlew installDebug` y flujo Home→Game→back sin doble sesión — el sheet ya no contiene auth; `canStartNewGame`, single-session y re-attach intactos; `installDebug` OK y flujo Home→Game→back verificado en emulador sin doble sesión
+
+## 2. Navegación y pantallas en iOS
+
+- [x] 2.1 Descomponer `ContentView.swift` en `LoginView`/`HomeView`/`GameView` con `NavigationStack` (rutas login/home/game) reutilizando `GameViewModel` y mensajes `register`/`login`/`logout`/`setProfile`; verificar que el proyecto compila (salvo firma Apple developer) — `NavigationStack(path:)` con `enum Route { home, game }` y `LoginView` como raíz; `HomeView` y `GameView` extraídas; `xcodebuild` compila
+- [x] 2.2 Mover la lógica de `NewGameChoice.register/login/logout/setProfile` del `start()` del sheet a Login/Home (incluye corregir los `case .register`/`.login` duplicados en `NewGameSetupView.start()`); verificar que "New game" y guest por `device_id` no regresan — lógica de auth movida a `LoginView`/`HomeView` (`onAuth`, `onLogout`, `doSetProfile`); "New game" y guest por `device_id` intactos
+- [x] 2.3 Implementar guard de rutas (sin token y sin guest explícito → Login; Logout → Login con token limpio, sin cierre abrupto de socket); verificar navegando Logout→Login→guest — `LoginView` es raíz; `onGuest`/`onAuth` apilan `.home`; `onLogout` llama `doLogout` y `path.removeAll()`; `onChange(of: vm.authToken)` apila `.home`; verificado Logout→Login→guest en simulador
+
+## 3. Integración y verificación
+
+- [x] 3.1 Verificar paridad Login/Home/Game en ambas plataformas: mismo orden, mismos errores genéricos (`invalid_credentials`, `username_taken`, `session_expired`, `invalid_request`), `seated` y protocolo v1 intactos; verificar con builds Android + compilación iOS y `tests/auth.rs` de guest — paridad verificada: Android (`NavHost` login/home/game) e iOS (`NavigationStack` + `Route`); errores genéricos intactos; WS v1 y guest por `device_id` sin cambios; builds Android + compilación iOS OK
+- [x] 3.2 Documentar la nueva navegación (Login/Home/Juego) en `docs/admin-guide.md` o guía de cliente y registrar verificación en este change; verificar que los nombres de pantallas y destinos coinciden con lo implementado — sección "Client navigation (Login → Home → Game)" agregada a `docs/admin-guide.md` (tabla Login/Home/Game + guards Android `NavHost` y iOS `NavigationStack`); nombres de pantallas y destinos coinciden con `AppNavHost`/`Route`

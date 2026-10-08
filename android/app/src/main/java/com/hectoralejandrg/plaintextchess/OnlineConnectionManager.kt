@@ -46,6 +46,9 @@ class OnlineConnectionManager(
     var onError: ((OnlineErrorCode?, String) -> Unit)? = null
     /** Phase changes (the view model mirrors these into its own state). */
     var onPhase: ((OnlinePhase) -> Unit)? = null
+    /** Auth result (add-auth-ui-clients): `true` carries the token on
+     * register/login success; `false` carries the error message. */
+    var onAuthResult: ((Boolean, String?) -> Unit)? = null
 
     @Volatile var phase: OnlinePhase = OnlinePhase.Idle
         private set
@@ -57,6 +60,11 @@ class OnlineConnectionManager(
         private set
     @Volatile var failureReason: String? = null
         private set
+
+    /** The current WebSocket (add-auth-ui-clients): the VM sends auth frames
+     * directly through it. */
+    val websocket: WebSocket?
+        get() = webSocket
 
     /** What the open socket should be told to do when it connects. */
     private sealed class PendingAction {
@@ -109,6 +117,36 @@ class OnlineConnectionManager(
     fun leave() {
         send(OnlineCodec.encodeLeave())
     }
+
+    // region Auth (add-auth-ui-clients)
+
+    /** Connect for an auth-only session (register/login): no room action on
+     * open, the server keeps the socket alive for the auth exchange. */
+    fun startAuth() {
+        beginAttempt(OnlinePhase.Connecting, PendingAction.None, reconnect = false)
+    }
+
+    /** Send a register request and wait for a "session" (token) or error. */
+    fun startRegister(username: String, password: String) {
+        send(OnlineCodec.encodeRegister(username, password, deviceID))
+    }
+
+    /** Send a login request and wait for a "session" (token) or error. */
+    fun startLogin(username: String, password: String) {
+        send(OnlineCodec.encodeLogin(username, password, deviceID))
+    }
+
+    /** Send a logout request and wait for "session_ok". */
+    fun startLogout(token: String) {
+        send(OnlineCodec.encodeLogout(token))
+    }
+
+    /** Send a set_profile request and wait for "profile_updated". */
+    fun startSetProfile(token: String, displayName: String) {
+        send(OnlineCodec.encodeSetProfile(token, displayName))
+    }
+
+    /** End region auth (add-auth-ui-clients) */
 
     /** Close the session and clear all state (the caller owns this manager
      * from here on; callbacks stop). */
@@ -261,6 +299,20 @@ class OnlineConnectionManager(
                     // Transient in-game error: surface it, keep the session.
                     onError?.invoke(code, message.message)
                 }
+                // Also inform auth consumers for register/login failures
+                onAuthResult?.invoke(false, message.message)
+            }
+            is ServerMessage.Session -> {
+                // register/login success: invoke auth callback with token
+                onAuthResult?.invoke(true, message.token)
+            }
+            is ServerMessage.ProfileUpdated -> {
+                // set_profile success
+                onAuthResult?.invoke(true, null)
+            }
+            is ServerMessage.SessionOk -> {
+                // logout success
+                onAuthResult?.invoke(true, null)
             }
         }
     }
@@ -341,6 +393,9 @@ class OnlineConnectionManager(
         failureReason = reason
         setPhase(OnlinePhase.Failed(reason))
         onError?.invoke(code, reason)
+        // An auth exchange in flight dies with the connection: report it so
+        // the sheet shows the failure instead of waiting forever (iOS parity).
+        onAuthResult?.invoke(false, reason)
     }
 
     companion object {

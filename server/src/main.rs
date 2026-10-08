@@ -1,7 +1,8 @@
 //! Entry point: bind from the environment (`BIND`, `PORT`,
-//! `RECONNECT_GRACE_SECS`), serve `GET /healthz` and the `/ws` WebSocket
-//! endpoint, and terminate cleanly on SIGTERM (spec: "Server Health and
-//! Configuration").
+//! `RECONNECT_GRACE_SECS`, `DATABASE_URL`, `SESSION_TTL_SECS`,
+//! `ARGON2_*`), initialize persistence (spec "Server Persistence"), serve
+//! `GET /healthz` and the `/ws` WebSocket endpoint, and terminate cleanly on
+//! SIGTERM (spec: "Server Health and Configuration").
 
 use std::future::{Future, IntoFuture};
 use std::sync::Arc;
@@ -16,8 +17,29 @@ async fn main() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
-    let config = Config::from_env();
-    let app = Arc::new(App::new(config.clone()));
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(err) => {
+            // Spec "Server Health and Configuration": a malformed or
+            // below-minimum authentication setting stops startup rather than
+            // silently running with weaker security.
+            tracing::error!(error = %err, "configuration is invalid; refusing to start");
+            std::process::exit(1);
+        }
+    };
+    let database_url = config.database_url.clone();
+    let app = match App::init(config.clone()).await {
+        Ok(app) => app,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                database = ?database_url,
+                "persistence initialization failed; refusing to start without a working database"
+            );
+            std::process::exit(1);
+        }
+    };
+    let app = Arc::new(app);
 
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await
@@ -26,6 +48,11 @@ async fn main() {
         bind = %config.bind,
         port = config.port,
         grace_secs = config.reconnect_grace.as_secs(),
+        database = ?database_url,
+        session_ttl_secs = config.session_ttl_secs,
+        argon2_memory_kib = config.argon2.memory_kib,
+        argon2_time_cost = config.argon2.time_cost,
+        argon2_parallelism = config.argon2.parallelism,
         "chess-server listening"
     );
 

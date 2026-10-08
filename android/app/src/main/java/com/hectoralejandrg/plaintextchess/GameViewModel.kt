@@ -86,6 +86,14 @@ enum class CpuDifficulty(val rawValue: Int, val displayName: String) {
     }
 }
 
+/** Choice of auth action shown in the new-game sheet (add-auth-ui-clients). */
+sealed class AuthChoice {
+    object Register : AuthChoice()
+    object Login : AuthChoice()
+    object SetProfile : AuthChoice()
+    object Logout : AuthChoice()
+}
+
 /**
  * Single source of truth for the Android game screen (design D4).
  *
@@ -185,6 +193,23 @@ class GameViewModel(private val context: Context) {
 
     /** The room's time control label from the last snapshot (lobby included). */
     var onlineTimeControl by mutableStateOf(OnlineTimeControl.default.label)
+        private set
+
+    /** Auth screen visibility (add-auth-ui-clients): when open, the setup
+     * sheet shows register/login choices instead of game options. */
+    var authMode by mutableStateOf<AuthChoice?>(null)
+        private set
+
+    /** The user's chosen display name after a successful set_profile. */
+    var userName by mutableStateOf<String?>(null)
+        private set
+
+    /** Auth errors shown inside the sheet (register/login failure). */
+    var authError by mutableStateOf<String?>(null)
+        private set
+
+    /** Protocol token after register/login; null while guest (device_id play). */
+    var authToken by mutableStateOf<String?>(null)
         private set
 
     private var online: OnlineConnectionManager? = null
@@ -793,6 +818,16 @@ class GameViewModel(private val context: Context) {
                 clearSelection()
             }
 
+            OnlineErrorCode.USERNAME_TAKEN,
+            OnlineErrorCode.INVALID_CREDENTIALS,
+            OnlineErrorCode.NOT_AUTHENTICATED,
+            OnlineErrorCode.SESSION_EXPIRED,
+            OnlineErrorCode.INVALID_REQUEST,
+            OnlineErrorCode.INVALID_DISPLAY_NAME ->
+                // Auth errors reach the setup sheet via onAuthResult; showing
+                // them in the game UI as well would double-report them.
+                Unit
+
             else -> errorMessage = message
         }
     }
@@ -1024,6 +1059,152 @@ class GameViewModel(private val context: Context) {
 
     private fun isOwn(piece: String, side: String): Boolean =
         if (side == "w") piece == piece.uppercase() else piece == piece.lowercase()
+
+    // region Auth (add-auth-ui-clients)
+
+    /** Start the auth flow: switch the setup sheet to register/login choices. */
+    fun startAuth(choice: AuthChoice) {
+        authMode = choice
+        authError = null
+    }
+
+    /** Cancel the auth sheet and return to normal game flow. */
+    fun cancelAuth() {
+        authMode = null
+    }
+
+    /** Ensure a socket that can carry an auth frame: reuse a live one
+     * (connecting, or already in a room) or open an auth-only connection.
+     * The auth-only connection is wired for the auth callback only, so the
+     * game UI never reacts to the auth exchange (iOS `ensureAuthConnection`
+     * parity). Returns false when no server URL is configured. */
+    private fun ensureAuthConnection(): Boolean {
+        val url = resolvedServerURL() ?: run {
+            authError = "No online server configured."
+            return false
+        }
+        val existing = online
+        if (existing == null) {
+            val manager = OnlineConnectionManager(url, GameViewModel.deviceID(context))
+            online = manager
+            manager.startAuth()
+            return true
+        }
+        when (existing.phase) {
+            // Dead or never-connected socket: (re)open it for auth. A
+            // connecting socket queues frames until the handshake completes,
+            // and a room socket is used as-is.
+            is OnlinePhase.Idle, is OnlinePhase.Failed -> existing.startAuth()
+            else -> {}
+        }
+        return true
+    }
+
+    /** Perform register (username + password) via the online protocol. */
+    fun doRegister(username: String, password: String) {
+        if (authToken != null) return // already logged in
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            if (success) {
+                tokenOrError?.let { setAuthTokenValue(it) }
+            } else {
+                authError = tokenOrError ?: "register_failed"
+            }
+        }
+        conn.startRegister(username, password)
+    }
+
+    /** Perform login (username + password) via the online protocol. */
+    fun doLogin(username: String, password: String) {
+        if (authToken != null) return // already logged in
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            if (success) {
+                tokenOrError?.let { setAuthTokenValue(it) }
+            } else {
+                authError = tokenOrError ?: "login_failed"
+            }
+        }
+        conn.startLogin(username, password)
+    }
+
+    /** Perform logout via the online protocol. */
+    fun doLogout() {
+        if (authToken == null) return // not logged in
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            if (success) {
+                authToken = null
+                userName = null
+                authMode = null
+                authError = null
+            } else {
+                // A refusal (e.g. `not_authenticated`, `session_expired`)
+                // keeps the token and surfaces the server's message.
+                authError = tokenOrError ?: "logout_failed"
+            }
+        }
+        conn.startLogout(authToken!!)
+    }
+
+    /** Perform set_profile (update display name) via the online protocol.
+     * Validates locally with the server's rules (trim, 1..32 chars, no
+     * control characters; iOS `doSetProfile` parity) then sends and expects
+     * `profile_updated`. A refusal (`not_authenticated`,
+     * `invalid_display_name`) keeps the token and surfaces the message. */
+    fun doSetProfile(displayName: String) {
+        if (authToken == null) return // not logged in
+        val trimmed = displayName.trim()
+        if (trimmed.isEmpty() || trimmed.length > 32) {
+            authError = "Display name must be 1–32 characters long."
+            return
+        }
+        if (trimmed.any { it.isISOControl() }) {
+            authError = "Display name cannot contain control characters."
+            return
+        }
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            if (success) {
+                userName = trimmed
+                authMode = null
+                authError = null
+            } else {
+                authError = tokenOrError ?: "set_profile_failed"
+            }
+        }
+        conn.startSetProfile(authToken!!, trimmed)
+    }
+
+    /** Mark that we are now logged in with the given token. */
+    fun setAuthTokenValue(token: String) {
+        authToken = token
+        authMode = null
+        userName = null
+        authError = null
+    }
+
+    /** Mark that the auth session expired; re-show login. */
+    fun setAuthSessionExpired() {
+        authToken = null
+        authError = "session_expired"
+        authMode = AuthChoice.Login
+    }
+
+    /** Mark that the request was invalid; re-show the form. */
+    fun setAuthInvalidRequest() {
+        authError = "invalid_request"
+    }
+
+    /** End region auth (add-auth-ui-clients) */
 }
 
 /**

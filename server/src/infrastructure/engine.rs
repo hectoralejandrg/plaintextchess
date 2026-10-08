@@ -4,9 +4,10 @@
 
 use std::sync::Arc;
 
-use chess_core::{new_game_session, GameSession};
+use chess_core::domain::RatingSnapshot;
+use chess_core::{new_game_session, new_game_session_from_rating_state, GameSession};
 
-use crate::application::ports::{ChessEngine, EngineError, EngineSession, RatingSession};
+use crate::application::ports::{ChessEngine, EngineError, EngineSession, RatingSession, RatingState};
 
 /// The production engine: the in-process `chess-core` crate.
 pub struct CoreEngine;
@@ -18,6 +19,14 @@ impl ChessEngine for CoreEngine {
 
     fn new_rating_session(&self, rating: f64) -> Box<dyn RatingSession> {
         Box::new(CoreRatingSession(new_game_session(rating)))
+    }
+
+    fn new_rating_session_state(&self, state: &RatingState) -> Box<dyn RatingSession> {
+        Box::new(CoreRatingSession(new_game_session_from_rating_state(RatingSnapshot {
+            rating: state.rating,
+            rating_deviation: state.rating_deviation,
+            volatility: state.volatility,
+        })))
     }
 }
 
@@ -54,6 +63,15 @@ impl RatingSession for CoreRatingSession {
         self.0
             .update_player_rating(opponent_rating, score)
             .map_err(|e| e.to_string())
+    }
+
+    fn state(&self) -> Result<RatingState, EngineError> {
+        let snapshot = self.0.get_rating_state();
+        Ok(RatingState {
+            rating: snapshot.rating,
+            rating_deviation: snapshot.rating_deviation,
+            volatility: snapshot.volatility,
+        })
     }
 }
 

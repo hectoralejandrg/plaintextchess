@@ -47,6 +47,9 @@ pub async fn next_state(rx: &mut mpsc::UnboundedReceiver<ServerMessage>) -> Stat
     match next_message(rx).await {
         ServerMessage::RoomReady { state, .. } | ServerMessage::State { state, .. } => state,
         ServerMessage::Error { code, .. } => panic!("expected a snapshot, got error `{code}`"),
+        // The room actor never emits these; only the socket handler does, and
+        // these tests drive the actor directly.
+        other => panic!("expected a snapshot, got {other:?}"),
     }
 }
 
@@ -54,6 +57,7 @@ pub fn state_of(message: &ServerMessage) -> &State {
     match message {
         ServerMessage::RoomReady { state, .. } | ServerMessage::State { state, .. } => state,
         ServerMessage::Error { .. } => panic!("expected a snapshot, got {message:?}"),
+        _ => panic!("expected a snapshot, got {message:?}"),
     }
 }
 

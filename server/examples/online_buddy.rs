@@ -47,6 +47,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             v: 1,
             player_id: device.clone(),
             time_control: time_control.clone(),
+            // A guest run: no token, so no account and no session (spec
+            // "Guest Play Fallback"). `BUDDY_TOKEN` signs the buddy in instead.
+            token: env::var("BUDDY_TOKEN").ok(),
         }
     } else if mode == "join" {
         let code = room.clone().ok_or_else(|| {
@@ -59,6 +62,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             v: 1,
             player_id: device.clone(),
             room_code: code,
+            token: env::var("BUDDY_TOKEN").ok(),
         }
     } else {
         return Err(format!("buddy: unknown BUDDY_MODE `{mode}'").into());
@@ -127,6 +131,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } => {
                 println!("buddy: error {code}: {message}");
+            }
+            // Authentication answers, which a guest run never receives. The
+            // token is deliberately not printed: it is a credential.
+            ServerMessage::Session {
+                account_id,
+                username,
+                display_name,
+                expires_at_ms,
+                ..
+            } => {
+                println!(
+                    "buddy: signed in as {username} ({display_name}, account {account_id}), session expires at {expires_at_ms}"
+                );
+            }
+            ServerMessage::SessionOk {
+                account_id,
+                username,
+                ..
+            } => {
+                println!("buddy: signed out of {username} ({account_id})");
+            }
+            ServerMessage::ProfileUpdated {
+                account_id,
+                display_name,
+                ..
+            } => {
+                println!("buddy: {account_id} is now displayed as {display_name}");
             }
         }
     }

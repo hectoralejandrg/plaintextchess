@@ -77,10 +77,84 @@ final class OnlineProtocolTests: XCTestCase {
             .move(uci: "g7h8q"),
             .resign,
             .leave,
+            .register(username: "ana", password: "passw0rd", deviceID: "device-a"),
+            .register(username: "ana", password: "passw0rd", deviceID: nil),
+            .login(username: "ana", password: "passw0rd", deviceID: "device-a"),
+            .login(username: "ana", password: "passw0rd", deviceID: nil),
+            .logout(token: "tok-123"),
+            .setProfile(token: "tok-123", displayName: "Ana"),
         ] {
             let json = try OnlineCodec.encodeClient(message)
             let data = json.data(using: .utf8)
             XCTAssertEqual(try JSONDecoder().decode(OnlineClientMessage.self, from: data!), message)
+        }
+    }
+
+    // MARK: - Authentication messages (add-auth-ui-clients)
+
+    func testRegisterEncodingCarriesTheDeviceID() throws {
+        let json = try OnlineCodec.encodeClient(
+            .register(username: "ana", password: "passw0rd", deviceID: "device-a"))
+        let object = try jsonObject(json)
+        XCTAssertEqual(object["type"] as? String, "register")
+        XCTAssertEqual(object["v"] as? Int, 1)
+        XCTAssertEqual(object["username"] as? String, "ana")
+        XCTAssertEqual(object["password"] as? String, "passw0rd")
+        XCTAssertEqual(object["device_id"] as? String, "device-a")
+    }
+
+    func testLoginOmitsAnUnknownDeviceID() throws {
+        let json = try OnlineCodec.encodeClient(
+            .login(username: "ana", password: "passw0rd", deviceID: nil))
+        let object = try jsonObject(json)
+        XCTAssertEqual(object["type"] as? String, "login")
+        XCTAssertEqual(object["username"] as? String, "ana")
+        XCTAssertNil(object["device_id"], "an unknown device must omit the field, not send null")
+    }
+
+    func testSessionDecodingCarriesTheToken() throws {
+        let json = """
+        {"v":1,"type":"session","account_id":"a1","username":"ana","display_name":"Ana","token":"tok-123","expires_at_ms":1700000000000}
+        """
+        guard case .session(let token) = try OnlineCodec.decodeServer(json) else {
+            return XCTFail("expected session")
+        }
+        XCTAssertEqual(token, "tok-123")
+    }
+
+    /// The spec pins one generic message for every credential failure, on
+    /// the server and on the client alike.
+    func testInvalidCredentialsCarriesTheGenericMessage() throws {
+        let json = """
+        {"v":1,"type":"error","code":"invalid_credentials","message":"That username and password do not match an account"}
+        """
+        guard case .error(let code, let message) = try OnlineCodec.decodeServer(json) else {
+            return XCTFail("expected error")
+        }
+        XCTAssertEqual(code, .invalidCredentials)
+        XCTAssertEqual(code.displayMessage, "That username and password do not match an account")
+        XCTAssertEqual(message, "That username and password do not match an account")
+    }
+
+    /// The client encodes `set_profile` with the server's wire format
+    /// (`display_name` snake_case, `token`, `v:1`).
+    func testSetProfileEncoding() throws {
+        let json = try OnlineCodec.encodeClient(.setProfile(token: "t", displayName: "Ana T."))
+        let object = try jsonObject(json)
+        XCTAssertEqual(object["type"] as? String, "set_profile")
+        XCTAssertEqual(object["v"] as? Int, 1)
+        XCTAssertEqual(object["token"] as? String, "t")
+        XCTAssertEqual(object["display_name"] as? String, "Ana T.")
+    }
+
+    /// A `profile_updated` reply decodes to the `.profileUpdated` case
+    /// regardless of the extra `display_name` field.
+    func testProfileUpdatedDecoding() throws {
+        let json = """
+        {"v":1,"type":"profile_updated","display_name":"Ana T."}
+        """
+        guard case .profileUpdated = try OnlineCodec.decodeServer(json) else {
+            return XCTFail("expected profileUpdated")
         }
     }
 

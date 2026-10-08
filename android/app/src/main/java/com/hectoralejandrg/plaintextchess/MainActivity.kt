@@ -8,6 +8,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -43,7 +44,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
@@ -87,7 +92,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    GameScreen(debugCpuDelayMs = debugCpuDelayMs, onlineUrl = onlineUrl)
+                    AppNavHost(debugCpuDelayMs = debugCpuDelayMs, onlineUrl = onlineUrl)
                 }
             }
         }
@@ -100,21 +105,8 @@ class MainActivity : ComponentActivity() {
  * action. All game state comes from [GameViewModel], backed by the Rust core.
  */
 @Composable
-fun GameScreen(debugCpuDelayMs: Long = 0L, onlineUrl: String? = null) {
+fun GameScreen(vm: GameViewModel = GameViewModel(LocalContext.current)) {
     val context = LocalContext.current
-    val vm = remember {
-        val model = GameViewModel(context)
-        // DEBUG hook (enforce-single-active-game D6), release-inert: 0 unless
-        // the activity is debuggable and the cpu_delay_ms extra was set.
-        model.debugCpuDelayMs = debugCpuDelayMs
-        // DEBUG hook (add-online-multiplayer D9), release-inert: the online
-        // server URL from the online_url extra.
-        model.debugOnlineURL = onlineUrl
-        // App-relaunch recovery (add-online-multiplayer D8): re-attach to a
-        // persisted mid-game room on start.
-        model.restoreOnlineSessionIfNeeded()
-        model
-    }
     var showNewGameSheet by remember { mutableStateOf(false) }
     // The setup sheet auto-dismisses once the server confirms an online seat
     // (add-online-multiplayer D4); a join error keeps it open instead.
@@ -296,6 +288,11 @@ private fun NewGameSetupSheet(
     var difficulty by remember { mutableStateOf(CpuDifficulty.MEDIUM) }
     var roomCode by remember { mutableStateOf("") }
     var timeControl by remember { mutableStateOf(OnlineTimeControl.default) }
+    var isAuth by remember { mutableStateOf(false) }
+    var authChoice by remember { mutableStateOf<AuthChoice?>(null) }
+    var authUsername by remember { mutableStateOf("") }
+    var authPassword by remember { mutableStateOf("") }
+    var authDisplayName by remember { mutableStateOf("") }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -309,12 +306,19 @@ private fun NewGameSetupSheet(
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Horizontally scrollable: on narrow screens the auth chips
+            // (Register/Login/Logout) would otherwise be pushed off-screen.
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 FilterChip(
-                    selected = !isCpu && !isOnline,
+                    selected = !isCpu && !isOnline && !isAuth,
                     onClick = {
                         isCpu = false
                         isOnline = false
+                        isAuth = false
+                        authChoice = null
                     },
                     label = { Text("Two players") },
                 )
@@ -331,10 +335,14 @@ private fun NewGameSetupSheet(
                     onClick = {
                         isOnline = true
                         isCpu = false
+                        isAuth = false
+                        authChoice = null
                     },
                     label = { Text("Online") },
                 )
+
             }
+
             if (isCpu) {
                 Text(
                     "Difficulty",
@@ -397,7 +405,7 @@ private fun NewGameSetupSheet(
                     ) { Text("Join room") }
                 }
             }
-            if (!isOnline) {
+            if (!isOnline && !isAuth) {
                 Button(
                     onClick = {
                         onConfirm(if (isCpu) GameMode.Cpu(difficulty) else GameMode.TwoPlayers)
@@ -634,4 +642,251 @@ private fun MoveList(vm: GameViewModel) {
             }
         }
     }
+}
+
+@Composable
+fun AppNavHost(debugCpuDelayMs: Long = 0L, onlineUrl: String? = null) {
+    val navController = rememberNavController()
+    val context = LocalContext.current
+    val vm = remember {
+        val model = GameViewModel(context)
+        model.debugCpuDelayMs = debugCpuDelayMs
+        model.debugOnlineURL = onlineUrl
+        model.restoreOnlineSessionIfNeeded()
+        model
+    }
+
+    NavHost(navController = navController, startDestination = "login") {
+        composable("login") {
+            LoginScreen(
+                vm = vm,
+                onLoginSuccess = { navController.navigate("home") { popUpTo("login") { inclusive = true } } },
+                onGuest = { navController.navigate("home") { popUpTo("login") { inclusive = true } } }
+            )
+        }
+        composable("home") {
+            HomeScreen(
+                vm = vm,
+                onStartGame = { navController.navigate("game") },
+                onGoToLogin = { navController.navigate("login") { popUpTo("home") { inclusive = true } } }
+            )
+        }
+        composable("game") {
+            GameDestination(vm = vm)
+        }
+    }
+}
+
+@Composable
+fun LoginScreen(
+    vm: GameViewModel,
+    onLoginSuccess: () -> Unit,
+    onGuest: () -> Unit
+) {
+    var username by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            "PlainTextChess",
+            style = MaterialTheme.typography.headlineLarge,
+            modifier = Modifier.padding(bottom = 32.dp)
+        )
+        OutlinedTextField(
+            value = username,
+            onValueChange = { username = it },
+            label = { Text("Username") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = password,
+            onValueChange = { password = it },
+            label = { Text("Password") },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(16.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = { vm.doRegister(username, password) },
+                enabled = username.isNotBlank() && password.isNotEmpty(),
+                modifier = Modifier.weight(1f)
+            ) { Text("Register") }
+            Button(
+                onClick = { vm.doLogin(username, password) },
+                enabled = username.isNotBlank() && password.isNotEmpty(),
+                modifier = Modifier.weight(1f)
+            ) { Text("Login") }
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { onGuest() },
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Play as guest") }
+        vm.authError?.let { error ->
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = error,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+    }
+
+    LaunchedEffect(vm.authToken) {
+        if (vm.authToken != null) {
+            onLoginSuccess()
+        }
+    }
+}
+
+@Composable
+fun HomeScreen(
+    vm: GameViewModel,
+    onStartGame: () -> Unit,
+    onGoToLogin: () -> Unit
+) {
+    var isCpu by remember { mutableStateOf(false) }
+    var isOnline by remember { mutableStateOf(false) }
+    var difficulty by remember { mutableStateOf(CpuDifficulty.MEDIUM) }
+    var roomCode by remember { mutableStateOf("") }
+    var timeControl by remember { mutableStateOf(OnlineTimeControl.default) }
+    var authDisplayName by remember { mutableStateOf("") }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Text(
+            "PlainTextChess",
+            style = MaterialTheme.typography.headlineLarge
+        )
+        if (vm.authToken != null) {
+            Text("Signed in", style = MaterialTheme.typography.titleMedium)
+            vm.userName?.let {
+                Text("Display name: $it", style = MaterialTheme.typography.bodyMedium)
+            }
+            OutlinedTextField(
+                value = authDisplayName,
+                onValueChange = { authDisplayName = it },
+                label = { Text("Display name") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Button(
+                onClick = { vm.doSetProfile(authDisplayName) },
+                enabled = authDisplayName.isNotBlank()
+            ) { Text("Update profile") }
+            OutlinedButton(onClick = { vm.doLogout(); onGoToLogin() }) { Text("Logout") }
+        } else {
+            Text("Playing as guest", style = MaterialTheme.typography.titleMedium)
+            OutlinedButton(onClick = { onGoToLogin() }) { Text("Login / Register") }
+        }
+        if (vm.authError != null) {
+            Text(
+                text = vm.authError ?: "",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+        Text("Mode selection", style = MaterialTheme.typography.titleMedium)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = !isCpu && !isOnline,
+                onClick = { isCpu = false; isOnline = false },
+                label = { Text("Two players") }
+            )
+            FilterChip(
+                selected = isCpu,
+                onClick = { isCpu = true; isOnline = false },
+                label = { Text("CPU") }
+            )
+            FilterChip(
+                selected = isOnline,
+                onClick = { isOnline = true; isCpu = false },
+                label = { Text("Online") }
+            )
+        }
+        if (isCpu) {
+            Text("Difficulty", style = MaterialTheme.typography.labelMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                CpuDifficulty.values().forEach { level ->
+                    FilterChip(
+                        selected = difficulty == level,
+                        onClick = { difficulty = level },
+                        label = { Text(level.displayName) }
+                    )
+                }
+            }
+        }
+        if (isOnline) {
+            Text("Time control", style = MaterialTheme.typography.labelMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OnlineTimeControl.presets.forEach { preset ->
+                    FilterChip(
+                        selected = timeControl == preset,
+                        onClick = { timeControl = preset },
+                        label = { Text(preset.label) }
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = roomCode,
+                onValueChange = { roomCode = it.uppercase() },
+                label = { Text("Room code to join (optional)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = {
+                    vm.startOnlineGame(true, null, timeControl.label)
+                    onStartGame()
+                }) { Text("Create room") }
+                Button(
+                    onClick = {
+                        if (roomCode.isNotEmpty()) {
+                            vm.startOnlineGame(false, roomCode, null)
+                            onStartGame()
+                        }
+                    },
+                    enabled = roomCode.isNotEmpty()
+                ) { Text("Join room") }
+            }
+            vm.onlineJoinError?.let { error ->
+                Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
+        }
+        if (!isOnline) {
+            Button(
+                onClick = {
+                    if (isCpu) vm.startGame(GameMode.Cpu(difficulty))
+                    else vm.startGame(GameMode.TwoPlayers)
+                    onStartGame()
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Start game")
+            }
+        }
+    }
+}
+
+@Composable
+fun GameDestination(vm: GameViewModel) {
+    GameScreen(vm = vm)
 }

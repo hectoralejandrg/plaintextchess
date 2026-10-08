@@ -83,6 +83,7 @@ async fn next_state(client: &mut WsClient) -> State {
     match next_server_message(client).await {
         ServerMessage::RoomReady { state, .. } | ServerMessage::State { state, .. } => state,
         ServerMessage::Error { code, .. } => panic!("expected a snapshot, got error `{code}`"),
+        other => panic!("expected a snapshot, got {other:?}"),
     }
 }
 
@@ -99,6 +100,7 @@ async fn create_room(client: &mut WsClient, player_id: &str) -> String {
             v: 1,
             player_id: player_id.into(),
             time_control: None,
+            token: None,
         }))
         .await
         .expect("send create");
@@ -114,6 +116,7 @@ async fn join_room(client: &mut WsClient, player_id: &str, code: String) {
             v: 1,
             player_id: player_id.into(),
             room_code: code,
+            token: None,
         }))
         .await
         .expect("send join");
