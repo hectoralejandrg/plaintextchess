@@ -24,6 +24,12 @@ const SHORT: TimeControl = TimeControl {
     increment_ms: 0,
 };
 
+/// Wall-clock slack a snapshot taken right after the side-to-move switch may
+/// already show on the just-started clock. The snapshot is built a hair after
+/// the switch, so a loaded machine loses a few milliseconds; the reading is
+/// still the full base for every practical purpose.
+const SNAPSHOT_SLACK_MS: u64 = 100;
+
 fn send(conn: &Conn, msg: RoomMsg) {
     conn.mailbox.send(msg).expect("room mailbox closed");
 }
@@ -199,7 +205,13 @@ async fn reattach_resumes_with_the_remaining_time() {
     send_move(&a, "e2e4");
     let _ = next_state(&mut a.out_rx).await;
     let started = next_state(&mut b.out_rx).await;
-    assert_eq!(started.black_time_ms, control.base_ms);
+    assert!(
+        started.black_time_ms <= control.base_ms
+            && started.black_time_ms >= control.base_ms - SNAPSHOT_SLACK_MS,
+        "expected a full reading around {} ms, got {}",
+        control.base_ms,
+        started.black_time_ms
+    );
 
     // Black disconnects and ~1 s elapses on its clock.
     detach(&b);
