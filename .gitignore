@@ -48,3 +48,6 @@ node_modules/
 *.swp
 
 graphify-out
+
+# iOS build output (xcodebuild -derivedDataPath ios/build)
+ios/build/
