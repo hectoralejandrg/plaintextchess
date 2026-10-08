@@ -97,6 +97,17 @@ impl GameSession {
         Ok(lock(&self.board_manager)?.is_draw())
     }
 
+    /// Whether the given side (`true` = White) cannot deliver checkmate with
+    /// its current material: the flag-fall draw judgment.
+    pub fn insufficient_material_for(&self, winner_is_white: bool) -> Result<bool, ChessError> {
+        let color = if winner_is_white {
+            shakmaty::Color::White
+        } else {
+            shakmaty::Color::Black
+        };
+        Ok(lock(&self.board_manager)?.insufficient_material_for(color))
+    }
+
     /// Get the piece at a square ("K", "q", ... or "" when empty).
     pub fn get_piece_at(&self, square: &str) -> Result<String, ChessError> {
         Ok(lock(&self.board_manager)?.get_piece_at(square))

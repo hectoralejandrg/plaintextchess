@@ -50,6 +50,13 @@ impl BoardManager {
             && (self.board.is_stalemate() || self.board.is_insufficient_material())
     }
 
+    /// Whether `color` cannot deliver checkmate with its current material
+    /// (the standard flag-fall judgment). Single source in the core; the
+    /// online server reads it through the `EngineSession` port.
+    pub fn insufficient_material_for(&self, color: Color) -> bool {
+        crate::domain::material::insufficient_to_mate(self.board.board(), color == Color::White)
+    }
+
     pub fn get_piece_at(&self, square: &str) -> String {
         let Ok(sq) = Square::from_bytes(square.as_bytes()) else {
             return String::new();
