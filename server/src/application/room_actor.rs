@@ -231,8 +231,122 @@ impl Room {
     }
 
     fn send_state_both(&self) {
-        self.send_state(WHITE);
-        self.send_state(BLACK);
+        // Shared fields computed once; only `your_color`/`opponent_online`
+        // differ per seat.
+        let now_ms = self.now_ms();
+        let board_fen = self.session.board_state().expect("board state");
+        let move_list = self.move_list.clone();
+        let side_to_move = if move_list.len().is_multiple_of(2) {
+            "w"
+        } else {
+            "b"
+        }
+        .to_string();
+        let status = self.status.clone();
+        let white_rating = self.rating(WHITE);
+        let black_rating = self.rating(BLACK);
+        let time_control = self.time_control.label();
+        let white_time_ms = self.remaining_ms(WHITE, now_ms);
+        let black_time_ms = self.remaining_ms(BLACK, now_ms);
+        for idx in [WHITE, BLACK] {
+            if let Some(seat) = &self.seats[idx] {
+                if seat.connected {
+                    let _ = seat.out.send(ServerMessage::State {
+                        v: VERSION,
+                        state: State {
+                            board_fen: board_fen.clone(),
+                            move_list: move_list.clone(),
+                            side_to_move: side_to_move.clone(),
+                            status: status.clone(),
+                            your_color: Self::color_of(idx),
+                            white_rating,
+                            black_rating,
+                            opponent_online: self.seats[1 - idx]
+                                .as_ref()
+                                .is_some_and(|seat| seat.connected),
+                            time_control: time_control.clone(),
+                            white_time_ms,
+                            black_time_ms,
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    /// Broadcast an in-game change to both seats (spec "Server Game
+    /// Authority"): an incremental `update` when the seam is on (production),
+    /// a full `state` snapshot otherwise (the deterministic socket tests,
+    /// which read one snapshot per broadcast). The full `State` is always
+    /// used for connect/re-attach regardless of the seam.
+    fn send_update_both(&self, uci: Option<&str>) {
+        if !self.services.incremental_updates {
+            self.send_state_both();
+            return;
+        }
+        // Shared fields computed once; only `opponent_online` differs per seat.
+        let now_ms = self.now_ms();
+        let uci = uci.map(str::to_string);
+        let side_to_move = if self.move_list.len().is_multiple_of(2) {
+            "w"
+        } else {
+            "b"
+        }
+        .to_string();
+        let status = self.status.clone();
+        let white_rating = self.rating(WHITE);
+        let black_rating = self.rating(BLACK);
+        let white_time_ms = self.remaining_ms(WHITE, now_ms);
+        let black_time_ms = self.remaining_ms(BLACK, now_ms);
+        for idx in [WHITE, BLACK] {
+            if let Some(seat) = &self.seats[idx] {
+                if seat.connected {
+                    let _ = seat.out.send(ServerMessage::Update {
+                        v: VERSION,
+                        uci: uci.clone(),
+                        side_to_move: side_to_move.clone(),
+                        status: status.clone(),
+                        white_rating,
+                        black_rating,
+                        opponent_online: self.seats[1 - idx]
+                            .as_ref()
+                            .is_some_and(|seat| seat.connected),
+                        white_time_ms,
+                        black_time_ms,
+                    });
+                }
+            }
+        }
+    }
+
+    fn send_update(&self, idx: usize, uci: Option<&str>) {
+        if !self.services.incremental_updates {
+            self.send_state(idx);
+            return;
+        }
+        if let Some(seat) = &self.seats[idx] {
+            if seat.connected {
+                let now_ms = self.now_ms();
+                let _ = seat.out.send(ServerMessage::Update {
+                    v: VERSION,
+                    uci: uci.map(str::to_string),
+                    side_to_move: if self.move_list.len().is_multiple_of(2) {
+                        "w"
+                    } else {
+                        "b"
+                    }
+                    .into(),
+                    status: self.status.clone(),
+                    white_rating: self.rating(WHITE),
+                    black_rating: self.rating(BLACK),
+                    opponent_online: self.seats[1 - idx]
+                        .as_ref()
+                        .is_some_and(|seat| seat.connected),
+                    white_time_ms: self.remaining_ms(WHITE, now_ms),
+                    black_time_ms: self.remaining_ms(BLACK, now_ms),
+                });
+            }
+        }
     }
 
     /// Freeze the clocks because the game just ended: without this the side to
@@ -550,7 +664,7 @@ impl Room {
             self.apply_terminal_ratings(idx).await;
             self.cancel_grace(); // the game is over: nothing left to time out
         }
-        self.send_state_both();
+        self.send_update_both(Some(uci));
     }
 
     async fn handle_resign(&mut self, identity: &Identity) {
@@ -574,7 +688,7 @@ impl Room {
         // durable commit, so the clocks reflect the real end of the game.
         self.stop_clocks();
         self.apply_terminal_ratings(winner).await;
-        self.send_state_both();
+        self.send_update_both(None);
     }
 
     async fn handle_leave(&mut self, identity: &Identity) {
@@ -594,13 +708,13 @@ impl Room {
             self.stop_clocks();
             self.apply_terminal_ratings(winner).await;
             self.remove_seat(idx);
-            self.send_state_both();
+            self.send_update_both(None);
             return;
         }
         // Lobby or finished game: just free the seat; the room drops when
         // the last seat is gone.
         self.remove_seat(idx);
-        self.send_state_both();
+        self.send_update_both(None);
     }
 
     fn handle_detach(&mut self, identity: &Identity) {
@@ -633,7 +747,7 @@ impl Room {
         }
         // In play: hold the seat for the grace window and tell the opponent.
         self.grace = Some((idx, Instant::now() + self.services.reconnect_grace));
-        self.send_state(1 - idx);
+        self.send_update(1 - idx, None);
     }
 
     /// The side to move's clock has reached zero: end the game by flag fall
@@ -658,7 +772,7 @@ impl Room {
         self.stop_clocks();
         self.apply_terminal_ratings(winner).await;
         self.cancel_grace(); // the game is over: nothing left to time out
-        self.send_state_both();
+        self.send_update_both(None);
     }
 
     /// The periodic deadline check (design D2/D8): settles a flag that fell
@@ -700,7 +814,7 @@ impl Room {
         };
         self.stop_clocks();
         self.apply_terminal_ratings(winner).await;
-        self.send_state(winner); // final snapshot (forfeited, new ratings)
+        self.send_update(winner, None); // terminal update (forfeited, new ratings)
         self.remove_seat(idx); // the absent player can no longer re-attach
         self.services.registry.remove_room(&self.code); // the room is gone from the registry
     }
@@ -746,12 +860,11 @@ pub async fn run_room(
     time_control: TimeControl,
 ) {
     let mut room = Room::new(services, code, time_control);
-    // The deadline tick (design D2): 200 ms is precise enough for a side
-    // project, and the exact apply-time check in `handle_move` means a move
-    // that lands before the next tick is never lost.
-    let mut deadline_tick = tokio::time::interval(std::time::Duration::from_millis(200));
-    deadline_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // Arm a one-shot timer only while a clock is running with its side
+        // connected (design D6); otherwise the room wakes only on mailbox
+        // messages or the grace window.
+        let deadline = clock_deadline(&room);
         tokio::select! {
             msg = mailbox.recv() => match msg {
                 Some(RoomMsg::Connect {
@@ -770,7 +883,7 @@ pub async fn run_room(
                 Some(RoomMsg::Detach { identity }) => room.handle_detach(&identity),
                 None => break, // both connection tasks gave up: room is dead
             },
-            _ = deadline_tick.tick() => room.tick_flags().await,
+            _ = sleep_until_opt(deadline) => room.tick_flags().await,
             seat = grace_timeout(&room.grace) => room.handle_grace_expiry(seat).await,
         }
         if !room.alive() {
@@ -789,6 +902,31 @@ async fn grace_timeout(grace: &Option<(usize, Instant)>) -> usize {
             *seat
         }
         None => std::future::pending::<usize>().await,
+    }
+}
+
+/// The instant the side to move's flag falls, while the game is in progress and
+/// that side is connected; `None` otherwise (no clock, game not started/over,
+/// or the side to move is disconnected, whose flag is deferred to re-attach or
+/// grace expiry). Turns the fixed 200 ms tick into a single exact wake-up.
+fn clock_deadline(room: &Room) -> Option<Instant> {
+    if !room.started() || room.status.is_terminal() {
+        return None;
+    }
+    let clocks = room.clocks.as_ref()?;
+    let side = clocks.side_to_move() as usize;
+    if !room.seats[side].as_ref().is_some_and(|seat| seat.connected) {
+        return None;
+    }
+    let remaining_ms = clocks.deadline_ms().saturating_sub(room.now_ms());
+    Some(Instant::now() + std::time::Duration::from_millis(remaining_ms))
+}
+
+/// Sleep until `deadline`, or pend forever when there is none.
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -825,6 +963,44 @@ mod tests {
             saw_white && saw_black,
             "both colors must occur across repeated rooms when randomness is enabled"
         );
+    }
+
+    /// Production behavior (incremental seam on): a move broadcasts `update`
+    /// frames to both seats, while a re-attach still gets a full `state`.
+    #[tokio::test]
+    async fn incremental_updates_carry_the_move_and_keep_snapshots_for_reattach() {
+        let mut room = TestRoom::spawn_incremental().await;
+
+        // The creator receives this game-start snapshot when the opponent
+        // joins; drain it so the next frame is the move's update.
+        let start = next_state(&mut room.white_rx).await;
+        assert_eq!(start.move_list, Vec::<String>::new());
+
+        room.move_as(P_WHITE, "e2e4");
+        for rx in [&mut room.white_rx, &mut room.black_rx] {
+            match next_message(rx).await {
+                ServerMessage::Update {
+                    uci,
+                    side_to_move,
+                    status,
+                    ..
+                } => {
+                    assert_eq!(uci.as_deref(), Some("e2e4"));
+                    assert_eq!(side_to_move, "b", "Black is to move after White's move");
+                    assert_eq!(status, Status::Playing);
+                }
+                other => panic!("expected an update, got {other:?}"),
+            }
+        }
+
+        // A re-attaching player still receives a full state snapshot.
+        let mut reattach = room.attach(P_WHITE.into()).await;
+        match next_message(&mut reattach).await {
+            ServerMessage::State { state, .. } => {
+                assert_eq!(state.move_list, vec!["e2e4".to_string()]);
+            }
+            other => panic!("expected a full snapshot on re-attach, got {other:?}"),
+        }
     }
 
     const ROOM_CODE: &str = "TESTROOM";
@@ -1050,6 +1226,23 @@ mod tests {
                 draw_after,
                 time_control,
                 fail_recorder,
+                false,
+            )
+            .await
+        }
+
+        /// The same room with the incremental-update seam on (production
+        /// behavior): in-game broadcasts are `update` frames, while
+        /// connect/re-attach still send a full `state`.
+        async fn spawn_incremental() -> Self {
+            Self::spawn_with(
+                P_WHITE.into(),
+                P_BLACK.into(),
+                None,
+                None,
+                TimeControl::DEFAULT,
+                false,
+                true,
             )
             .await
         }
@@ -1064,6 +1257,7 @@ mod tests {
             draw_after: Option<usize>,
             time_control: TimeControl,
             fail_recorder: bool,
+            incremental_updates: bool,
         ) -> Self {
             let engine: Arc<dyn ChessEngine> = Arc::new(ScriptedEngine {
                 checkmate_after,
@@ -1085,6 +1279,7 @@ mod tests {
                 recorder: Arc::clone(&recorder) as Arc<dyn GameRecorder>,
                 auth: Arc::new(crate::infrastructure::auth::PlayerAuthStore::new()),
                 random_colors: false,
+                incremental_updates,
             };
 
             let (tx, rx) = mpsc::unbounded_channel();
@@ -1513,6 +1708,7 @@ mod tests {
             None,
             None,
             TimeControl::DEFAULT,
+            false,
             false,
         )
         .await

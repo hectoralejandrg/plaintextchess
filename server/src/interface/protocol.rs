@@ -273,6 +273,24 @@ pub enum ServerMessage {
     },
     /// Full state snapshot after any accepted action and on re-attach.
     State { v: u32, state: State },
+    /// Incremental update after an accepted action (spec "Server Game
+    /// Authority"): the applied move, when there is one, plus the fields that
+    /// can change. Clients replay `uci` into their mirror session instead of
+    /// rebuilding the whole screen from a snapshot; the full `State` is
+    /// reserved for connect/re-attach.
+    Update {
+        v: u32,
+        /// The UCI move just applied; `None` for a terminal result with no
+        /// move (resignation, forfeit, flag fall).
+        uci: Option<String>,
+        side_to_move: String,
+        status: Status,
+        white_rating: f64,
+        black_rating: f64,
+        opponent_online: bool,
+        white_time_ms: u64,
+        black_time_ms: u64,
+    },
     /// Structured business-rule error (connection stays open).
     Error {
         v: u32,
@@ -458,6 +476,30 @@ mod tests {
             ServerMessage::State {
                 v: VERSION,
                 state: state.clone(),
+            },
+            ServerMessage::Update {
+                v: VERSION,
+                uci: Some("e2e4".into()),
+                side_to_move: "b".into(),
+                status: Status::Playing,
+                white_rating: 1500.0,
+                black_rating: 1499.0,
+                opponent_online: true,
+                white_time_ms: 180_000,
+                black_time_ms: 180_000,
+            },
+            ServerMessage::Update {
+                v: VERSION,
+                uci: None,
+                side_to_move: "b".into(),
+                status: Status::Resigned {
+                    winner: Color::Black,
+                },
+                white_rating: 1490.0,
+                black_rating: 1510.0,
+                opponent_online: true,
+                white_time_ms: 180_000,
+                black_time_ms: 181_000,
             },
             ServerMessage::error(ErrorCode::NotYourTurn),
             ServerMessage::Session {
@@ -817,6 +859,44 @@ mod tests {
             .unwrap();
         assert_eq!(value["type"], "state");
         assert_eq!(value["state"]["board_fen"], "x");
+
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::Update {
+            v: VERSION,
+            uci: Some("e7e5".into()),
+            side_to_move: "w".into(),
+            status: Status::Playing,
+            white_rating: 1500.0,
+            black_rating: 1500.0,
+            opponent_online: true,
+            white_time_ms: 179_000,
+            black_time_ms: 180_000,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "update");
+        assert_eq!(value["uci"], "e7e5");
+        assert_eq!(value["side_to_move"], "w");
+        assert_eq!(value["status"], "playing");
+        assert_eq!(value["white_time_ms"], 179_000);
+        assert_eq!(value["black_time_ms"], 180_000);
+
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::Update {
+            v: VERSION,
+            uci: None,
+            side_to_move: "w".into(),
+            status: Status::Resigned {
+                winner: Color::White,
+            },
+            white_rating: 1510.0,
+            black_rating: 1490.0,
+            opponent_online: false,
+            white_time_ms: 100_000,
+            black_time_ms: 100_000,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "update");
+        assert!(value["uci"].is_null(), "a resignation carries no move");
+        assert_eq!(value["status"]["resigned"]["winner"], "white");
+        assert_eq!(value["opponent_online"], false);
 
         let value: serde_json::Value =
             serde_json::to_value(ServerMessage::error(ErrorCode::RoomFull)).unwrap();

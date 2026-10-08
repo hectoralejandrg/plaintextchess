@@ -125,6 +125,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &state, &my_color, &reply_moves, &mut reply_index, &mut move_count, &mut socket,
                 ).await?;
             }
+            // Incremental update (production path): the buddy replies from the
+            // mutable fields instead of a full snapshot.
+            ServerMessage::Update {
+                uci,
+                side_to_move,
+                status,
+                opponent_online,
+                ..
+            } => {
+                if let Some(uci) = &uci {
+                    println!("buddy: saw move: {uci}");
+                    move_count += 1;
+                }
+                if matches!(status, Status::Playing) {
+                    let my_turn = matches!(
+                        (my_color, side_to_move.as_str()),
+                        (Some(Color::White), "w") | (Some(Color::Black), "b")
+                    );
+                    if my_turn && opponent_online && reply_index < reply_moves.len() {
+                        let uci = reply_moves[reply_index].clone();
+                        reply_index += 1;
+                        println!("buddy: playing {uci}");
+                        let message = ClientMessage::Move { v: 1, uci };
+                        socket
+                            .send(Message::Text(Utf8Bytes::from(
+                                serde_json::to_string(&message)?,
+                            )))
+                            .await
+                            .map_err(|error| format!("buddy: send failed: {error}"))?;
+                    }
+                } else {
+                    println!("buddy: terminal: {status:?}");
+                }
+            }
             ServerMessage::Error {
                 code,
                 message,

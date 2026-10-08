@@ -103,6 +103,11 @@ pub struct Config {
     /// deterministic test config pins the creator to White so the room tests
     /// stay stable.
     pub random_colors: bool,
+    /// Whether in-game broadcasts are incremental `update` frames (spec
+    /// "Server Game Authority"). Production is incremental; the test config
+    /// sends full `state` snapshots so the socket tests, which read one
+    /// snapshot per broadcast, stay stable. Dedicated tests turn it on.
+    pub incremental_updates: bool,
 }
 
 /// Read an optional unsigned integer for a security-relevant variable: an
@@ -169,6 +174,7 @@ impl Config {
             session_ttl_secs,
             argon2,
             random_colors: true,
+            incremental_updates: true,
         })
     }
 
@@ -197,6 +203,7 @@ impl Config {
             session_ttl_secs: DEFAULT_SESSION_TTL_SECS,
             argon2: Argon2Params::default(),
             random_colors: false,
+            incremental_updates: false,
         }
     }
 }

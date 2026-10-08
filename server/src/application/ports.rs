@@ -248,4 +248,8 @@ pub struct RoomServices {
     /// Whether the room creator's color is chosen at random (spec "Server Room
     /// Management"); `false` pins the creator to White (deterministic tests).
     pub random_colors: bool,
+    /// Whether in-game broadcasts are incremental `update` frames (spec
+    /// "Server Game Authority"); `false` sends full `state` snapshots
+    /// (deterministic socket tests).
+    pub incremental_updates: bool,
 }

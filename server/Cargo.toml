@@ -13,6 +13,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
+futures-util = "0.3"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 # player-auth: argon2id password hashing (design D5) and SHA-256 for the
 # session-token hash (design D6 — the token has full entropy, so a fast

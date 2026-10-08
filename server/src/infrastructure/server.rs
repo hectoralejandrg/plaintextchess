@@ -426,6 +426,7 @@ impl App {
             recorder: Arc::clone(&self.recorder),
             auth: Arc::clone(&self.auth) as Arc<dyn PlayerAuth>,
             random_colors: self.config.random_colors,
+            incremental_updates: self.config.incremental_updates,
         }
     }
 
