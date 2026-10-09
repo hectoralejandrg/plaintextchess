@@ -89,8 +89,11 @@ struct Room {
     status: Status,
     /// The running clock; `None` until the game starts (both seats filled).
     clocks: Option<Clocks>,
-    /// Grace window for a disconnected seat: `(seat index, deadline)`.
-    grace: Option<(usize, Instant)>,
+    /// Grace deadline per seat: `grace[seat]` is the instant after which a
+    /// disconnected seat is truly gone. A seat that reconnects cancels its own
+    /// deadline, and a detach never frees the opponent's seat, so both seats may
+    /// be in grace at once (two simultaneous disconnects keep the room alive).
+    grace: [Option<Instant>; 2],
 }
 
 impl Room {
@@ -105,7 +108,7 @@ impl Room {
             move_list: Vec::new(),
             status: Status::Playing,
             clocks: None,
-            grace: None,
+            grace: [None, None],
         }
     }
 
@@ -379,8 +382,14 @@ impl Room {
         }
     }
 
-    fn cancel_grace(&mut self) {
-        self.grace = None;
+    /// Cancel one seat's grace deadline (it reconnected or was removed).
+    fn cancel_grace(&mut self, idx: usize) {
+        self.grace[idx] = None;
+    }
+
+    /// Cancel every grace deadline (the game reached a terminal state).
+    fn cancel_all_graces(&mut self) {
+        self.grace = [None, None];
     }
 
     /// The terminal-rating funnel (spec "Server Persistence", design D3):
@@ -464,11 +473,9 @@ impl Room {
         }
     }
 
-    /// Release a seat and any pending timer, unbinding the device.
+    /// Release a seat and its grace deadline, unbinding the device.
     fn remove_seat(&mut self, idx: usize) {
-        if self.grace.is_some_and(|(seat_idx, _)| seat_idx == idx) {
-            self.cancel_grace();
-        }
+        self.cancel_grace(idx);
         if let Some(seat) = self.seats[idx].take() {
             // Rebuild the identity the seat was held under so both the device
             // entry and the account entry are released (design D8/D9).
@@ -546,7 +553,7 @@ impl Room {
                 self.settle_flag().await;
                 return;
             }
-            self.cancel_grace();
+            self.cancel_grace(idx);
             self.send_state(idx); // resync snapshot for the re-attached player
             self.send_state(1 - idx); // opponent_online goes back to true
             return;
@@ -662,7 +669,7 @@ impl Room {
         if self.status.is_terminal() {
             self.stop_clocks();
             self.apply_terminal_ratings(idx).await;
-            self.cancel_grace(); // the game is over: nothing left to time out
+            self.cancel_all_graces(); // the game is over: nothing left to time out
         }
         self.send_update_both(Some(uci));
     }
@@ -683,7 +690,7 @@ impl Room {
         self.status = Status::Resigned {
             winner: Self::color_of(winner),
         };
-        self.cancel_grace();
+        self.cancel_all_graces();
         // Freeze at the moment the result is known, before the (possibly slow)
         // durable commit, so the clocks reflect the real end of the game.
         self.stop_clocks();
@@ -704,7 +711,7 @@ impl Room {
             self.status = Status::Resigned {
                 winner: Self::color_of(winner),
             };
-            self.cancel_grace();
+            self.cancel_all_graces();
             self.stop_clocks();
             self.apply_terminal_ratings(winner).await;
             self.remove_seat(idx);
@@ -738,15 +745,11 @@ impl Room {
             self.remove_seat(idx);
             return;
         }
-        if !self.seats[1 - idx].as_ref().is_some_and(|s| s.connected) {
-            // Both players are gone: no result is recorded, the room is
-            // dropped immediately (spec: "Empty rooms are cleaned up").
-            self.remove_seat(idx);
-            self.remove_seat(1 - idx);
-            return;
-        }
-        // In play: hold the seat for the grace window and tell the opponent.
-        self.grace = Some((idx, Instant::now() + self.services.reconnect_grace));
+        // In play: hold *this* seat for its own grace deadline and tell the
+        // opponent. The opponent's seat is never freed here, so two simultaneous
+        // disconnects keep the room alive for both to reconnect (spec "Empty
+        // rooms are cleaned up" applies only once no seat is left).
+        self.grace[idx] = Some(Instant::now() + self.services.reconnect_grace);
         self.send_update(1 - idx, None);
     }
 
@@ -771,7 +774,7 @@ impl Room {
         };
         self.stop_clocks();
         self.apply_terminal_ratings(winner).await;
-        self.cancel_grace(); // the game is over: nothing left to time out
+        self.cancel_all_graces(); // the game is over: nothing left to time out
         self.send_update_both(None);
     }
 
@@ -795,28 +798,44 @@ impl Room {
     }
 
     async fn handle_grace_expiry(&mut self, idx: usize) {
+        // The deadline fired: clear it so the loop does not re-arm it.
+        self.cancel_grace(idx);
+
         let still_gone = self.seats[idx]
             .as_ref()
             .is_some_and(|s| !s.connected);
-        let in_play = self.started() && !self.status.is_terminal();
+        // "In play" must not depend on both seats still being present: once the
+        // first of two disconnected seats is freed, `started()` becomes false but
+        // the second grace expiry still has to release its seat. The clocks are
+        // created when the second player joins, so they mark a started game.
+        let in_play = self.clocks.is_some() && !self.status.is_terminal();
         let opponent_connected = self
             .seats[1 - idx]
             .as_ref()
             .is_some_and(|s| s.connected);
-        if !(still_gone && in_play && opponent_connected) {
-            // Nothing to forfeit (re-attached meanwhile, game ended, or the
-            // opponent is gone too — that path drops the room on detach).
+
+        if !(still_gone && in_play) {
+            // Re-attached meanwhile, or the game already ended: nothing to do.
             return;
         }
-        let winner = 1 - idx;
-        self.status = Status::Forfeited {
-            winner: Self::color_of(winner),
-        };
-        self.stop_clocks();
-        self.apply_terminal_ratings(winner).await;
-        self.send_update(winner, None); // terminal update (forfeited, new ratings)
-        self.remove_seat(idx); // the absent player can no longer re-attach
-        self.services.registry.remove_room(&self.code); // the room is gone from the registry
+        if opponent_connected {
+            // The opponent stayed: the absent player forfeits.
+            let winner = 1 - idx;
+            self.status = Status::Forfeited {
+                winner: Self::color_of(winner),
+            };
+            self.cancel_all_graces();
+            self.stop_clocks();
+            self.apply_terminal_ratings(winner).await;
+            self.send_update(winner, None); // terminal update (forfeited, new ratings)
+            self.remove_seat(idx); // the absent player can no longer re-attach
+            self.services.registry.remove_room(&self.code); // the room is gone from the registry
+            return;
+        }
+        // Both seats are disconnected: this one is truly gone, but the room
+        // stays until the other seat's grace also expires, then it is dropped as
+        // an empty room with no result.
+        self.remove_seat(idx);
     }
 }
 
@@ -893,13 +912,18 @@ pub async fn run_room(
     }
 }
 
-/// Polls the grace window: resolves with the timed-out seat index, or stays
-/// pending forever when no timer is armed.
-async fn grace_timeout(grace: &Option<(usize, Instant)>) -> usize {
-    match grace {
-        Some((seat, deadline)) => {
-            sleep_until(*deadline).await;
-            *seat
+/// Polls the grace windows: resolves with the seat whose grace expired first, or
+/// stays pending forever when none is armed.
+async fn grace_timeout(grace: &[Option<Instant>; 2]) -> usize {
+    let next = grace
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, deadline)| deadline.map(|d| (idx, d)))
+        .min_by_key(|(_, deadline)| *deadline);
+    match next {
+        Some((idx, deadline)) => {
+            sleep_until(deadline).await;
+            idx
         }
         None => std::future::pending::<usize>().await,
     }
@@ -1440,6 +1464,73 @@ mod tests {
         assert_eq!(record.black_device, P_BLACK);
         assert_eq!(record.white_rating_before, DEFAULT_RATING);
         assert_eq!(record.black_rating_before, DEFAULT_RATING);
+    }
+
+    // ------------------------------------------------------------------
+    // Disconnect, reconnect, and simultaneous disconnects
+    // ------------------------------------------------------------------
+
+    /// Two simultaneous disconnects must NOT destroy the room: each seat is held
+    /// for its own grace, so both players can reconnect (BUG-P2-R1).
+    #[tokio::test]
+    async fn two_simultaneous_detaches_keep_the_room_alive_for_both() {
+        let room = TestRoom::spawn(None, None, TimeControl::DEFAULT, false).await;
+
+        room.detach_as(P_WHITE);
+        room.detach_as(P_BLACK);
+
+        // Both return within the grace window: each re-attaches with a snapshot
+        // (a dropped room would close the channel and fail the read).
+        let mut white = room.attach(P_WHITE.into()).await;
+        let mut black = room.attach(P_BLACK.into()).await;
+        let _ = next_state(&mut white).await;
+        let _ = next_state(&mut black).await;
+    }
+
+    /// One player reconnects and the other's grace expires: the present player
+    /// wins by forfeit, exactly as in the single-disconnect case.
+    #[tokio::test]
+    async fn one_reconnect_and_one_grace_expiry_forfeits_for_the_present_player() {
+        let room = TestRoom::spawn(None, None, TimeControl::DEFAULT, false).await;
+        room.move_as(P_WHITE, "e2e4");
+
+        room.detach_as(P_WHITE);
+        room.detach_as(P_BLACK);
+
+        // Only White comes back.
+        let mut white = room.attach(P_WHITE.into()).await;
+        let _ = next_state(&mut white).await;
+
+        // Black's grace (300 ms) expires: White, present, wins.
+        let terminal = terminal_state(&mut white).await;
+        assert!(
+            matches!(terminal.status, Status::Forfeited { winner: Color::White }),
+            "the present player must win by forfeit, got {:?}",
+            terminal.status
+        );
+    }
+
+    /// If both graces expire, the room is dropped with no recorded result.
+    #[tokio::test]
+    async fn both_graces_expiring_drops_the_room_with_no_result() {
+        let room = TestRoom::spawn(None, None, TimeControl::DEFAULT, false).await;
+        room.move_as(P_WHITE, "e2e4");
+
+        room.detach_as(P_WHITE);
+        room.detach_as(P_BLACK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !room.tx.is_closed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the room should be dropped once both grace windows expire"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            room.recorded_games().is_empty(),
+            "nobody was present, so no result is recorded"
+        );
     }
 
     // ------------------------------------------------------------------

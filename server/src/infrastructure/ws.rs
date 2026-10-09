@@ -12,16 +12,14 @@
 //! handling (design D11). An auth failure never closes the socket either
 //! (spec "Guest Play Fallback").
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
-use futures_util::stream::SplitSink;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio::sync::Notify;
 
 use crate::application::ports::{
@@ -35,18 +33,10 @@ use crate::domain::account::{
 use crate::domain::time_control::TimeControl;
 use crate::infrastructure::password::{expires_at, generate_token, hash_token, now_ms};
 use crate::infrastructure::server::{App, Conn};
+use crate::infrastructure::transport::{is_state_class, write_loop, Outbound, Outbox};
 use crate::interface::protocol::{
-    decode_incoming, ClientMessage, ErrorCode, ServerMessage, PROTOCOL_CLOSE_CODE, VERSION,
+    decode_incoming, ClientMessage, ErrorCode, ServerMessage, VERSION,
 };
-
-/// Protocol-level close frame: the server must close only for malformed
-/// JSON, unknown message types, or unsupported versions.
-fn protocol_close() -> Message {
-    Message::Close(Some(CloseFrame {
-        code: CloseCode::from(PROTOCOL_CLOSE_CODE),
-        reason: "protocol error".into(),
-    }))
-}
 
 pub async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -60,128 +50,6 @@ pub async fn ws_upgrade(
     State(app): State<Arc<App>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, app))
-}
-
-/// How long between server keepalive pings: well under the reconnect grace, so
-/// a dead peer is noticed before the window elapses.
-const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// One item queued for the connection's writer.
-#[derive(Debug)]
-enum Outbound {
-    /// A server message (JSON text).
-    Text(ServerMessage),
-    /// A keepalive ping.
-    Ping,
-    /// A response to a client ping.
-    Pong(Vec<u8>),
-    /// A protocol close frame.
-    Close,
-}
-
-/// Whether a frame is a state-class snapshot/update: these coalesce so a slow
-/// client always converges to the newest authoritative state, while one-shot
-/// control frames are never dropped.
-fn is_state_class(message: &ServerMessage) -> bool {
-    matches!(
-        message,
-        ServerMessage::RoomReady { .. } | ServerMessage::State { .. } | ServerMessage::Update { .. }
-    )
-}
-
-/// A per-connection outbound buffer with backpressure: at most one coalesced
-/// state-class frame plus an ordered queue of control frames, so a client that
-/// stops reading cannot grow the server's memory without bound.
-#[derive(Default)]
-struct Outbox {
-    inner: Mutex<VecDeque<Outbound>>,
-    closed: AtomicBool,
-    notify: Notify,
-}
-
-impl Outbox {
-    fn push(&self, item: Outbound) {
-        let mut queue = self.inner.lock().unwrap();
-        if let Outbound::Text(message) = &item {
-            if is_state_class(message) {
-                queue.retain(|queued| !matches!(queued, Outbound::Text(m) if is_state_class(m)));
-            }
-        }
-        queue.push_back(item);
-        drop(queue);
-        self.notify.notify_one();
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.notify.notify_one();
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
-    }
-
-    fn take_batch(&self) -> Vec<Outbound> {
-        let mut queue = self.inner.lock().unwrap();
-        queue.drain(..).collect()
-    }
-}
-
-/// The writer half: drains the outbox and sends keepalive pings, treating a
-/// peer that stops responding as gone. Notifies `finished` on the way out so
-/// the reader ends the session too.
-async fn write_loop(
-    mut sink: SplitSink<WebSocket, Message>,
-    outbox: Arc<Outbox>,
-    alive: Arc<AtomicBool>,
-    finished: Arc<Notify>,
-) {
-    let mut ping = tokio::time::interval_at(
-        tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
-        KEEPALIVE_INTERVAL,
-    );
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    async {
-        loop {
-            let batch = outbox.take_batch();
-            if !batch.is_empty() {
-                for item in batch {
-                    let sent = match item {
-                        Outbound::Text(message) => send_json(&mut sink, &message).await,
-                        Outbound::Ping => {
-                            sink.send(Message::Ping(Default::default())).await.is_ok()
-                        }
-                        Outbound::Pong(payload) => {
-                            sink.send(Message::Pong(payload.into())).await.is_ok()
-                        }
-                        Outbound::Close => {
-                            let _ = sink.send(protocol_close()).await;
-                            return;
-                        }
-                    };
-                    if !sent {
-                        return;
-                    }
-                }
-                continue;
-            }
-            if outbox.is_closed() {
-                return;
-            }
-            tokio::select! {
-                _ = outbox.notify.notified() => {}
-                _ = ping.tick() => {
-                    // No inbound frame since the last ping: the peer is gone.
-                    if !alive.swap(false, Ordering::SeqCst) {
-                        return;
-                    }
-                    let _ = sink.send(Message::Ping(Default::default())).await;
-                }
-            }
-        }
-    }
-    .await;
-    finished.notify_one();
 }
 
 async fn handle_socket(socket: WebSocket, app: Arc<App>) {
@@ -262,17 +130,6 @@ async fn handle_socket(socket: WebSocket, app: Arc<App>) {
             .send(RoomMsg::Detach {
                 identity: conn.identity,
             });
-    }
-}
-
-/// Serialize and send one server message over the writer half. `false` means
-/// the socket is gone.
-async fn send_json(sink: &mut SplitSink<WebSocket, Message>, message: &ServerMessage) -> bool {
-    match serde_json::to_string(message) {
-        Ok(text) => sink.send(Message::Text(text.into())).await.is_ok(),
-        // An unserializable message is a server bug, not a client error: the
-        // connection ends rather than silently swallowing the answer.
-        Err(_) => false,
     }
 }
 
@@ -761,93 +618,5 @@ where
             %account_id,
             "failed to persist an authentication change; it is applied in memory only"
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::interface::protocol::Status;
-
-    fn update(uci: &str) -> ServerMessage {
-        ServerMessage::Update {
-            v: VERSION,
-            uci: Some(uci.to_string()),
-            side_to_move: "b".into(),
-            status: Status::Playing,
-            white_rating: 1500.0,
-            black_rating: 1500.0,
-            opponent_online: true,
-            white_time_ms: 1_000,
-            black_time_ms: 1_000,
-        }
-    }
-
-    fn a_state() -> ServerMessage {
-        ServerMessage::State {
-            v: VERSION,
-            state: crate::interface::protocol::State {
-                board_fen: "x".into(),
-                move_list: vec![],
-                side_to_move: "w".into(),
-                status: Status::Playing,
-                your_color: crate::interface::protocol::Color::White,
-                white_rating: 1500.0,
-                black_rating: 1500.0,
-                opponent_online: true,
-                time_control: "1+0".into(),
-                white_time_ms: 60_000,
-                black_time_ms: 60_000,
-            },
-        }
-    }
-
-    /// A slow client that never drains cannot grow memory: the pending
-    /// state-class frames collapse to the newest one.
-    #[test]
-    fn state_frames_coalesce_to_the_newest_with_bounded_memory() {
-        let outbox = Outbox::default();
-        for i in 0..1_000 {
-            outbox.push(Outbound::Text(update(&format!("m{i}"))));
-        }
-        let batch = outbox.take_batch();
-        assert_eq!(batch.len(), 1, "state frames coalesce to a single slot");
-        match &batch[0] {
-            Outbound::Text(ServerMessage::Update { uci, .. }) => {
-                assert_eq!(uci.as_deref(), Some("m999"), "the newest update wins");
-            }
-            other => panic!("expected the newest update, got {other:?}"),
-        }
-    }
-
-    /// One-shot control frames are never dropped, even when surrounded by
-    /// coalesced state frames.
-    #[test]
-    fn control_frames_are_never_dropped_and_keep_their_order() {
-        let outbox = Outbox::default();
-        outbox.push(Outbound::Text(ServerMessage::error(ErrorCode::NotYourTurn)));
-        outbox.push(Outbound::Text(a_state()));
-        outbox.push(Outbound::Text(update("a")));
-        outbox.push(Outbound::Text(ServerMessage::error(ErrorCode::IllegalMove)));
-        outbox.push(Outbound::Text(update("b")));
-
-        let batch = outbox.take_batch();
-        // The two control frames survive in order; only the newest state-class
-        // frame (the "b" update) remains.
-        assert_eq!(batch.len(), 3, "two control frames plus the newest state");
-        assert!(matches!(
-            &batch[0],
-            Outbound::Text(ServerMessage::Error { .. })
-        ));
-        assert!(matches!(
-            &batch[1],
-            Outbound::Text(ServerMessage::Error { .. })
-        ));
-        match &batch[2] {
-            Outbound::Text(ServerMessage::Update { uci, .. }) => {
-                assert_eq!(uci.as_deref(), Some("b"), "the newest state-class frame is last");
-            }
-            other => panic!("expected the newest update last, got {other:?}"),
-        }
     }
 }

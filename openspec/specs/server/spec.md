@@ -4,6 +4,7 @@
 Authoritative online game server: in-memory two-player rooms, core-validated moves, disconnect handling, and per-device Glicko2 ratings.
 
 ## Requirements
+
 ### Requirement: Server Room Management
 The server MUST host two-player online rooms in memory. A player creates a
 room and receives a room code: a 6-character code drawn from an unambiguous
@@ -46,6 +47,7 @@ be removed from memory.
 #### Scenario: Empty rooms are cleaned up
 - **WHEN** all players of a room are gone (the lobby player left, or a finished game's players stop being connected)
 - **THEN** the server removes the room and its state from memory
+
 ### Requirement: Server Game Authority
 Within a room the server MUST own the authoritative game session: the
 server applies the moves, and check, checkmate, and draw state MUST come
@@ -126,6 +128,7 @@ window.
 #### Scenario: An unresponsive peer is detected by keepalive
 - **WHEN** a connected peer stops responding to the server's keepalive pings
 - **THEN** the server treats it as disconnected (holding the seat for the grace window as usual) without waiting for the full reconnect window to elapse
+
 ### Requirement: Server Disconnect, Reconnect, and Forfeit
 A player's disconnection MUST NOT immediately end the game: the server
 MUST keep the room for a configurable grace window (default 120 seconds,
@@ -141,7 +144,12 @@ MUST resume with that player's remaining time at the value the server
 measured; if the player's time ran out while they were disconnected, the
 game MUST end by flag fall when they re-attach (or when the grace window
 expires, whichever comes first), with the same outcome as if they had been
-connected at the flag.
+connected at the flag. When both players are disconnected at the same time,
+the server MUST hold each seat for its own grace window and let either
+player re-attach and resume; a seat whose grace window expires while the
+other player is connected forfeits to the connected player, and if every
+grace window expires with no player connected the room is removed with no
+result, exactly as an empty room.
 
 #### Scenario: A disconnected player can re-attach within the grace window
 - **WHEN** a player's connection drops and the same device identifier reconnects to the same room before the grace window expires
@@ -166,6 +174,11 @@ connected at the flag.
 #### Scenario: A flag that fell while disconnected is settled on re-attach
 - **WHEN** a player's time runs out while they are disconnected and they re-attach before the disconnect grace expires
 - **THEN** the game ends by flag fall with the opponent as winner (or as a draw when the opponent's material is insufficient to checkmate), exactly as if they had been connected at the flag
+
+#### Scenario: Both players disconnect within the grace window
+- **WHEN** both players' connections drop before the grace window expires
+- **THEN** the server holds each seat for its own grace window, either player may re-attach and resume the game, a seat whose grace expires while the other player is connected forfeits to the connected player, and if both grace windows expire with neither player present the room is removed with no result
+
 ### Requirement: Server Online Rating
 The server MUST keep a per-player Glicko-2 rating, keyed by the player's
 persistent device identifier (spec "Server Persistence"), and load the
@@ -195,6 +208,7 @@ end. Ratings MUST be included in every state snapshot.
 #### Scenario: A flag fall updates both ratings
 - **WHEN** an online game ends by flag fall
 - **THEN** the server updates the winner's rating up and the timed-out player's rating down against each other using the core's rating logic, and both players see the new ratings in the final snapshot
+
 ### Requirement: Server Persistence
 The server MUST persist the per-device Glicko-2 rating state (rating,
 rating deviation, and volatility) and a record of every finished online game
@@ -241,6 +255,7 @@ persistence file can be created on first use.
 #### Scenario: Configuration comes from the environment
 - **WHEN** the server starts with BIND, PORT, or RECONNECT_GRACE_SECS set
 - **THEN** it binds to that address and port and uses that grace window, and without them it uses the built-in defaults
+
 ### Requirement: Server Time Control and Clock
 The server MUST support a fixed set of time controls for online rooms,
 each a base time with a Fischer increment (added to the moving player's

@@ -243,6 +243,25 @@ async fn next_state(client: &mut WsClient) -> State {
     }
 }
 
+/// Read snapshots until the move list reaches `expected` moves.
+///
+/// The server coalesces state-class frames (a slow reader converges to the
+/// newest snapshot) and a player's socket can still hold the opponent's earlier
+/// snapshot unread, so a test MUST NOT assume one frame per move: it waits until
+/// the authoritative snapshot reflects the move it just played.
+async fn next_state_with_moves(client: &mut WsClient, expected: usize) -> State {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = next_state(client).await;
+            if state.move_list.len() == expected {
+                return state;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for a snapshot with {expected} moves"))
+}
+
 /// The socket stays open and sends nothing else: a refusal is exactly one
 /// error frame.
 async fn assert_silent(client: &mut WsClient) {
@@ -928,25 +947,35 @@ async fn guest_and_authenticated_play_identically_over_the_wire() {
     assert!(black_state.opponent_online);
     next_state(&mut white).await;
 
-    // Both games follow one script and stay in lockstep, move for move and
-    // snapshot for snapshot.
-    for (side, uci) in [
+    // Both games follow one script; after each move both reach the same
+    // authoritative snapshot (draining any earlier, superseded snapshot).
+    for (step, (side, uci)) in [
         (Color::White, "e2e4"),
         (Color::Black, "e7e5"),
         (Color::White, "d1h5"),
         (Color::Black, "b8c6"),
         (Color::White, "f1c4"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_moves = step + 1;
         let (guest_state, authed_state) = match side {
             Color::White => {
                 move_piece(&mut guest_white, uci).await;
                 move_piece(&mut white, uci).await;
-                (next_state(&mut guest_white).await, next_state(&mut white).await)
+                (
+                    next_state_with_moves(&mut guest_white, expected_moves).await,
+                    next_state_with_moves(&mut white, expected_moves).await,
+                )
             }
             Color::Black => {
                 move_piece(&mut guest_black, uci).await;
                 move_piece(&mut black, uci).await;
-                (next_state(&mut guest_black).await, next_state(&mut black).await)
+                (
+                    next_state_with_moves(&mut guest_black, expected_moves).await,
+                    next_state_with_moves(&mut black, expected_moves).await,
+                )
             }
         };
         assert_eq!(guest_state.move_list, authed_state.move_list);

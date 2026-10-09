@@ -1,0 +1,314 @@
+//! Shared transport primitives: framing, outbound coalescing, keepalive,
+//! protocol-close, and reconnect bookkeeping. Used by the transport tier
+//! (and the monolith in TIER=all mode).
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket};
+use futures_util::stream::SplitSink;
+use futures_util::SinkExt;
+use tokio::sync::Notify;
+
+use crate::interface::protocol::{ErrorCode, ServerMessage, PROTOCOL_CLOSE_CODE};
+
+/// Protocol-level close frame: the server must close only for malformed
+/// JSON, unknown message types, or unsupported versions.
+pub fn protocol_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: CloseCode::from(PROTOCOL_CLOSE_CODE),
+        reason: "protocol error".into(),
+    }))
+}
+
+/// How long between server keepalive pings: well under the reconnect grace, so
+/// a dead peer is noticed before the window elapses.
+pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// One item queued for the connection's writer.
+#[derive(Debug)]
+pub enum Outbound {
+    /// A server message (JSON text).
+    Text(ServerMessage),
+    /// A keepalive ping.
+    Ping,
+    /// A response to a client ping.
+    Pong(Vec<u8>),
+    /// A protocol close frame (malformed/unknown frame, 4000).
+    Close,
+    /// The broker fabric was lost: close the client with an internal-error
+    /// frame so the loss is visible rather than a silent zombie socket.
+    BrokerUnavailable,
+    /// This node lost its liveness lease while still running (a pause longer
+    /// than the TTL, or lost lease keys). The authoritative tier may have
+    /// presumed the node dead; close the client so it reconnects and re-attaches
+    /// instead of being silently orphaned (design D11).
+    LeaseLost,
+    /// The logic node that owned this connection's room was lost. Close with a
+    /// clear terminal signal instead of leaving the socket mute (design D13 /
+    /// GAP-P3-D): the room's state lives in that node and is gone.
+    RoomEnded,
+}
+
+/// Close frame for a lost broker: `1011` internal error, not a client protocol
+/// error (design D10).
+pub const BROKER_UNAVAILABLE_CLOSE_CODE: u16 = 1011;
+
+/// Close frame for a lost node lease: `1012` service restart, so the client
+/// reconnects and re-attaches (design D11).
+pub const LEASE_LOST_CLOSE_CODE: u16 = 1012;
+
+/// Close frame for a lost broker.
+pub fn broker_unavailable_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: BROKER_UNAVAILABLE_CLOSE_CODE,
+        reason: "broker unavailable".into(),
+    }))
+}
+
+/// Close frame for a lost node lease: tell the client to reconnect.
+pub fn lease_lost_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: LEASE_LOST_CLOSE_CODE,
+        reason: "node lease lost; reconnect".into(),
+    }))
+}
+
+/// Close code for a room whose logic owner was lost: `4001` (application range),
+/// distinct from the protocol error (`4000`) and the broker/lease codes.
+pub const ROOM_ENDED_CLOSE_CODE: u16 = 4001;
+
+/// Close frame for a room whose owning logic node was lost: a clear terminal
+/// signal, so the players are not left mute (GAP-P3-D).
+pub fn room_ended_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: ROOM_ENDED_CLOSE_CODE,
+        reason: "room ended: its logic node was lost".into(),
+    }))
+}
+
+/// Whether a frame is a state-class snapshot/update: these coalesce so a slow
+/// client always converges to the newest authoritative state, while one-shot
+/// control frames are never dropped.
+pub fn is_state_class(message: &ServerMessage) -> bool {
+    matches!(
+        message,
+        ServerMessage::RoomReady { .. } | ServerMessage::State { .. } | ServerMessage::Update { .. }
+    )
+}
+
+/// A per-connection outbound buffer with backpressure: at most one coalesced
+/// state-class frame plus an ordered queue of control frames, so a client that
+/// stops reading cannot grow the server's memory without bound.
+#[derive(Default)]
+pub struct Outbox {
+    inner: Mutex<VecDeque<Outbound>>,
+    closed: AtomicBool,
+    notify: Notify,
+}
+
+impl Outbox {
+    pub fn push(&self, item: Outbound) {
+        let mut queue = self.inner.lock().unwrap();
+        if let Outbound::Text(message) = &item {
+            if is_state_class(message) {
+                queue.retain(|queued| !matches!(queued, Outbound::Text(m) if is_state_class(m)));
+            }
+        }
+        queue.push_back(item);
+        drop(queue);
+        self.notify.notify_one();
+    }
+
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub fn take_batch(&self) -> Vec<Outbound> {
+        let mut queue = self.inner.lock().unwrap();
+        queue.drain(..).collect()
+    }
+}
+
+/// The writer half: drains the outbox and sends keepalive pings, treating a
+/// peer that stops responding as gone. Notifies `finished` on the way out so
+/// the reader ends the session too.
+pub async fn write_loop(
+    mut sink: SplitSink<WebSocket, Message>,
+    outbox: Arc<Outbox>,
+    alive: Arc<AtomicBool>,
+    finished: Arc<Notify>,
+) {
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
+        KEEPALIVE_INTERVAL,
+    );
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    async {
+        loop {
+            let batch = outbox.take_batch();
+            if !batch.is_empty() {
+                for item in batch {
+                    let sent = match item {
+                        Outbound::Text(message) => send_json(&mut sink, &message).await,
+                        Outbound::Ping => {
+                            sink.send(Message::Ping(Default::default())).await.is_ok()
+                        }
+                        Outbound::Pong(payload) => {
+                            sink.send(Message::Pong(payload.into())).await.is_ok()
+                        }
+                        Outbound::Close => {
+                            let _ = sink.send(protocol_close()).await;
+                            return;
+                        }
+                        Outbound::BrokerUnavailable => {
+                            let _ = sink.send(broker_unavailable_close()).await;
+                            return;
+                        }
+                        Outbound::LeaseLost => {
+                            let _ = sink.send(lease_lost_close()).await;
+                            return;
+                        }
+                        Outbound::RoomEnded => {
+                            let _ = sink.send(room_ended_close()).await;
+                            return;
+                        }
+                    };
+                    if !sent {
+                        return;
+                    }
+                }
+                continue;
+            }
+            if outbox.is_closed() {
+                return;
+            }
+            tokio::select! {
+                _ = outbox.notify.notified() => {}
+                _ = ping.tick() => {
+                    // No inbound frame since the last ping: the peer is gone.
+                    if !alive.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                    let _ = sink.send(Message::Ping(Default::default())).await;
+                }
+            }
+        }
+    }
+    .await;
+    finished.notify_one();
+}
+
+/// Serialize and send one server message over the writer half. `false` means
+/// the socket is gone.
+pub async fn send_json(sink: &mut SplitSink<WebSocket, Message>, message: &ServerMessage) -> bool {
+    match serde_json::to_string(message) {
+        Ok(text) => sink.send(Message::Text(text.into())).await.is_ok(),
+        // An unserializable message is a server bug, not a client error: the
+        // connection ends rather than silently swallowing the answer.
+        Err(_) => false,
+    }
+}
+
+/// Map an `ErrorCode` to a protocol `ServerMessage::Error`.
+pub fn error_message(code: ErrorCode) -> ServerMessage {
+    ServerMessage::Error {
+        v: crate::interface::protocol::VERSION,
+        code: code.as_str().to_string(),
+        message: code.message().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interface::protocol::Status;
+
+    fn update(uci: &str) -> ServerMessage {
+        ServerMessage::Update {
+            v: crate::interface::protocol::VERSION,
+            uci: Some(uci.to_string()),
+            side_to_move: "b".into(),
+            status: Status::Playing,
+            white_rating: 1500.0,
+            black_rating: 1500.0,
+            opponent_online: true,
+            white_time_ms: 1_000,
+            black_time_ms: 1_000,
+        }
+    }
+
+    fn a_state() -> ServerMessage {
+        ServerMessage::State {
+            v: crate::interface::protocol::VERSION,
+            state: crate::interface::protocol::State {
+                board_fen: "x".into(),
+                move_list: vec![],
+                side_to_move: "w".into(),
+                status: Status::Playing,
+                your_color: crate::interface::protocol::Color::White,
+                white_rating: 1500.0,
+                black_rating: 1500.0,
+                opponent_online: true,
+                time_control: "1+0".into(),
+                white_time_ms: 60_000,
+                black_time_ms: 60_000,
+            },
+        }
+    }
+
+    /// A slow client that never drains cannot grow memory: the pending
+    /// state-class frames collapse to the newest one.
+    #[test]
+    fn state_frames_coalesce_to_the_newest_with_bounded_memory() {
+        let outbox = Outbox::default();
+        for i in 0..1_000 {
+            outbox.push(Outbound::Text(update(&format!("m{i}"))));
+        }
+        let batch = outbox.take_batch();
+        assert_eq!(batch.len(), 1, "state frames coalesce to a single slot");
+        match &batch[0] {
+            Outbound::Text(ServerMessage::Update { uci, .. }) => {
+                assert_eq!(uci.as_deref(), Some("m999"), "the newest update wins");
+            }
+            other => panic!("expected the newest update, got {other:?}"),
+        }
+    }
+
+    /// One-shot control frames are never dropped, even when surrounded by
+    /// coalesced state frames.
+    #[test]
+    fn control_frames_are_never_dropped_and_keep_their_order() {
+        let outbox = Outbox::default();
+        outbox.push(Outbound::Text(error_message(ErrorCode::NotYourTurn)));
+        outbox.push(Outbound::Text(a_state()));
+        outbox.push(Outbound::Text(update("a")));
+        outbox.push(Outbound::Text(error_message(ErrorCode::IllegalMove)));
+        outbox.push(Outbound::Text(update("b")));
+
+        let batch = outbox.take_batch();
+        // The two control frames survive in order; only the newest state-class
+        // frame (the "b" update) remains.
+        assert_eq!(batch.len(), 3, "two control frames plus the newest state");
+        assert!(matches!(
+            &batch[0],
+            Outbound::Text(ServerMessage::Error { .. })
+        ));
+        assert!(matches!(
+            &batch[1],
+            Outbound::Text(ServerMessage::Error { .. })
+        ));
+        match &batch[2] {
+            Outbound::Text(ServerMessage::Update { uci, .. }) => {
+                assert_eq!(uci.as_deref(), Some("b"), "the newest state-class frame is last");
+            }
+            other => panic!("expected the newest update last, got {other:?}"),
+        }
+    }
+}

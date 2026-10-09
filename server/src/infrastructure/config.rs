@@ -17,6 +17,38 @@ pub const DEFAULT_RECONNECT_GRACE_SECS: u64 = 120;
 /// file below the server's working `data/` directory, created if missing.
 pub const DEFAULT_DATABASE_URL: &str = "sqlite:./data/chess-server.db";
 
+/// Server tier role (design D8): `all` = monolith (default), `transport` = WS
+/// termination only, `logic` = authoritative game logic only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    All,
+    Transport,
+    Logic,
+}
+
+impl Default for Tier {
+    fn default() -> Self {
+        Tier::All
+    }
+}
+
+impl Tier {
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var("TIER") {
+            Err(_) => Ok(Tier::All),
+            Ok(raw) => match raw.trim().to_lowercase().as_str() {
+                "all" => Ok(Tier::All),
+                "transport" => Ok(Tier::Transport),
+                "logic" => Ok(Tier::Logic),
+                other => Err(format!(
+                    "TIER={other:?} is invalid; must be 'all', 'transport', or 'logic'"
+                )),
+            },
+        }
+    }
+}
+
 /// Default session lifetime (design D7): 30 days, long enough that a player
 /// signs in rarely and short enough that a leaked token stops working.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60;
@@ -108,6 +140,10 @@ pub struct Config {
     /// sends full `state` snapshots so the socket tests, which read one
     /// snapshot per broadcast, stay stable. Dedicated tests turn it on.
     pub incremental_updates: bool,
+    /// Server tier role (design D8). Defaults to `all` (monolith).
+    pub tier: Tier,
+    /// Redis connection URL (required when tier is `transport` or `logic`).
+    pub redis_url: Option<String>,
 }
 
 /// Read an optional unsigned integer for a security-relevant variable: an
@@ -166,6 +202,9 @@ impl Config {
         };
         argon2.validate()?;
 
+        let tier = Tier::from_env()?;
+        let redis_url = std::env::var("REDIS_URL").ok();
+
         Ok(Self {
             bind,
             port,
@@ -175,6 +214,8 @@ impl Config {
             argon2,
             random_colors: true,
             incremental_updates: true,
+            tier,
+            redis_url,
         })
     }
 
@@ -204,6 +245,8 @@ impl Config {
             argon2: Argon2Params::default(),
             random_colors: false,
             incremental_updates: false,
+            tier: Tier::All,
+            redis_url: None,
         }
     }
 }

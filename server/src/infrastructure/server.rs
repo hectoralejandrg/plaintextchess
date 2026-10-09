@@ -14,6 +14,7 @@ use crate::application::ports::{
     Accounts, AuthRecorder, ChessEngine, GameRecorder, PlayerAuth, ProfileStore, Ratings,
     RoomRegistry, RoomServices, SessionLookup, Sessions, TimeSource,
 };
+use crate::infrastructure::broker::Broker;
 use crate::application::room_actor::{run_room, RoomMsg};
 use crate::domain::account::Identity;
 use crate::domain::rating::RatingState;
@@ -26,7 +27,8 @@ use crate::infrastructure::engine::CoreEngine;
 use crate::infrastructure::password::{hash_token, now_ms, PasswordHasher};
 use crate::infrastructure::ratings::RatingStore;
 use crate::infrastructure::recorder::{MIGRATIONS, NoopGameRecorder, SqliteGameRecorder};
-use crate::interface::protocol::{ErrorCode, ServerMessage};
+use crate::interface::protocol::{ErrorCode, ServerMessage, VERSION};
+use crate::domain::account::UsernameError;
 
 /// The credential primitives the WebSocket auth handlers need, derived from
 /// the app's configuration (spec "Credential and Session Data Protection").
@@ -105,11 +107,22 @@ pub struct App {
     auth: Arc<PlayerAuthStore>,
     /// The durable side of `auth`. `None` for a run without a database.
     auth_recorder: Arc<dyn AuthRecorder>,
+    /// Optional broker for split-mode room ownership (Phase 3).
+    /// Present when running as TIER=logic; None for TIER=all.
+    broker: Option<Arc<Broker>>,
 }
 
 impl RoomRegistry for App {
     fn remove_room(&self, code: &str) {
         self.rooms.lock().unwrap().remove(code);
+        // Phase 3: release room ownership if we have a broker (split mode)
+        if let Some(broker) = &self.broker {
+            let code = code.to_string();
+            let broker = Arc::clone(broker);
+            tokio::spawn(async move {
+                let _ = broker.release_room(&code).await;
+            });
+        }
     }
 
     /// Forget a player, but only the entries still bound to this room (so a
@@ -128,6 +141,13 @@ impl RoomRegistry for App {
                 account_rooms.remove(account_id);
             }
         }
+    }
+}
+
+/// Helper to set the broker on an already-constructed App (for split mode).
+impl App {
+    pub fn set_broker(&mut self, broker: Arc<Broker>) {
+        self.broker = Some(broker);
     }
 }
 
@@ -151,6 +171,7 @@ impl App {
             recorder,
             auth: Arc::new(PlayerAuthStore::new()),
             auth_recorder: Arc::new(NoopAuthRecorder),
+            broker: None,
         }
     }
 
@@ -184,7 +205,6 @@ impl App {
             .map_err(|e| format!("database migrations failed for `{database_url}`: {e}"))?;
 
         let engine: Arc<dyn ChessEngine> = Arc::new(CoreEngine);
-        let ratings = Arc::new(RatingStore::new(Arc::clone(&engine)));
         // Design D1: the in-memory store is the runtime authority, seeded
         // from the database at startup so ratings survive restarts.
         let rows =
@@ -196,8 +216,10 @@ impl App {
             .map_err(|e| {
                 format!("loading persisted ratings failed for `{database_url}`: {e}")
             })?;
+
+        let rating_store = RatingStore::new(Arc::clone(&engine));
         for (device_id, rating, rating_deviation, volatility) in rows {
-            ratings.seed(
+            rating_store.seed(
                 &device_id,
                 RatingState {
                     rating,
@@ -206,6 +228,7 @@ impl App {
                 },
             );
         }
+        let ratings = Arc::new(rating_store);
 
         let time: Arc<dyn TimeSource> = Arc::new(SystemTimeSource::new());
         let recorder: Arc<dyn GameRecorder> = Arc::new(SqliteGameRecorder::new(pool.clone()));
@@ -264,6 +287,7 @@ impl App {
             recorder,
             auth,
             auth_recorder: Arc::new(SqliteAuthRecorder::new(pool)),
+            broker: None,
         })
     }
 
@@ -590,6 +614,296 @@ impl App {
             if !rooms.contains_key(&code) {
                 return code;
             }
+        }
+    }
+}
+
+/// Auth methods for the logic tier (extracted from ws.rs for reuse).
+impl App {
+    /// Register a new account (mirrors ws.rs::register).
+    pub async fn register(
+        self: &Arc<Self>,
+        username: &str,
+        password: &str,
+        device_id: Option<String>,
+    ) -> ServerMessage {
+        use crate::domain::account::{validate_password, validate_username, PasswordError};
+        use crate::infrastructure::password::now_ms;
+
+        // Validate before hashing
+        let username = match validate_username(username) {
+            Ok(username) => username,
+            Err(err) => return self.username_error_message(err),
+        };
+        if let Err(PasswordError::Length) = validate_password(password) {
+            return self.password_error_message();
+        }
+
+        let store = self.auth();
+        if store.account_by_username(&username).is_some() {
+            tracing::info!(username = %username, "registration refused: the username is taken");
+            return ServerMessage::error(ErrorCode::UsernameTaken);
+        }
+
+        let tooling = self.auth_tooling();
+        let password_hash = match tooling.hasher.hash(password).await {
+            Ok(hash) => hash,
+            Err(err) => {
+                tracing::error!(error = %err, "password hashing failed during registration");
+                return ServerMessage::error(ErrorCode::InvalidRequest);
+            }
+        };
+
+        let account = crate::domain::account::Account {
+            account_id: uuid::Uuid::new_v4().to_string(),
+            username: username.clone(),
+            username_key: crate::domain::account::username_key(&username),
+            password_hash,
+            display_name: None,
+            created_at_ms: now_ms(),
+        };
+        if let Err(err) = store.insert_account(account.clone()) {
+            tracing::info!(username = %username, error = %err, "registration refused: the username is taken");
+            return ServerMessage::error(ErrorCode::UsernameTaken);
+        }
+        let recorder = self.auth_recorder().clone();
+        let written = account.clone();
+        self.persist_auth(recorder, account.account_id.clone(), move |recorder| {
+            Box::pin(async move { recorder.record_account_created(&written).await })
+        })
+        .await;
+
+        if let Some(device) = device_id.as_deref() {
+            self.link_device_to(device, &account.account_id).await;
+        }
+
+        let (token, expires_at_ms) = self.issue_session(&account, device_id.as_deref()).await;
+        tracing::info!(
+            account_id = %account.account_id,
+            username = %account.username,
+            "registration succeeded"
+        );
+        self.session_message(&account, &token, expires_at_ms)
+    }
+
+    /// Login (mirrors ws.rs::login).
+    pub async fn login(
+        self: &Arc<Self>,
+        username: &str,
+        password: &str,
+        device_id: Option<String>,
+    ) -> ServerMessage {
+        use crate::domain::account::validate_password;
+
+        if validate_password(password).is_err() {
+            tracing::info!("login refused: the password is outside the accepted length");
+            return ServerMessage::error(ErrorCode::InvalidCredentials);
+        }
+
+        let store = self.auth();
+        let Some(account) = store.account_by_username(username) else {
+            tracing::info!("login refused: no such account");
+            return ServerMessage::error(ErrorCode::InvalidCredentials);
+        };
+
+        let tooling = self.auth_tooling();
+        if !tooling
+            .hasher
+            .verify(password, &account.password_hash)
+            .await
+        {
+            tracing::info!(account_id = %account.account_id, "login refused: wrong password");
+            return ServerMessage::error(ErrorCode::InvalidCredentials);
+        }
+
+        if let Some(device) = device_id.as_deref() {
+            self.link_device_to(device, &account.account_id).await;
+        }
+
+        let (token, expires_at_ms) = self.issue_session(&account, device_id.as_deref()).await;
+        tracing::info!(
+            account_id = %account.account_id,
+            username = %account.username,
+            "login succeeded"
+        );
+        self.session_message(&account, &token, expires_at_ms)
+    }
+
+    /// Logout (mirrors ws.rs::logout).
+    pub fn logout(self: &Arc<Self>, token: &str) -> ServerMessage {
+        let store = self.auth();
+        let token_hash = hash_token(token);
+        let now_ms = now_ms();
+
+        let Some(session) = store.session_of_token_hash(&token_hash) else {
+            tracing::info!("logout presented a token the server has never issued");
+            return ServerMessage::error(ErrorCode::NotAuthenticated);
+        };
+        match store.session_by_token_hash(&token_hash, now_ms) {
+            SessionLookup::Usable => {}
+            SessionLookup::Revoked => {
+                tracing::info!(account_id = %session.account_id, "logout of an already revoked session");
+                return ServerMessage::error(ErrorCode::NotAuthenticated);
+            }
+            SessionLookup::Absent => {
+                tracing::info!(account_id = %session.account_id, "logout of an expired session");
+                return ServerMessage::error(ErrorCode::SessionExpired);
+            }
+        }
+
+        store.revoke_session(&token_hash, now_ms);
+        let recorder = self.auth_recorder().clone();
+        let hash = token_hash.clone();
+        let revoked_for = session.account_id.clone();
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            this.persist_auth(recorder, revoked_for, move |recorder| {
+                Box::pin(async move { recorder.record_session_revoked(&hash, now_ms).await })
+            })
+            .await;
+        });
+
+        let Some(account) = store.account_by_id(&session.account_id) else {
+            return ServerMessage::error(ErrorCode::NotAuthenticated);
+        };
+        tracing::info!(account_id = %account.account_id, "logout succeeded");
+        ServerMessage::SessionOk {
+            v: VERSION,
+            account_id: account.account_id.clone(),
+            username: account.username.clone(),
+            display_name: account.reported_name().to_string(),
+            expires_at_ms: now_ms,
+        }
+    }
+
+    /// Set profile (mirrors ws.rs::set_profile).
+    pub async fn set_profile(
+        self: &Arc<Self>,
+        display_name: &str,
+        token: &str,
+    ) -> ServerMessage {
+        use crate::domain::account::validate_display_name;
+
+        let store = self.auth();
+        let token_hash = hash_token(token);
+        let now_ms = now_ms();
+
+        let Some(session) = store.session_of_token_hash(&token_hash) else {
+            tracing::info!("display-name change presented a token the server has never issued");
+            return ServerMessage::error(ErrorCode::NotAuthenticated);
+        };
+        if session.is_revoked() {
+            tracing::info!(account_id = %session.account_id, "display-name change with a revoked session");
+            return ServerMessage::error(ErrorCode::NotAuthenticated);
+        }
+        if session.is_expired(now_ms) {
+            tracing::info!(account_id = %session.account_id, "display-name change with an expired session");
+            return ServerMessage::error(ErrorCode::SessionExpired);
+        }
+
+        let display_name = match validate_display_name(display_name) {
+            Ok(name) => name,
+            Err(err) => {
+                tracing::info!(
+                    account_id = %session.account_id,
+                    reason = ?err,
+                    "display name refused: outside the accepted format"
+                );
+                return ServerMessage::error(ErrorCode::InvalidDisplayName);
+            }
+        };
+
+        store.set_display_name(&session.account_id, &display_name);
+        let recorder = self.auth_recorder().clone();
+        let account_id = session.account_id.clone();
+        let name = display_name.clone();
+        self.persist_auth(recorder, account_id.clone(), move |recorder| {
+            Box::pin(async move { recorder.record_display_name_changed(&account_id, &name).await })
+        })
+        .await;
+        tracing::info!(
+            account_id = %session.account_id,
+            "display name updated"
+        );
+        ServerMessage::ProfileUpdated {
+            v: VERSION,
+            account_id: session.account_id,
+            display_name,
+        }
+    }
+
+    fn session_message(&self, account: &crate::domain::account::Account, token: &str, expires_at_ms: i64) -> ServerMessage {
+        ServerMessage::Session {
+            v: VERSION,
+            account_id: account.account_id.clone(),
+            username: account.username.clone(),
+            display_name: account.reported_name().to_string(),
+            token: token.to_string(),
+            expires_at_ms,
+        }
+    }
+
+    fn username_error_message(&self, err: crate::domain::account::UsernameError) -> ServerMessage {
+        use crate::domain::account::{MAX_USERNAME_LEN, MIN_USERNAME_LEN};
+        let detail = match err {
+            UsernameError::Length => {
+                format!("username must be {MIN_USERNAME_LEN} to {MAX_USERNAME_LEN} characters")
+            }
+            UsernameError::Charset => {
+                "username may only contain letters, digits, underscore, and hyphen".to_string()
+            }
+        };
+        ErrorCode::InvalidRequest.with_message(detail)
+    }
+
+    fn password_error_message(&self) -> ServerMessage {
+        use crate::domain::account::{MAX_PASSWORD_LEN, MIN_PASSWORD_LEN};
+        ErrorCode::InvalidRequest
+            .with_message(format!("password must be {MIN_PASSWORD_LEN} to {MAX_PASSWORD_LEN} characters"))
+    }
+
+    async fn issue_session(
+        self: &Arc<Self>,
+        account: &crate::domain::account::Account,
+        device_id: Option<&str>,
+    ) -> (String, i64) {
+        use crate::infrastructure::password::{expires_at, generate_token, now_ms};
+
+        let store = self.auth();
+        let tooling = self.auth_tooling();
+        let token = generate_token();
+        let issued_at_ms = now_ms();
+        let expires_at_ms = expires_at(issued_at_ms, tooling.session_ttl);
+        let session = crate::domain::account::Session {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            account_id: account.account_id.clone(),
+            device_id: device_id.unwrap_or_default().to_string(),
+            token_hash: hash_token(&token),
+            created_at_ms: issued_at_ms,
+            expires_at_ms,
+            revoked_at_ms: None,
+        };
+        store.insert_session(session.clone());
+        let recorder = self.auth_recorder().clone();
+        let account_id = account.account_id.clone();
+        self.persist_auth(recorder, account_id, move |recorder| {
+            Box::pin(async move { recorder.record_session_issued(&session).await })
+        })
+        .await;
+        (token, expires_at_ms)
+    }
+
+    async fn persist_auth<F, Fut>(&self, recorder: Arc<dyn crate::application::ports::AuthRecorder>, account_id: String, make: F)
+    where
+        F: FnOnce(Arc<dyn crate::application::ports::AuthRecorder>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), crate::application::ports::RecorderError>>,
+    {
+        if let Err(err) = make(recorder).await {
+            tracing::error!(
+                error = %err,
+                %account_id,
+                "failed to persist an authentication change; it is applied in memory only"
+            );
         }
     }
 }
