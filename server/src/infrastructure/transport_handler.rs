@@ -73,6 +73,9 @@ pub struct TransportState {
     /// non-room-scoped frames (Move/Resign/Leave/Disconnect) are routed to the
     /// logic node that seats it, so several logic instances do not mis-route.
     conn_logic: Mutex<HashMap<String, String>>,
+    /// Round-robin index for balancing new rooms across live logic nodes.
+    /// Only used when placing a new room (create_room).
+    placement_rr: std::sync::atomic::AtomicUsize,
 }
 
 impl TransportState {
@@ -84,6 +87,7 @@ impl TransportState {
             healthy: AtomicBool::new(true),
             liveness_task: Mutex::new(None),
             conn_logic: Mutex::new(HashMap::new()),
+            placement_rr: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -309,11 +313,19 @@ impl TransportState {
 }
 
 /// Upgrade a WebSocket connection for the transport tier.
+///
+/// tungstenite allocates its read/write buffers eagerly per connection and
+/// defaults both to 128 KiB, which dominates the per-connection memory budget.
+/// Our frames are small JSON, so we shrink the initial buffers; they still grow
+/// on demand up to `max_frame_size`, so correctness is unaffected.
 pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<Arc<TransportState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_transport_socket(socket, state))
+    ws.read_buffer_size(8 * 1024)
+        .write_buffer_size(8 * 1024)
+        .max_write_buffer_size(64 * 1024)
+        .on_upgrade(move |socket| handle_transport_socket(socket, state))
 }
 
 /// Handle a WebSocket connection in the transport tier.
@@ -449,10 +461,11 @@ async fn handle_transport_text(
         _ => None,
     };
 
-    // Resolve the logic node(s) to try, most specific first: JoinRoom goes to the
-    // room's recorded owner; any other frame goes to the node that already serves
-    // this connection; then every registered logic node as a fallback. A stale
-    // membership key is tolerated because a 0-subscriber probe is skipped.
+    // Specific target first: a join goes to the room's recorded owner, any other
+    // frame to the node that already serves this connection. The full node list
+    // is only fetched if that target does not accept the frame, so the hot path
+    // (a move on a seated connection) costs ONE publish, not list + publish. A
+    // stale membership/target is tolerated: a 0-subscriber probe is skipped.
     let mut candidates: Vec<String> = Vec::new();
     if let Some(code) = &join_room_code {
         if let Some(owner) = resolve_room_owner(state, code).await {
@@ -460,19 +473,6 @@ async fn handle_transport_text(
         }
     } else if let Some(known) = state.conn_logic_node(connection_id) {
         candidates.push(known);
-    }
-    match state.broker.logic_nodes().await {
-        Ok(nodes) => {
-            for node in nodes {
-                if !candidates.contains(&node) {
-                    candidates.push(node);
-                }
-            }
-        }
-        Err(e) => tracing::warn!(error = %e, "failed to list logic nodes"),
-    }
-    if candidates.is_empty() {
-        candidates.push(DEFAULT_LOGIC_NODE.to_string());
     }
 
     let envelope = InboundEnvelope {
@@ -482,17 +482,64 @@ async fn handle_transport_text(
         payload: InboundPayload::Client(message),
     };
 
-    // Probe candidates until one delivers. A publish with 0 subscribers reaches
-    // nobody, so a live node delivers while a stale/dead id is skipped; retry
-    // (bounded) to allow a logic tier to resubscribe after a broker restart.
-    for attempt in 0..INBOUND_PUBLISH_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(INBOUND_PUBLISH_RETRY_DELAY).await;
-        }
+    // 1) Hot path: try the specific target(s) without paying for the node list.
+    if !candidates.is_empty() {
         for candidate in &candidates {
             match state.broker.publish_inbound_to(&envelope, candidate).await {
                 Ok(subscribers) if subscribers > 0 => {
                     state.set_conn_logic_node(connection_id, candidate);
+                    return true;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to publish inbound envelope");
+                    outbox.push(Outbound::BrokerUnavailable);
+                    return false;
+                }
+            }
+        }
+    }
+
+    // 2) Cold/fallback path: broaden to every registered logic node and retry
+    // (bounded) so a logic tier can resubscribe after a broker restart.
+    for attempt in 0..INBOUND_PUBLISH_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(INBOUND_PUBLISH_RETRY_DELAY).await;
+        }
+        let nodes = match state.broker.logic_nodes().await {
+            Ok(nodes) => nodes,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to list logic nodes");
+                Vec::new()
+            }
+        };
+        if nodes.is_empty() && candidates.is_empty() {
+            candidates.push(DEFAULT_LOGIC_NODE.to_string());
+        }
+        for node in nodes {
+            if candidates.contains(&node) {
+                continue;
+            }
+            candidates.push(node.clone());
+        }
+
+        // Round-robin placement for new rooms (create_room):
+        // When there's no specific target (no join_room_code and no existing
+        // conn_logic_node), rotate the candidate list so the next live node
+        // in round-robin order is tried first. This distributes new rooms
+        // across live logic nodes while keeping single-node behavior identical.
+        let is_create_room = join_room_code.is_none() && state.conn_logic_node(connection_id).is_none();
+        if is_create_room && !candidates.is_empty() {
+            let idx = state.placement_rr.fetch_add(1, Ordering::Relaxed) % candidates.len();
+            // Rotate so candidate at idx is tried first.
+            candidates.rotate_left(idx);
+        }
+
+        // Try any candidate not already tried above (the appended ones).
+        for candidate in candidates.clone() {
+            match state.broker.publish_inbound_to(&envelope, &candidate).await {
+                Ok(subscribers) if subscribers > 0 => {
+                    state.set_conn_logic_node(connection_id, &candidate);
                     return true;
                 }
                 Ok(_) => continue,
@@ -522,5 +569,57 @@ async fn resolve_room_owner(state: &Arc<TransportState>, room_code: &str) -> Opt
             tracing::warn!(room_code = %room_code, error = %e, "failed to read room owner");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    /// Round-robin placement distributes new rooms across live logic nodes.
+    /// The counter increments modulo the number of candidates, so each call
+    /// selects the next node in the list. The index sequence is 0, 1, 2, 0, 1, 2...
+    #[test]
+    fn placement_round_robins_over_nodes() {
+        let rr = std::sync::atomic::AtomicUsize::new(0);
+        let len = 3;
+
+        // Index sequence: 0, 1, 2, 0, 1, 2, ...
+        assert_eq!(rr.fetch_add(1, Ordering::Relaxed) % len, 0);
+        assert_eq!(rr.fetch_add(1, Ordering::Relaxed) % len, 1);
+        assert_eq!(rr.fetch_add(1, Ordering::Relaxed) % len, 2);
+        assert_eq!(rr.fetch_add(1, Ordering::Relaxed) % len, 0);
+        assert_eq!(rr.fetch_add(1, Ordering::Relaxed) % len, 1);
+        assert_eq!(rr.fetch_add(1, Ordering::Relaxed) % len, 2);
+    }
+
+    /// When there's only one candidate, round-robin always selects it.
+    #[test]
+    fn placement_round_robin_single_node() {
+        let rr = std::sync::atomic::AtomicUsize::new(0);
+        let len = 1;
+
+        for _ in 0..5 {
+            assert_eq!(rr.fetch_add(1, Ordering::Relaxed) % len, 0);
+        }
+    }
+
+    /// With two nodes, round-robin alternates.
+    #[test]
+    fn placement_round_robin_two_nodes() {
+        let rr = std::sync::atomic::AtomicUsize::new(0);
+        let len = 2;
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10 {
+            let idx = rr.fetch_add(1, Ordering::Relaxed) % len;
+            assert!(idx == 0 || idx == 1);
+            if idx == 0 {
+                seen.insert("node-a");
+            } else {
+                seen.insert("node-b");
+            }
+        }
+        assert_eq!(seen.len(), 2);
     }
 }

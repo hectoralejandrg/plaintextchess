@@ -158,6 +158,15 @@ pub mod ownership {
     /// TTL for room ownership (must be renewed by the logic node).
     pub const TTL_SECS: u64 = 60;
 
+    /// Lua body that renews one ownership lease if (and only if) we still own it.
+    const RENEW_SCRIPT: &str = r#"
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("expire", KEYS[1], ARGV[2])
+        else
+            return 0
+        end
+    "#;
+
     /// Claim ownership of a room.
     pub async fn claim(
         conn: &mut ConnectionManager,
@@ -211,6 +220,48 @@ pub mod ownership {
         "#);
         let result: i32 = script.key(key).arg(logic_node_id).arg(TTL_SECS).invoke_async(conn).await?;
         Ok(result == 1)
+    }
+
+    /// Renew multiple ownership leases in a single pipeline (design D4).
+    ///
+    /// Returns a vec of success (`true` = renewed, `false` = key lost or owned
+    /// by another node) in the same order as the input rooms. The Lua body is
+    /// sent via `EVALSHA` so a sweep is one round trip; if Redis reports
+    /// `NOSCRIPT` (e.g. its script cache was flushed by a restart), the script
+    /// is loaded once and the pipeline is retried, so the steady-state path
+    /// stays pipelined instead of falling back to one call per room.
+    pub async fn renew_pipelined(
+        conn: &mut ConnectionManager,
+        rooms: &[(String, String)], // (room_code, logic_node_id)
+    ) -> redis::RedisResult<Vec<bool>> {
+        if rooms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let script = Script::new(RENEW_SCRIPT);
+        let results: Vec<i32> = match build_renew_pipeline(&script, rooms).query_async(conn).await {
+            Ok(results) => results,
+            Err(e) if e.kind() == redis::ErrorKind::NoScriptError => {
+                script.prepare_invoke().load_async(conn).await?;
+                build_renew_pipeline(&script, rooms).query_async(conn).await?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(results.into_iter().map(|r| r == 1).collect())
+    }
+
+    /// Build the pipelined `EVALSHA` command for a batch of rooms.
+    fn build_renew_pipeline(script: &Script, rooms: &[(String, String)]) -> redis::Pipeline {
+        let mut pipe = redis::pipe();
+        for (room_code, logic_node_id) in rooms {
+            let key = format!("{}{}", PREFIX, room_code);
+            pipe.cmd("EVALSHA")
+                .arg(script.get_hash())
+                .arg(1)
+                .arg(key)
+                .arg(logic_node_id)
+                .arg(TTL_SECS);
+        }
+        pipe
     }
 }
 
@@ -596,6 +647,14 @@ impl Broker {
     pub async fn renew_room_lease(&self, room_code: &str) -> redis::RedisResult<bool> {
         let mut conn = self.conn();
         ownership::renew(&mut conn, room_code, &self.node_id).await
+    }
+
+    /// Renew multiple room ownership leases in a single pipeline (Phase 3, task 5.1).
+    /// Returns a vec of success (true = renewed, false = key lost/owned by other)
+    /// in the same order as the input rooms.
+    pub async fn renew_room_leases_pipelined(&self, rooms: &[(String, String)]) -> redis::RedisResult<Vec<bool>> {
+        let mut conn = self.conn();
+        ownership::renew_pipelined(&mut conn, rooms).await
     }
 
     /// Register logic node membership (Phase 3).

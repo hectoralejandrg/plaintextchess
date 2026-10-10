@@ -78,6 +78,11 @@ const PORT_SESSION_2: u16 = 18837;
 const PORT_LOAD_1: u16 = 18839;
 const PORT_LOAD_2: u16 = 18841;
 const PORT_LOAD_3: u16 = 18843;
+const PORT_LANES: u16 = 18845;
+const PORT_CONTROL: u16 = 18847;
+
+const PORT_DISTRIBUTION_1: u16 = 18849;
+const PORT_DISTRIBUTION_2: u16 = 18851;
 
 /// The Redis the split tests connect to: `REDIS_URL` when set (the design's
 /// gate), otherwise the local default.
@@ -150,6 +155,13 @@ async fn start_split(ports: &[u16]) -> Harness {
 /// Start the split tiers with an explicit reconnect grace (tests that must not
 /// wait the default 120 s for a grace to elapse).
 async fn start_split_with_grace(ports: &[u16], grace: Duration) -> Harness {
+    start_split_tuned(ports, grace, 1).await
+}
+
+/// Like `start_split_with_grace`, but with an explicit number of room lanes.
+/// A lane count greater than 1 exercises the sharded inbound fan-out: independent
+/// rooms are handled by different workers while a room maps to exactly one lane.
+async fn start_split_tuned(ports: &[u16], grace: Duration, room_lanes: usize) -> Harness {
     let db_dir = std::env::temp_dir().join(format!("ptc-split-e2e-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&db_dir).expect("create temp dir");
     let mut config = Config::with_database(format!("sqlite:{}/e2e.db", db_dir.display()));
@@ -172,7 +184,14 @@ async fn start_split_with_grace(ports: &[u16], grace: Duration) -> Harness {
     app.set_broker(Arc::clone(&logic_broker));
     let app = Arc::new(app);
 
-    let logic = Arc::new(LogicState::new(app, logic_broker.clone(), logic_node.clone()));
+    let room_lanes = room_lanes.max(1);
+    let logic = Arc::new(LogicState::new(
+        app,
+        logic_broker.clone(),
+        logic_node.clone(),
+        room_lanes,
+        room_lanes,
+    ));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let logic_handle = tokio::spawn(async move {
         let _ = logic.run(Some(ready_tx)).await;
@@ -2049,6 +2068,223 @@ async fn failover_has_no_double_owner() {
     );
 }
 
+/// This change (task 2.1/2.2): with four room lanes, independent rooms are
+/// processed by different workers while each room's moves keep their arrival
+/// order. Three games play concurrently (one ply per room per round), so all
+/// rooms are in flight across the lanes at once; a misrouted or reordered move
+/// would surface as a missing `Update` (the receive would time out) or an error.
+#[tokio::test]
+#[ignore]
+async fn per_room_order_preserved_across_lanes() {
+    let _guard = e2e_guard();
+    flush_ptc_keys().await;
+    let default_grace = Config::with_database("sqlite::memory:").reconnect_grace;
+    let _harness = start_split_tuned(&[PORT_LANES], default_grace, 4).await;
+
+    let plies = ["e2e4", "e7e5", "g1f3", "b8c6"];
+
+    let mut games = Vec::new();
+    for g in 0..3 {
+        let mut p1 = connect(PORT_LANES).await;
+        send(
+            &mut p1,
+            ClientMessage::CreateRoom {
+                v: VERSION,
+                player_id: format!("lanes-p1-{g}"),
+                time_control: Some("15+10".into()),
+                token: None,
+            },
+        )
+        .await;
+        let room_code = match recv(&mut p1, "p1 room_ready", is_room_ready, 5).await {
+            ServerMessage::RoomReady { room_code, .. } => room_code,
+            other => panic!("expected RoomReady, got {other:?}"),
+        };
+
+        let mut p2 = connect(PORT_LANES).await;
+        send(
+            &mut p2,
+            ClientMessage::JoinRoom {
+                v: VERSION,
+                player_id: format!("lanes-p2-{g}"),
+                room_code,
+                token: None,
+            },
+        )
+        .await;
+        recv(&mut p2, "p2 room_ready", is_room_ready, 5).await;
+
+        games.push((p1, p2));
+    }
+
+    // Advance every room one ply at a time (keeping each room's order), so the
+    // rooms progress concurrently across the four lanes.
+    for (i, uci) in plies.iter().enumerate() {
+        for (p1, p2) in games.iter_mut() {
+            let mover = if i % 2 == 0 { p1 } else { p2 };
+            send(
+                mover,
+                ClientMessage::Move { v: VERSION, uci: (*uci).into() },
+            )
+            .await;
+        }
+        for (p1, p2) in games.iter_mut() {
+            recv(p1, "p1 update", is_move(uci), 5).await;
+            recv(p2, "p2 update", is_move(uci), 5).await;
+        }
+    }
+}
+
+/// This change (task 4.1): control-plane messages from one connection are
+/// processed in order by its control lane, so a create-then-create sequence
+/// yields exactly one room and an `already_in_room` error rather than a race.
+#[tokio::test]
+#[ignore]
+async fn connection_control_order_preserved() {
+    let _guard = e2e_guard();
+    flush_ptc_keys().await;
+    let default_grace = Config::with_database("sqlite::memory:").reconnect_grace;
+    let _harness = start_split_tuned(&[PORT_CONTROL], default_grace, 4).await;
+
+    let mut p = connect(PORT_CONTROL).await;
+    for _ in 0..2 {
+        send(
+            &mut p,
+            ClientMessage::CreateRoom {
+                v: VERSION,
+                player_id: "device-control-order".into(),
+                time_control: Some("15+10".into()),
+                token: None,
+            },
+        )
+        .await;
+    }
+
+    recv(&mut p, "create #1", is_room_ready, 5).await;
+    let err = recv(
+        &mut p,
+        "create #2",
+        |m| matches!(m, ServerMessage::Error { .. }),
+        5,
+    )
+    .await;
+    match err {
+        ServerMessage::Error { code, .. } => assert_eq!(code, "already_in_room"),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}
+
+/// This change (task 5.1): the ownership renewal sweep renews every owned room
+/// in one pipelined round trip, reports a lost key as `false` so the caller
+/// re-claims it, and survives a Redis script-cache flush (a broker restart
+/// clears `EVALSHA` scripts) by reloading and retrying instead of failing or
+/// falling back to one call per room.
+#[tokio::test]
+#[ignore]
+async fn renew_pipelined_renews_all_and_survives_script_flush() {
+    let _guard = e2e_guard();
+    flush_ptc_keys().await;
+
+    let redis_url = test_redis_url();
+    let node = "renew-pipelined".to_string();
+    let broker = Broker::connect(&redis_url, node.clone())
+        .await
+        .expect("broker");
+
+    let codes = ["PIPE01", "PIPE02", "PIPE03"];
+    for code in codes {
+        assert!(broker.claim_room(code).await.expect("claim"), "claim {code}");
+    }
+    let rooms: Vec<(String, String)> =
+        codes.iter().map(|c| (c.to_string(), node.clone())).collect();
+
+    assert_eq!(
+        broker
+            .renew_room_leases_pipelined(&rooms)
+            .await
+            .expect("renew"),
+        vec![true, true, true],
+        "every owned room renews in one pipeline"
+    );
+
+    let client = redis::Client::open(redis_url.as_str()).expect("redis client");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+    let _: () = redis::cmd("DEL")
+        .arg("ptc.room_owner.PIPE02")
+        .query_async(&mut conn)
+        .await
+        .expect("del key");
+
+    assert_eq!(
+        broker
+            .renew_room_leases_pipelined(&rooms)
+            .await
+            .expect("renew after del"),
+        vec![true, false, true],
+        "only the lost key reports false"
+    );
+
+    let _: () = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut conn)
+        .await
+        .expect("script flush");
+
+    assert_eq!(
+        broker
+            .renew_room_leases_pipelined(&rooms)
+            .await
+            .expect("renew after script flush"),
+        vec![true, false, true],
+        "the pipelined sweep survives a script-cache flush"
+    );
+}
+
+/// Regression fix (BUG-P3-2): a graceful logic shutdown releases its room
+/// ownership and drops its membership key, so a survivor is not blocked by a
+/// stale owner or a membership entry that looks alive.
+#[tokio::test]
+#[ignore]
+async fn graceful_shutdown_releases_ownership_and_membership() {
+    let _guard = e2e_guard();
+    flush_ptc_keys().await;
+
+    let redis_url = test_redis_url();
+    let node = "shutdown-node".to_string();
+    let broker = Broker::connect(&redis_url, node.clone())
+        .await
+        .expect("broker");
+
+    broker.register_logic_node(None).await.expect("register");
+    for code in ["SHDN01", "SHDN02"] {
+        assert!(broker.claim_room(code).await.expect("claim"), "claim {code}");
+    }
+    assert!(
+        broker.logic_nodes().await.expect("nodes").iter().any(|n| n == &node),
+        "the node is registered before shutdown"
+    );
+
+    for code in ["SHDN01", "SHDN02"] {
+        let _ = broker.release_room(code).await;
+    }
+    broker.unregister_logic_node().await.expect("unregister");
+
+    assert!(
+        !broker.logic_nodes().await.expect("nodes").iter().any(|n| n == &node),
+        "the membership key is dropped after shutdown"
+    );
+    for code in ["SHDN01", "SHDN02"] {
+        assert_eq!(
+            broker.get_room_owner(code).await.expect("owner"),
+            None,
+            "ownership for {code} is released after shutdown"
+        );
+    }
+}
+
 /// Phase 3 (task 4.5): a session issued by one logic instance is
 /// accepted by another through the shared Redis mirror, and a
 /// logout on one node revokes the token everywhere. Only the
@@ -2369,7 +2605,7 @@ async fn start_split_multi_logic(logic_count: usize, ports: &[u16]) -> MultiLogi
         app.set_broker(Arc::clone(&broker));
         let app = Arc::new(app);
 
-        let logic = Arc::new(LogicState::new(app, broker, node_id.clone()));
+        let logic = Arc::new(LogicState::new(app, broker, node_id.clone(), 1, 1));
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             let _ = logic.run(Some(ready_tx)).await;
@@ -2826,7 +3062,6 @@ async fn load_smoke_per_connection_budget() {
     );
 
     const NUM_CLIENTS: usize = 10; // 5 games, very light sequential load
-    const MOVES_PER_GAME: usize = 0; // no moves, just create+join for RSS/FD baseline
 
     // Run games SEQUENTIALLY (one at a time) to avoid overwhelming the
     // single logic node which processes inbound messages in series.
@@ -2912,6 +3147,69 @@ async fn load_smoke_per_connection_budget() {
 
 /// Sample RSS (KB) and open FD count for a PID.
 /// Cross-platform: Linux reads /proc, macOS uses `ps`.
+
+/// Phase 2 (Balance Room Placement): verify that new rooms are distributed
+/// across live logic nodes. With two logic instances running, creating many
+/// rooms should result in rooms being owned by both instances (not all on one).
+#[tokio::test]
+#[ignore]
+async fn rooms_distributed_across_logic_nodes() {
+    let _guard = e2e_guard();
+    // Two logic instances and two transport nodes.
+    let h = start_split_multi_logic(2, &[PORT_DISTRIBUTION_1, PORT_DISTRIBUTION_2]).await;
+    assert_eq!(h.logic_count(), 2, "two logic instances must be running");
+
+    // Both instances registered membership.
+    let registered = scan_keys("ptc.logic_node.*").await;
+    assert!(
+        registered.len() >= 2,
+        "both logic instances must register membership, got {registered:?}"
+    );
+
+    // Create many rooms sequentially - they should be distributed across both logic nodes.
+    const NUM_ROOMS: usize = 20;
+    let mut room_owners = std::collections::HashMap::new();
+
+    for i in 0..NUM_ROOMS {
+        let transport_port = h.port(i % h.transports.len());
+        let device_id = format!("device-dist-{i}");
+
+        let mut conn = connect(transport_port).await;
+        send(
+            &mut conn,
+        ClientMessage::CreateRoom {
+            v: VERSION,
+            player_id: device_id,
+            time_control: None,
+            token: None,
+        },
+    )
+    .await;
+    let room_code = match recv(&mut conn, "create room", is_room_ready, 10).await {
+        ServerMessage::RoomReady { room_code, .. } => room_code,
+        other => panic!("expected RoomReady, got {other:?}"),
+    };
+
+    // Record the owner of this room.
+    let owner = wait_room_owner(&room_code, true).await;
+    assert!(owner.is_some(), "room {room_code} must have an owner");
+    *room_owners.entry(owner.unwrap()).or_insert(0) += 1;
+    }
+
+    // Verify rooms are distributed across both logic instances.
+    // At least one room on each node (statistically very likely with 20 rooms).
+    assert_eq!(
+        room_owners.len(),
+        2,
+        "rooms should be distributed across both logic nodes, got {room_owners:?}"
+    );
+
+    // Verify each node has a reasonable share (not all on one).
+    for (owner, count) in &room_owners {
+        assert!(*count > 0 && *count < NUM_ROOMS, "node {owner} has {count} rooms, expected balanced distribution");
+    }
+}
+
 async fn sample_rss_fds(pid: u32) -> (u64, u64) {
     #[cfg(target_os = "linux")]
     {

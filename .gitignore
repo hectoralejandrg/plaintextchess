@@ -51,3 +51,8 @@ graphify-out
 
 # iOS build output (xcodebuild -derivedDataPath ios/build)
 ios/build/
+
+# ---------------------------------------------------------------------------
+# Local runtime data (server SQLite lives under ./data by default)
+# ---------------------------------------------------------------------------
+data/

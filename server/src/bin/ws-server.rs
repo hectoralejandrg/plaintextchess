@@ -193,8 +193,16 @@ async fn run_logic(config: Config, mut app: Arc<App>) {
 
     tracing::info!(tier = "logic", node_id = %node_id, "ws-server (logic) starting");
 
-    // Per-tier health endpoint with tier and node_id.
-    let health_node_id = node_id.clone();
+    let logic_state = Arc::new(LogicState::new(
+        app,
+        broker,
+        node_id,
+        config.logic_lanes,
+        config.logic_control_lanes,
+    ));
+
+    // Per-tier health endpoint with tier, node_id and lane metrics (task 6.1).
+    let health_state = Arc::clone(&logic_state);
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await
         .expect("bind listener");
@@ -202,20 +210,22 @@ async fn run_logic(config: Config, mut app: Arc<App>) {
         bind = %config.bind,
         port = config.port,
         tier = "logic",
-        node_id = %node_id,
+        node_id = %logic_state.get_node_id(),
         "ws-server (logic) health endpoint listening"
     );
     let router = axum::Router::new().route(
         "/healthz",
         axum::routing::get(move || {
-            let nid = health_node_id.clone();
+            let state = Arc::clone(&health_state);
             async move {
-                axum::Json(serde_json::json!({
-                    "status": "ok",
-                    "tier": "logic",
-                    "node_id": nid,
-                    "protocol_version": VERSION,
-                }))
+                let mut body = state.metrics_snapshot();
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("status".to_string(), serde_json::json!("ok"));
+                    obj.insert("tier".to_string(), serde_json::json!("logic"));
+                    obj.insert("node_id".to_string(), serde_json::json!(state.get_node_id()));
+                    obj.insert("protocol_version".to_string(), serde_json::json!(VERSION));
+                }
+                axum::Json(body)
             }
         }),
     );
@@ -226,10 +236,10 @@ async fn run_logic(config: Config, mut app: Arc<App>) {
         }
     });
 
-    let logic_state = Arc::new(LogicState::new(app, broker, node_id));
-    let run_state = Arc::clone(&logic_state);
+    // Keep one Arc to trigger graceful shutdown while the reader loop runs.
+    let shutdown_state = Arc::clone(&logic_state);
     tokio::select! {
-        result = run_state.run(None) => {
+        result = logic_state.run(None) => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "logic tier exited with error");
                 std::process::exit(1);
@@ -237,7 +247,7 @@ async fn run_logic(config: Config, mut app: Arc<App>) {
         }
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received; releasing rooms and membership");
-            logic_state.shutdown().await;
+            shutdown_state.shutdown().await;
         }
     }
 }

@@ -59,6 +59,8 @@ The transport tier listens on `PORT` (default 8765) for client WebSocket connect
 | `ARGON2_MEMORY_KIB` | Argon2 memory cost (KiB) | `19456` | All modes |
 | `ARGON2_TIME_COST` | Argon2 time cost | `2` | All modes |
 | `ARGON2_PARALLELISM` | Argon2 parallelism | `1` | All modes |
+| `LOGIC_LANES` | Number of inbound processing lanes for logic tier (room-scoped messages); `hash(room_code) % K` partitioning preserves per-room order | `1` (serial) | `logic` |
+| `LOGIC_CONTROL_LANES` | Number of control-plane lanes for logic tier (create room + auth); keyed by `connection_id` to isolate auth from moves | `1` | `logic` |
 
 ## Architecture
 
@@ -93,9 +95,17 @@ The transport tier listens on `PORT` (default 8765) for client WebSocket connect
 ### Logic Tier (`TIER=logic`)
 - Owns authoritative room state (board, move list, clocks, ratings)
 - Subscribes to inbound envelopes from transport tier
+- **Processes inbound messages through a sharded lane model:**
+  - A single reader parses envelopes from Redis and routes them to `LOGIC_LANES` bounded `mpsc` channels.
+  - Room-scoped messages (join by room code, moves, resigns, leaves, and disconnects for a seated connection) are routed to lane `hash(room_code) % K`, so a room's messages stay ordered while independent rooms run in parallel.
+  - Control-plane messages (create room and auth) are routed to `LOGIC_CONTROL_LANES` channels keyed by `connection_id`, isolating argon2 auth and create-room Redis round trips from the move path.
+  - Lanes are bounded; when a lane is full the reader pauses (backpressure) rather than growing memory without limit. Because there is a single reader, a saturated lane also backpressures the other lanes (a documented limitation; per-shard consumption is the future fix).
+  - Setting `LOGIC_LANES=1` (the default) reproduces the original serial behavior.
 - Runs room actors (`run_room`) that apply game rules
 - Publishes outbound `ServerMessage` envelopes to the correct transport node
 - Handles authentication, session management, persistence (SQLite)
+- Places each new room on a live logic instance in round-robin order, so
+  several instances share new rooms (a single instance takes every room)
 - Exposes `GET /healthz` on `BIND`/`PORT` (per-tier health)
 - Re-establishes its inbound subscription on broker loss; if the broker stays
   down past a bounded number of attempts it exits non-zero so a supervisor
@@ -384,3 +394,84 @@ connection's registry entry (`ptc.conn.{connection_id}`) carries a
 bounded TTL, so it is reclaimed even if its disconnect was never
 delivered, and transport-node liveness (D11) synthesizes disconnects
 for a crashed node's connections.
+
+### Lease TTL Invariant (Task 5.2)
+
+The logic tier asserts at startup that the room ownership TTL safely
+exceeds the renewal sweep interval plus the worst-case sweep duration.
+This prevents a live node from spuriously re-claiming its own rooms
+under load.
+
+- **Room ownership TTL**: 60 seconds (`ownership::TTL_SECS`)
+- **Renewal sweep interval**: 10 seconds (`ROOM_LEASE_RENEW_INTERVAL`)
+- **Maximum sweep duration**: 5 seconds (`ROOM_LEASE_RENEW_SWEEP_MAX`, one pipelined round trip)
+- **Invariant**: `TTL > sweep_interval + sweep_max` → `60 > 10 + 5` ✓
+
+If this invariant is violated at startup, the logic tier refuses to
+start with a clear error message, preventing silent misconfiguration
+that would cause spurious re-claims under load.
+
+### Observability and Metrics (Task 6.1)
+
+The logic tier's `/healthz` endpoint reports live per-lane metrics so
+per-node capacity and regressions are measurable:
+
+- **Per-lane queue depth** (`depth`): pending envelopes in that lane,
+  derived from the bounded channel (`max_capacity - capacity`).
+- **Per-lane processing latency** (`last_us`/`max_us`/`avg_us`):
+  microseconds from the reader routing an envelope to its worker
+  finishing `handle_inbound` (queue wait + processing).
+- **Inbound move-dispatch latency** (`move_dispatch`): the same
+  measurement restricted to `Move` envelopes. It covers routing to
+  dispatch; it does not include the room actor applying the move or the
+  outbound `Update` publish.
+
+Each `room_lane_metrics[i]` / `control_lane_metrics[i]` object carries
+`depth`, `processed`, `last_us`, `max_us`, and `avg_us`.
+
+Example `/healthz` response (2 room lanes, 1 control lane):
+```json
+{
+  "status": "ok",
+  "tier": "logic",
+  "node_id": "logic-abc123",
+  "protocol_version": 1,
+  "room_lanes": 2,
+  "control_lanes": 1,
+  "room_lane_metrics": [
+    { "depth": 0, "processed": 1542, "last_us": 38, "max_us": 210, "avg_us": 41 },
+    { "depth": 3, "processed": 1487, "last_us": 55, "max_us": 305, "avg_us": 44 }
+  ],
+  "control_lane_metrics": [
+    { "depth": 0, "processed": 12, "last_us": 120, "max_us": 980, "avg_us": 310 }
+  ],
+  "move_dispatch": { "processed": 3013, "last_us": 40, "max_us": 305, "avg_us": 42 }
+}
+```
+
+## Per-Node Capacity (measured)
+
+Release build, Apple M2 Max (12 cores, 32 GB), one logic node and one transport
+on the same host, driven by a self-paced load (games of 20 plies, a move every
+~60 ms). Move-ack latency is measured end-to-end from the client.
+
+| Concurrent games | Players | move-ack p95 |
+|---|---|---|
+| 1,000 | 2,000 | 4 ms |
+| 2,000 | 4,000 | 24 ms |
+| ~2,000–2,700 | ~4,000–5,400 | 100 ms (crossing) |
+| 3,000 | 6,000 | 106 ms |
+| 4,000 | 8,000 | 286 ms (degraded) |
+
+Peak sustained throughput is ~23k moves/s at 2,000 games. Before this change the
+ceiling was ~950–1,250 games (~2.0k–2.5k players) and ~7.9k moves/s; the gain
+came from removing a per-frame fabric lookup from the transport hot path, not
+from the handler lanes (4 lanes == 1 lane). The sharded lanes preserve per-room
+ordering and isolate the control plane; they do not add per-node capacity.
+
+The remaining lever is per-message lock/timer contention in the fabric
+(`reduce-fabric-contention`); new rooms are now distributed across live logic
+nodes, so adding logic instances multiplies capacity.
+
+Caveats: single host, synthetic uniform load, one sample per point. These are a
+per-node baseline, not a production SLA.

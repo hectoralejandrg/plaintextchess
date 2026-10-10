@@ -45,11 +45,20 @@ pub async fn healthz() -> Json<serde_json::Value> {
     }))
 }
 
+/// Upgrade a WebSocket connection for the single-tier (`all`) server.
+///
+/// Keep the buffer sizes in step with the split transport tier: tungstenite
+/// defaults to 128 KiB read/write buffers allocated eagerly per connection,
+/// which dominates the per-connection memory budget. Frames here are small
+/// JSON, so shrink the initial buffers (they grow on demand as needed).
 pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(app): State<Arc<App>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, app))
+    ws.read_buffer_size(8 * 1024)
+        .write_buffer_size(8 * 1024)
+        .max_write_buffer_size(64 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, app))
 }
 
 async fn handle_socket(socket: WebSocket, app: Arc<App>) {

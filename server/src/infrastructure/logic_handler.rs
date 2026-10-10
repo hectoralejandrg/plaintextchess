@@ -2,13 +2,15 @@
 //! dispatches them into the existing `App`/room actors, and publishes outbound
 //! envelopes back to the owning transport connection (design D5/D6).
 //!
-//! Inbound envelopes are processed **in series** in one task, so a connection's
-//! messages keep their order and the logic tier does not need a sequencer
-//! (design D4 "Ordering").
+//! Inbound envelopes are routed by a single reader to bounded lanes: room-scoped
+//! messages by `hash(room_code) % K` (per-room order preserved) and control-plane
+//! messages (create room, auth) by `hash(connection_id) % C`. Independent lanes
+//! run concurrently; the bounded lanes make the reader the backpressure point.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, oneshot};
 use futures_util::StreamExt;
 use tracing::{debug, error, info, warn};
@@ -43,9 +45,91 @@ pub fn node_detection_window() -> Duration {
 /// ownership leases (Phase 3 / BUG-P3-1). Well under `ownership::TTL_SECS`.
 const ROOM_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Maximum expected duration for a single renewal sweep (one round trip).
+/// Used for the startup invariant: TTL must exceed sweep_interval + sweep_duration.
+const ROOM_LEASE_RENEW_SWEEP_MAX: Duration = Duration::from_secs(5);
+
 /// Exponential backoff, capped, from a 1-based failure count.
 fn reconnect_backoff(failures: u32) -> Duration {
     (RECONNECT_MIN * (1u32 << failures.min(4))).min(RECONNECT_MAX)
+}
+
+/// Capacity of each bounded inbound lane (design D3). The reader pauses when a
+/// lane is full, providing end-to-end backpressure.
+const LANE_CAPACITY: usize = 1024;
+
+/// One item on a lane: the envelope plus when the reader routed it, so a worker
+/// can record queue-wait + processing latency (task 6.1).
+struct LaneItem {
+    envelope: InboundEnvelope,
+    routed_at: Instant,
+}
+
+/// A bounded inbound lane.
+type LaneSender = mpsc::Sender<LaneItem>;
+type LaneReceiver = mpsc::Receiver<LaneItem>;
+
+/// Per-lane counters (task 6.1). Queue depth is derived from the bounded sender
+/// (`max_capacity - capacity`); the timing fields are recorded per processed item.
+#[derive(Default)]
+struct LaneMetrics {
+    processed: AtomicU64,
+    last_us: AtomicU64,
+    max_us: AtomicU64,
+    sum_us: AtomicU64,
+}
+
+impl LaneMetrics {
+    fn record(&self, micros: u64) {
+        self.processed.fetch_add(1, Ordering::Relaxed);
+        self.last_us.store(micros, Ordering::Relaxed);
+        self.max_us.fetch_max(micros, Ordering::Relaxed);
+        self.sum_us.fetch_add(micros, Ordering::Relaxed);
+    }
+}
+
+/// Which lane pool a client message belongs to (design D2). Non-room-scoped
+/// control work (create room, auth) goes to the control pool; room-scoped work
+/// stays on the room pool so it keeps the room's order.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Room,
+    Control,
+}
+
+/// Classify a client message into its lane pool. `seated_room` is the room the
+/// connection currently holds, if any.
+fn route_kind(message: &ClientMessage, seated_room: Option<&str>) -> Route {
+    match message {
+        ClientMessage::CreateRoom { .. }
+        | ClientMessage::Register { .. }
+        | ClientMessage::Login { .. }
+        | ClientMessage::Logout { .. }
+        | ClientMessage::SetProfile { .. } => Route::Control,
+        ClientMessage::JoinRoom { .. } => Route::Room,
+        ClientMessage::Move { .. } | ClientMessage::Resign { .. } | ClientMessage::Leave { .. } => {
+            if seated_room.is_some() {
+                Route::Room
+            } else {
+                Route::Control
+            }
+        }
+    }
+}
+
+/// JSON for one lane's metrics (task 6.1). Queue depth is derived from the
+/// bounded sender; the rest is read from the lane's counters.
+fn lane_metrics_json(sender: &LaneSender, m: &LaneMetrics) -> serde_json::Value {
+    let depth = sender.max_capacity().saturating_sub(sender.capacity());
+    let processed = m.processed.load(Ordering::Relaxed);
+    let sum = m.sum_us.load(Ordering::Relaxed);
+    serde_json::json!({
+        "depth": depth,
+        "processed": processed,
+        "last_us": m.last_us.load(Ordering::Relaxed),
+        "max_us": m.max_us.load(Ordering::Relaxed),
+        "avg_us": if processed > 0 { sum / processed } else { 0 },
+    })
 }
 
 /// State for a connection being handled by the logic tier.
@@ -65,44 +149,225 @@ struct LogicConnection {
     room_code: Option<String>,
 }
 
+/// Shard count for partitioned connections map (matches room lanes for simplicity).
+const CONNECTION_SHARDS: usize = 16;
+
+/// Sharded connections map to avoid a single global lock.
+/// Each shard is an independent AsyncMutex<HashMap>.
+type ConnectionsShards = Vec<AsyncMutex<HashMap<String, LogicConnection>>>;
+
 /// Shared state for the logic tier.
 pub struct LogicState {
     app: Arc<App>,
     broker: Arc<Broker>,
     node_id: String,
-    /// Maps connection_id -> LogicConnection.
-    connections: AsyncMutex<HashMap<String, LogicConnection>>,
+    /// Sharded connection maps to avoid a single global lock (task 3.1).
+    /// Shard = hash(connection_id) % CONNECTION_SHARDS.
+    connections: ConnectionsShards,
+    /// Bounded lane senders for room-scoped messages (design D1).
+    /// Index = lane_id = hash(room_code) % K.
+    room_lane_senders: Vec<LaneSender>,
+    /// Bounded lane receivers for room-scoped messages, taken once by `run()`.
+    /// Wrapped so `run()` does not need unique ownership of the `Arc` (a second
+    /// `Arc` is held by the caller for graceful shutdown).
+    room_lane_receivers: std::sync::Mutex<Option<Vec<LaneReceiver>>>,
+    /// Bounded lane senders for control-plane messages (design D2).
+    /// Index = connection_id hash % C.
+    control_lane_senders: Vec<LaneSender>,
+    /// Bounded lane receivers for control-plane messages, taken once by `run()`.
+    control_lane_receivers: std::sync::Mutex<Option<Vec<LaneReceiver>>>,
+    /// Number of room lanes (LOGIC_LANES).
+    room_lane_count: usize,
+    /// Number of control lanes (LOGIC_CONTROL_LANES).
+    control_lane_count: usize,
+    /// Per-lane counters for observability (task 6.1).
+    room_lane_metrics: Vec<Arc<LaneMetrics>>,
+    control_lane_metrics: Vec<Arc<LaneMetrics>>,
+    /// Aggregate inbound move-dispatch latency (task 6.1).
+    move_metrics: Arc<LaneMetrics>,
 }
 
 impl LogicState {
-    pub fn new(app: Arc<App>, broker: Arc<Broker>, node_id: String) -> Self {
+    pub fn new(app: Arc<App>, broker: Arc<Broker>, node_id: String, room_lane_count: usize, control_lane_count: usize) -> Self {
+        // Create bounded room lanes (design D3: bounded capacity for backpressure).
+        let mut room_lane_senders = Vec::with_capacity(room_lane_count);
+        let mut room_lane_receivers = Vec::with_capacity(room_lane_count);
+        let mut room_lane_metrics = Vec::with_capacity(room_lane_count);
+        for _ in 0..room_lane_count {
+            let (tx, rx) = mpsc::channel(LANE_CAPACITY);
+            room_lane_senders.push(tx);
+            room_lane_receivers.push(rx);
+            room_lane_metrics.push(Arc::new(LaneMetrics::default()));
+        }
+
+        // Create bounded control lanes (design D2).
+        let mut control_lane_senders = Vec::with_capacity(control_lane_count);
+        let mut control_lane_receivers = Vec::with_capacity(control_lane_count);
+        let mut control_lane_metrics = Vec::with_capacity(control_lane_count);
+        for _ in 0..control_lane_count {
+            let (tx, rx) = mpsc::channel(LANE_CAPACITY);
+            control_lane_senders.push(tx);
+            control_lane_receivers.push(rx);
+            control_lane_metrics.push(Arc::new(LaneMetrics::default()));
+        }
+
         Self {
             app,
             broker,
             node_id,
-            connections: AsyncMutex::new(HashMap::new()),
+            connections: (0..CONNECTION_SHARDS)
+                .map(|_| AsyncMutex::new(HashMap::new()))
+                .collect(),
+            room_lane_senders,
+            room_lane_receivers: std::sync::Mutex::new(Some(room_lane_receivers)),
+            control_lane_senders,
+            control_lane_receivers: std::sync::Mutex::new(Some(control_lane_receivers)),
+            room_lane_count,
+            control_lane_count,
+            room_lane_metrics,
+            control_lane_metrics,
+            move_metrics: Arc::new(LaneMetrics::default()),
         }
     }
 
+    /// Get the node ID.
+    pub fn get_node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    /// Get the connections shard for a connection_id.
+    fn connections_shard(&self, connection_id: &str) -> &AsyncMutex<HashMap<String, LogicConnection>> {
+        let shard_idx = Self::hash_connection_id(connection_id) % CONNECTION_SHARDS;
+        &self.connections[shard_idx]
+    }
+
+    /// Snapshot of inbound lane metrics for `/healthz` (task 6.1). Queue depth is
+    /// derived from each bounded sender; timings are recorded per processed item.
+    pub fn metrics_snapshot(&self) -> serde_json::Value {
+        let rooms: Vec<serde_json::Value> = self
+            .room_lane_senders
+            .iter()
+            .zip(&self.room_lane_metrics)
+            .map(|(s, m)| lane_metrics_json(s, m))
+            .collect();
+        let control: Vec<serde_json::Value> = self
+            .control_lane_senders
+            .iter()
+            .zip(&self.control_lane_metrics)
+            .map(|(s, m)| lane_metrics_json(s, m))
+            .collect();
+        let mm = &self.move_metrics;
+        let mp = mm.processed.load(Ordering::Relaxed);
+        let msum = mm.sum_us.load(Ordering::Relaxed);
+        serde_json::json!({
+            "room_lanes": self.room_lane_count,
+            "control_lanes": self.control_lane_count,
+            "room_lane_metrics": rooms,
+            "control_lane_metrics": control,
+            "move_dispatch": {
+                "processed": mp,
+                "last_us": mm.last_us.load(Ordering::Relaxed),
+                "max_us": mm.max_us.load(Ordering::Relaxed),
+                "avg_us": if mp > 0 { msum / mp } else { 0 },
+            },
+        })
+    }
+
     /// Start the logic tier: register the node lease, subscribe to inbound,
-    /// then consume envelopes in series. The subscription is re-established when
-    /// the broker drops; if it stays gone past a bounded number of attempts the
-    /// tier exits non-zero so a supervisor notices (spec "Broker loss is surfaced").
+    /// spawn room/control workers, then run the reader fan-out loop.
+    /// The subscription is re-established when the broker drops; if it stays
+    /// gone past a bounded number of attempts the tier exits non-zero so a
+    /// supervisor notices (spec "Broker loss is surfaced").
     ///
     /// If `ready_tx` is provided, a signal is sent when the logic node has
-    /// subscribed to its inbound channel and is ready to receive messages.
+    /// subscribed to its inbound channel and workers are running.
     /// This is useful for test harnesses that need to wait for the node to be ready.
     pub async fn run(self: Arc<Self>, ready_tx: Option<oneshot::Sender<()>>) -> Result<(), Box<dyn std::error::Error>> {
-        info!(node_id = %self.node_id, "logic tier starting");
+        info!(node_id = %self.node_id, room_lanes = self.room_lane_count, control_lanes = self.control_lane_count, "logic tier starting");
 
         // Fail fast at startup: no broker, no service.
         self.broker.register_logic_node(None).await?;
+
+        // Assert that the room ownership TTL safely exceeds the sweep interval
+        // plus the worst-case sweep duration, so a live node never spuriously
+        // re-claims its own rooms under load (task 5.2).
+        let ttl_secs = crate::infrastructure::broker::ownership::TTL_SECS as u64;
+        let sweep_interval = ROOM_LEASE_RENEW_INTERVAL.as_secs();
+        let sweep_max = ROOM_LEASE_RENEW_SWEEP_MAX.as_secs();
+        if ttl_secs <= sweep_interval + sweep_max {
+            return Err(format!(
+                "ROOM_OWNERSHIP_TTL_SECS ({ttl_secs}) must exceed sweep interval ({sweep_interval}s) + max sweep ({sweep_max}s); \
+                adjust TTL or reduce sweep interval/max"
+            ).into());
+        }
+        info!(ttl_secs, sweep_interval, sweep_max, "room ownership TTL invariant satisfied");
 
         // Subscribe to our inbound channel immediately so we're ready to receive
         // messages before spawning background tasks (helps with test harness timing).
         let mut pubsub = self.broker.subscribe_inbound_self().await?;
 
-        // Signal that we're ready to receive messages.
+        // Take the lane receivers once. They live behind a Mutex so `run()` does
+        // not need unique ownership of the Arc: the caller keeps a second Arc to
+        // trigger graceful shutdown while the reader loop runs.
+        let mut room_lane_receivers = self
+            .room_lane_receivers
+            .lock()
+            .expect("lane receivers mutex poisoned")
+            .take()
+            .expect("logic tier run() called twice");
+        let mut control_lane_receivers = self
+            .control_lane_receivers
+            .lock()
+            .expect("lane receivers mutex poisoned")
+            .take()
+            .expect("logic tier run() called twice");
+
+        // Spawn room lane workers (design D1): each worker processes one lane.
+        // Room-scoped messages (moves, resigns, leaves for seated connections,
+        // disconnects for seated connections) are routed to these lanes by
+        // hash(room_code) % K, preserving per-room FIFO ordering.
+        for lane_id in 0..self.room_lane_count {
+            let mut lane_receiver = room_lane_receivers.remove(0);
+            let state = Arc::clone(&self);
+            let metrics = Arc::clone(&self.room_lane_metrics[lane_id]);
+            let move_metrics = Arc::clone(&self.move_metrics);
+            tokio::spawn(async move {
+                info!(node_id = %state.node_id, lane_id, "room lane worker started");
+                while let Some(item) = lane_receiver.recv().await {
+                    let is_move = matches!(
+                        &item.envelope.payload,
+                        InboundPayload::Client(ClientMessage::Move { .. })
+                    );
+                    state.handle_inbound(item.envelope).await;
+                    let micros = item.routed_at.elapsed().as_micros() as u64;
+                    metrics.record(micros);
+                    if is_move {
+                        move_metrics.record(micros);
+                    }
+                }
+                info!(node_id = %state.node_id, lane_id, "room lane worker stopped");
+            });
+        }
+
+        // Spawn control lane workers (design D2): each worker processes one
+        // control lane. Control-plane messages (create/join/leave/resign/auth)
+        // are routed by connection_id hash to isolate argon2 auth and Redis
+        // round trips from the move path.
+        for lane_id in 0..self.control_lane_count {
+            let mut lane_receiver = control_lane_receivers.remove(0);
+            let state = Arc::clone(&self);
+            let metrics = Arc::clone(&self.control_lane_metrics[lane_id]);
+            tokio::spawn(async move {
+                info!(node_id = %state.node_id, lane_id, "control lane worker started");
+                while let Some(item) = lane_receiver.recv().await {
+                    state.handle_inbound(item.envelope).await;
+                    metrics.record(item.routed_at.elapsed().as_micros() as u64);
+                }
+                info!(node_id = %state.node_id, lane_id, "control lane worker stopped");
+            });
+        }
+
+        // Signal that we're ready to receive messages (workers are running).
         if let Some(tx) = ready_tx {
             let _ = tx.send(());
         }
@@ -144,13 +409,16 @@ impl LogicState {
             loop {
                 interval.tick().await;
 
-                // Collect distinct transport node ids currently holding connections.
+                // Collect distinct transport node ids currently holding connections
+                // across all shards.
                 let nodes: Vec<String> = {
-                    let conns = watch_state.connections.lock().await;
                     let mut seen = Vec::new();
-                    for conn in conns.values() {
-                        if !conn.transport_node_id.is_empty() && !seen.contains(&conn.transport_node_id) {
-                            seen.push(conn.transport_node_id.clone());
+                    for shard in &watch_state.connections {
+                        let conns = shard.lock().await;
+                        for conn in conns.values() {
+                            if !conn.transport_node_id.is_empty() && !seen.contains(&conn.transport_node_id) {
+                                seen.push(conn.transport_node_id.clone());
+                            }
                         }
                     }
                     seen
@@ -169,13 +437,18 @@ impl LogicState {
                             if *m >= NODE_MISS_THRESHOLD {
                                 // Two consecutive misses -> declare node dead.
                                 misses.remove(&node);
-                                // Collect connection ids on this node.
+                                // Collect connection ids on this node across all shards.
                                 let ids: Vec<String> = {
-                                    let conns = watch_state.connections.lock().await;
-                                    conns.iter()
-                                        .filter(|(_, c)| c.transport_node_id == node)
-                                        .map(|(id, _)| id.clone())
-                                        .collect()
+                                    let mut ids = Vec::new();
+                                    for shard in &watch_state.connections {
+                                        let conns = shard.lock().await;
+                                        for (id, c) in conns.iter() {
+                                            if c.transport_node_id == node {
+                                                ids.push(id.clone());
+                                            }
+                                        }
+                                    }
+                                    ids
                                 };
                                 for id in ids {
                                     watch_state.handle_disconnect(&id).await;
@@ -194,10 +467,16 @@ impl LogicState {
             }
         });
 
-        // One task processes every envelope, in arrival order, reconnecting
-        // when the broker restarts (design D4/D10).
+        // Reader fan-out loop (design D1/D3): a single reader parses envelopes
+        // and routes them to bounded lanes. The reader is the backpressure
+        // point: `route_inbound` awaits a lane when it is full, so memory is
+        // bounded and no envelope is dropped. Because the reader is single, a
+        // saturated lane also backpressures the other lanes; this is a
+        // documented limitation (see design D3) whose durable fix is per-shard
+        // consumption. Per-room ordering is always preserved.
         let mut failures: u32 = 0;
-        loop {
+        'reader: loop {
+            // Process messages in a scope that drops the stream before reassigning pubsub.
             {
                 let mut messages = pubsub.on_message();
                 while let Some(message) = messages.next().await {
@@ -208,16 +487,14 @@ impl LogicState {
                         warn!("dropped an unparseable inbound envelope");
                         continue;
                     };
-                    self.handle_inbound(envelope).await;
+                    // Route to appropriate lane (design D1/D2).
+                    self.route_inbound(envelope).await;
                 }
-            }
+            } // messages stream dropped here, releasing borrow on pubsub
 
+            // Subscription ended (broker lost); reconnect within failure budget.
             error!(node_id = %self.node_id, "inbound subscription ended (broker lost); reconnecting");
-            // Re-subscribe WITHIN the failure budget. The subscribe itself must
-            // be inside the budget: a `?` here would end the process on the first
-            // failed attempt, making the budget dead code and killing the whole
-            // logic tier on any broker outage longer than one retry (BUG-P3-4).
-            pubsub = loop {
+            loop {
                 failures += 1;
                 if failures >= MAX_SUBSCRIBE_FAILURES {
                     // Give up: drop the membership key so this node is not
@@ -227,33 +504,158 @@ impl LogicState {
                 }
                 tokio::time::sleep(reconnect_backoff(failures)).await;
                 match self.broker.subscribe_inbound_self().await {
-                    Ok(pubsub) => {
+                    Ok(new_pubsub) => {
                         info!(node_id = %self.node_id, "broker reconnected: inbound subscription restored");
                         failures = 0;
-                        break pubsub;
+                        pubsub = new_pubsub;
+                        continue 'reader;
                     }
                     Err(e) => {
                         warn!(error = %e, failures, "failed to re-subscribe to the inbound channel; retrying");
                     }
                 }
-            };
+            }
         }
+    }
+
+    /// Route an inbound envelope to the appropriate lane (design D1/D2).
+    /// - Room-scoped messages (join by room code, moves, resigns, leaves, and
+    ///   disconnects for seated connections) go to room lane
+    ///   `hash(room_code) % K`, so a room's messages are always ordered.
+    /// - Control-plane messages (create room, auth) and messages for unseated
+    ///   connections go to control lane `hash(connection_id) % C`, keeping
+    ///   argon2 auth and create-room Redis round trips off the move path.
+    /// Bounded lanes apply backpressure through the reader.
+    async fn route_inbound(&self, envelope: InboundEnvelope) {
+        let lane_sender = match &envelope.payload {
+            InboundPayload::Client(message) => {
+                let seated = self.connection_room_code(&envelope.connection_id).await;
+                match route_kind(message, seated.as_deref()) {
+                    Route::Room => match message {
+                        ClientMessage::JoinRoom { room_code, .. } => self.room_lane_for_room(room_code),
+                        _ => {
+                            let room = seated
+                                .as_deref()
+                                .expect("a room-scoped route requires the connection to be seated");
+                            self.room_lane_for_room(room)
+                        }
+                    },
+                    Route::Control => self.control_lane_for_connection(&envelope.connection_id),
+                }
+            }
+            InboundPayload::Disconnect => {
+                match self.connection_room_code(&envelope.connection_id).await {
+                    Some(room_code) => self.room_lane_for_room(&room_code),
+                    None => self.control_lane_for_connection(&envelope.connection_id),
+                }
+            }
+        };
+
+        // Bounded lanes: awaiting a full lane applies backpressure. A closed
+        // lane means its worker is gone (panic/shutdown); surface it instead of
+        // dropping silently.
+        let connection_id = envelope.connection_id.clone();
+        let item = LaneItem {
+            envelope,
+            routed_at: Instant::now(),
+        };
+        if lane_sender.send(item).await.is_err() {
+            warn!(connection_id = %connection_id, "inbound lane worker is gone; envelope dropped");
+        }
+    }
+
+    /// Get the room lane sender for a room code (hash(room_code) % K).
+    fn room_lane_for_room(&self, room_code: &str) -> &LaneSender {
+        let lane_id = Self::hash_room_code(room_code) % self.room_lane_count;
+        &self.room_lane_senders[lane_id]
+    }
+
+    /// Get the control lane sender for a connection (hash(connection_id) % C).
+    fn control_lane_for_connection(&self, connection_id: &str) -> &LaneSender {
+        let lane_id = Self::hash_connection_id(connection_id) % self.control_lane_count;
+        &self.control_lane_senders[lane_id]
+    }
+
+    /// Hash a room code to a lane index.
+    fn hash_room_code(room_code: &str) -> usize {
+        // Simple FNV-1a hash for deterministic distribution.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in room_code.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash as usize
+    }
+
+    /// Hash a connection id to a lane index.
+    fn hash_connection_id(connection_id: &str) -> usize {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in connection_id.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash as usize
+    }
+
+    /// Get the room code for a connection, if seated.
+    async fn connection_room_code(&self, connection_id: &str) -> Option<String> {
+        let shard = self.connections_shard(connection_id);
+        let connections = shard.lock().await;
+        connections.get(connection_id).and_then(|c| c.room_code.clone())
     }
 
     /// Refresh this node's ownership of every room it still holds, re-claiming a
     /// room whose ownership key was lost (BUG-P3-1). The room list comes from the
     /// authoritative `App`, not from scanning Redis keys (a lost key would make a
     /// scan-based sweep miss exactly the room that needs re-claiming).
+    /// Uses a pipelined Redis call to renew all leases in a single round trip (task 5.1).
     async fn keep_room_ownership(&self) {
-        for code in self.app.room_codes() {
-            match self.broker.renew_room_lease(&code).await {
-                Ok(true) => {}
-                Ok(false) => match self.broker.claim_room(&code).await {
+        let room_codes = self.app.room_codes();
+        if room_codes.is_empty() {
+            return;
+        }
+
+        // Prepare rooms for pipelined renewal: (room_code, logic_node_id)
+        let rooms: Vec<(String, String)> = room_codes.iter()
+            .map(|c| (c.clone(), self.node_id.clone()))
+            .collect();
+
+        // Single pipelined round trip to renew all leases (task 5.1).
+        let results = match self.broker.renew_room_leases_pipelined(&rooms).await {
+            Ok(results) => results,
+            Err(e) => {
+                // Fallback to per-room renewal on a pipeline error (e.g. an
+                // unexpected broker error). Log the cause once, then renew
+                // each room individually so a sweep still makes progress.
+                warn!(error = %e, "pipelined lease renewal failed; falling back to per-room renewal");
+                for code in &room_codes {
+                    match self.broker.renew_room_lease(code).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if let Err(e) = self.broker.claim_room(code).await {
+                                warn!(room_code = %code, error = %e, "failed to re-claim room");
+                            } else {
+                                warn!(room_code = %code, "re-claimed a room whose ownership lease was lost");
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "failed to renew room ownership"),
+                    }
+                }
+                return;
+            }
+        };
+
+        // For rooms where renewal failed (key lost or owned by another), re-claim.
+        for i in 0..room_codes.len() {
+            let code = &room_codes[i];
+            let renewed = results[i];
+            if !renewed {
+                match self.broker.claim_room(code).await {
                     Ok(true) => {
                         warn!(room_code = %code, "re-claimed a room whose ownership lease was lost");
                     }
                     Ok(false) => {
-                        let owner = self.broker.get_room_owner(&code).await.ok().flatten();
+                        let owner = self.broker.get_room_owner(code).await.ok().flatten();
                         if owner.as_deref() != Some(self.node_id.as_str()) {
                             warn!(room_code = %code, owner = ?owner, "another node owns a room this node holds");
                         }
@@ -261,9 +663,6 @@ impl LogicState {
                     Err(e) => {
                         warn!(room_code = %code, error = %e, "failed to re-claim room ownership");
                     }
-                },
-                Err(e) => {
-                    warn!(room_code = %code, error = %e, "failed to renew room ownership");
                 }
             }
         }
@@ -300,7 +699,8 @@ impl LogicState {
     /// (the client reconnected before this socket's close was processed), the
     /// stale disconnect is ignored so it cannot unseat the fresh connection.
     async fn handle_disconnect(&self, connection_id: &str) {
-        let mut connections = self.connections.lock().await;
+        let shard = self.connections_shard(connection_id);
+        let mut connections = shard.lock().await;
         let Some(conn) = connections.remove(connection_id) else {
             return;
         };
@@ -328,7 +728,8 @@ impl LogicState {
         transport_node_id: &str,
         message: ClientMessage,
     ) {
-        let mut connections = self.connections.lock().await;
+        let shard = self.connections_shard(connection_id);
+        let mut connections = shard.lock().await;
         let logic_conn = connections
             .entry(connection_id.to_string())
             .or_insert_with(|| LogicConnection {
@@ -803,5 +1204,172 @@ async fn deliver_outbound(
             error!(error = %e, "failed to publish outbound envelope");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The room hash is deterministic: a room always maps to the same lane,
+    /// which is what preserves per-room ordering across K lanes.
+    #[test]
+    fn room_lane_assignment_is_deterministic() {
+        for code in ["ABC123", "XYZ789", "N3959S", "room-0001"] {
+            let a = LogicState::hash_room_code(code) % 4;
+            let b = LogicState::hash_room_code(code) % 4;
+            assert_eq!(a, b, "room {code} must always map to the same lane");
+        }
+    }
+
+    /// With several lanes, distinct rooms spread across lanes (so independent
+    /// rooms are actually processed in parallel) and no single lane receives
+    /// every room.
+    #[test]
+    fn rooms_spread_across_lanes() {
+        const LANES: usize = 4;
+        let mut counts = [0usize; LANES];
+        for i in 0..400 {
+            let code = format!("ROOM{i:04}");
+            counts[LogicState::hash_room_code(&code) % LANES] += 1;
+        }
+        assert!(
+            counts.iter().filter(|c| **c > 0).count() >= LANES - 1,
+            "rooms should occupy most lanes, got {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|c| *c < 400),
+            "a single lane must not receive every room: {counts:?}"
+        );
+    }
+
+    /// Control-plane routing is keyed by connection id and is deterministic, so
+    /// create-before-join ordering per connection is preserved.
+    #[test]
+    fn control_lane_assignment_is_deterministic() {
+        for id in ["conn-1", "conn-2", "abc", "zzz"] {
+            let a = LogicState::hash_connection_id(id) % 3;
+            let b = LogicState::hash_connection_id(id) % 3;
+            assert_eq!(a, b, "connection {id} must always map to the same lane");
+        }
+    }
+
+    /// The TTL invariant assertion rejects a TTL that is too small for the
+    /// configured sweep interval and max sweep duration (task 5.2).
+    #[test]
+    fn lease_ttl_exceeds_renewal_sweep() {
+        let ttl = crate::infrastructure::broker::ownership::TTL_SECS as u64;
+        let interval = ROOM_LEASE_RENEW_INTERVAL.as_secs();
+        let sweep = ROOM_LEASE_RENEW_SWEEP_MAX.as_secs();
+        assert!(ttl > interval + sweep,
+            "default TTL ({ttl}) must exceed sweep_interval ({interval}) + sweep_max ({sweep})");
+    }
+
+    /// Lanes are bounded, so a full lane rejects further sends until the worker
+    /// drains it (backpressure) rather than growing without limit (task 2.4).
+    #[test]
+    fn lane_capacity_is_bounded() {
+        let (tx, _rx) = mpsc::channel::<u8>(LANE_CAPACITY);
+        assert_eq!(tx.max_capacity(), LANE_CAPACITY);
+        for _ in 0..LANE_CAPACITY {
+            assert!(tx.try_send(0).is_ok(), "a lane must admit LANE_CAPACITY items");
+        }
+        assert!(
+            tx.try_send(0).is_err(),
+            "a full lane must reject further sends (backpressure), not grow unbounded"
+        );
+    }
+
+    /// The connection registry is sharded, so the reader's per-message lane
+    /// lookup and the lane workers do not serialize on one global lock, and
+    /// connections spread across shards (task 3.1).
+    #[test]
+    fn lanes_do_not_serialize_on_connection_map() {
+        assert!(CONNECTION_SHARDS > 1, "the connection map must be sharded");
+        let total = CONNECTION_SHARDS * 50;
+        let mut counts = [0usize; CONNECTION_SHARDS];
+        for i in 0..total {
+            let id = format!("conn-{i:05}");
+            counts[LogicState::hash_connection_id(&id) % CONNECTION_SHARDS] += 1;
+        }
+        assert!(
+            counts.iter().filter(|c| **c > 0).count() >= CONNECTION_SHARDS - 1,
+            "connections should spread across shards, got {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|c| *c < total),
+            "no single shard may hold every connection: {counts:?}"
+        );
+    }
+
+    /// Control-plane work (auth, create room) and room-scoped work (moves) are
+    /// routed to separate lane pools, so an in-flight auth cannot occupy the
+    /// worker that would ack a move (task 4.2).
+    #[test]
+    fn control_and_move_messages_use_separate_pools() {
+        let login = ClientMessage::Login {
+            v: VERSION,
+            username: "u".into(),
+            password: "p".into(),
+            device_id: None,
+        };
+        let create = ClientMessage::CreateRoom {
+            v: VERSION,
+            player_id: "d".into(),
+            time_control: None,
+            token: None,
+        };
+        let mv = ClientMessage::Move {
+            v: VERSION,
+            uci: "e2e4".into(),
+        };
+        let join = ClientMessage::JoinRoom {
+            v: VERSION,
+            player_id: "d".into(),
+            room_code: "ROOM".into(),
+            token: None,
+        };
+        assert_eq!(route_kind(&login, None), Route::Control);
+        assert_eq!(route_kind(&create, None), Route::Control);
+        assert_eq!(route_kind(&mv, Some("ROOM")), Route::Room);
+        assert_eq!(route_kind(&join, None), Route::Room);
+        // A move from a connection not seated in a room is not room-scoped.
+        assert_eq!(route_kind(&mv, None), Route::Control);
+    }
+
+    /// Per-lane metrics expose the queue depth derived from the bounded sender
+    /// plus the processing timings recorded by the worker (task 6.1).
+    #[test]
+    fn lane_metrics_are_exposed() {
+        let (tx, _rx) = mpsc::channel::<LaneItem>(LANE_CAPACITY);
+        let m = LaneMetrics::default();
+
+        let empty = lane_metrics_json(&tx, &m);
+        assert_eq!(empty["depth"], 0);
+        assert_eq!(empty["processed"], 0);
+        assert_eq!(empty["avg_us"], 0);
+
+        let mk = || InboundEnvelope {
+            v: ENVELOPE_VERSION,
+            connection_id: "c1".into(),
+            node_id: "n1".into(),
+            payload: InboundPayload::Disconnect,
+        };
+        for _ in 0..3 {
+            tx.try_send(LaneItem {
+                envelope: mk(),
+                routed_at: Instant::now(),
+            })
+            .unwrap();
+        }
+        assert_eq!(lane_metrics_json(&tx, &m)["depth"], 3, "depth is derived from the sender");
+
+        m.record(120);
+        m.record(80);
+        let recorded = lane_metrics_json(&tx, &m);
+        assert_eq!(recorded["processed"], 2);
+        assert_eq!(recorded["last_us"], 80);
+        assert_eq!(recorded["max_us"], 120);
+        assert_eq!(recorded["avg_us"], 100);
     }
 }

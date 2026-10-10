@@ -55,6 +55,21 @@ pub const DEFAULT_SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// The shortest session lifetime the server will accept (design D7).
 pub const MIN_SESSION_TTL_SECS: u64 = 60;
 
+/// Default number of inbound processing lanes (design D5/D1). A single lane
+/// preserves the current serial behavior; unset uses 1. Increasing K allows
+/// independent rooms to be processed concurrently while preserving per-room
+/// ordering via `hash(room_code) % K`.
+pub const DEFAULT_LOGIC_LANES: usize = 1;
+/// Minimum allowed inbound lanes (must be >= 1 to preserve ordering guarantees).
+pub const MIN_LOGIC_LANES: usize = 1;
+
+/// Default number of control-plane lanes (design D2). Control-plane messages
+/// (create/join/leave/resign/auth) are routed here, keyed by connection_id,
+/// so argon2 auth and Redis round trips do not stall move lanes.
+pub const DEFAULT_LOGIC_CONTROL_LANES: usize = 1;
+/// Minimum allowed control lanes (must be >= 1).
+pub const MIN_LOGIC_CONTROL_LANES: usize = 1;
+
 /// Argon2id cost parameters (spec "Credential and Session Data Protection",
 /// design D5). Defaults are the OWASP baseline recommendation; each has a
 /// floor below which startup is refused rather than degraded.
@@ -144,6 +159,17 @@ pub struct Config {
     pub tier: Tier,
     /// Redis connection URL (required when tier is `transport` or `logic`).
     pub redis_url: Option<String>,
+    /// Number of inbound processing lanes for the logic tier (design D1/D5).
+    /// When `TIER=logic`, this controls how many concurrent workers process
+    /// room-scoped messages. Each room maps to `hash(room_code) % LOGIC_LANES`,
+    /// so independent rooms run in parallel while per-room ordering is preserved.
+    /// Unset uses the safe default 1 (serial behavior); zero/invalid is rejected.
+    pub logic_lanes: usize,
+    /// Number of control-plane lanes for the logic tier (design D2).
+    /// These lanes handle create/join/leave/resign/auth keyed by connection_id,
+    /// isolating argon2 auth and Redis round trips from move lanes.
+    /// Unset uses the safe default 1; zero/invalid is rejected.
+    pub logic_control_lanes: usize,
 }
 
 /// Read an optional unsigned integer for a security-relevant variable: an
@@ -205,6 +231,42 @@ impl Config {
         let tier = Tier::from_env()?;
         let redis_url = std::env::var("REDIS_URL").ok();
 
+        // LOGIC_LANES: number of inbound processing lanes (design D1/D5)
+        let logic_lanes = match std::env::var("LOGIC_LANES") {
+            Err(_) => DEFAULT_LOGIC_LANES,
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(v) if v >= MIN_LOGIC_LANES => v,
+                Ok(_) => {
+                    return Err(format!(
+                        "LOGIC_LANES must be >= {MIN_LOGIC_LANES}; got {raw:?}"
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "LOGIC_LANES={raw:?} is not a valid positive integer"
+                    ));
+                }
+            },
+        };
+
+        // LOGIC_CONTROL_LANES: number of control-plane lanes (design D2)
+        let logic_control_lanes = match std::env::var("LOGIC_CONTROL_LANES") {
+            Err(_) => DEFAULT_LOGIC_CONTROL_LANES,
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(v) if v >= MIN_LOGIC_CONTROL_LANES => v,
+                Ok(_) => {
+                    return Err(format!(
+                        "LOGIC_CONTROL_LANES must be >= {MIN_LOGIC_CONTROL_LANES}; got {raw:?}"
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "LOGIC_CONTROL_LANES={raw:?} is not a valid positive integer"
+                    ));
+                }
+            },
+        };
+
         Ok(Self {
             bind,
             port,
@@ -216,6 +278,8 @@ impl Config {
             incremental_updates: true,
             tier,
             redis_url,
+            logic_lanes,
+            logic_control_lanes,
         })
     }
 
@@ -247,6 +311,8 @@ impl Config {
             incremental_updates: false,
             tier: Tier::All,
             redis_url: None,
+            logic_lanes: DEFAULT_LOGIC_LANES,
+            logic_control_lanes: DEFAULT_LOGIC_CONTROL_LANES,
         }
     }
 }
@@ -256,12 +322,14 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    const AUTH_VARS: [&str; 5] = [
+    const AUTH_VARS: [&str; 7] = [
         "SESSION_TTL_SECS",
         "ARGON2_MEMORY_KIB",
         "ARGON2_TIME_COST",
         "ARGON2_PARALLELISM",
         "DATABASE_URL",
+        "LOGIC_LANES",
+        "LOGIC_CONTROL_LANES",
     ];
 
     /// The authentication variables are process-wide, so the tests that read
@@ -350,6 +418,56 @@ mod tests {
         let config = Config::from_env().expect("the floors themselves are valid");
         assert_eq!(config.session_ttl_secs, MIN_SESSION_TTL_SECS);
         assert_eq!(config.argon2.memory_kib, MIN_ARGON2_MEMORY_KIB);
+    }
+
+    #[test]
+    fn logic_lanes_defaults_to_one() {
+        let _guard = env_guard();
+        let config = Config::from_env().expect("defaults must be valid");
+        assert_eq!(config.logic_lanes, DEFAULT_LOGIC_LANES);
+        assert_eq!(config.logic_control_lanes, DEFAULT_LOGIC_CONTROL_LANES);
+    }
+
+    #[test]
+    fn logic_lanes_can_be_set_via_env() {
+        let _guard = env_guard();
+        std::env::set_var("LOGIC_LANES", "4");
+        std::env::set_var("LOGIC_CONTROL_LANES", "2");
+        let config = Config::from_env().expect("valid lane counts must be accepted");
+        assert_eq!(config.logic_lanes, 4);
+        assert_eq!(config.logic_control_lanes, 2);
+    }
+
+    #[test]
+    fn logic_lanes_zero_is_rejected() {
+        let _guard = env_guard();
+        std::env::set_var("LOGIC_LANES", "0");
+        let err = Config::from_env().expect_err("zero lanes must be refused");
+        assert!(err.contains("LOGIC_LANES") && err.contains("1"));
+    }
+
+    #[test]
+    fn logic_control_lanes_zero_is_rejected() {
+        let _guard = env_guard();
+        std::env::set_var("LOGIC_CONTROL_LANES", "0");
+        let err = Config::from_env().expect_err("zero control lanes must be refused");
+        assert!(err.contains("LOGIC_CONTROL_LANES") && err.contains("1"));
+    }
+
+    #[test]
+    fn logic_lanes_invalid_is_rejected() {
+        let _guard = env_guard();
+        std::env::set_var("LOGIC_LANES", "not-a-number");
+        let err = Config::from_env().expect_err("invalid lane count must be refused");
+        assert!(err.contains("LOGIC_LANES") && err.contains("valid positive integer"));
+    }
+
+    #[test]
+    fn logic_control_lanes_invalid_is_rejected() {
+        let _guard = env_guard();
+        std::env::set_var("LOGIC_CONTROL_LANES", "not-a-number");
+        let err = Config::from_env().expect_err("invalid control lanes must be refused");
+        assert!(err.contains("LOGIC_CONTROL_LANES") && err.contains("valid positive integer"));
     }
 
     #[test]
