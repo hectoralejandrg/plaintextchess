@@ -58,6 +58,14 @@ const LOGIC_WATCH_INTERVAL: Duration = Duration::from_secs(3);
 /// broker must not hold a closing socket open.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Number of shards for the connection affinity map. Matches the logic side
+/// for consistency and avoids hot spots.
+const CONN_LOGIC_SHARDS: usize = 16;
+
+/// Sharded connection affinity map to avoid a global lock on the hot path.
+/// Shard = hash(connection_id) % CONN_LOGIC_SHARDS.
+type ConnLogicShards = Vec<Mutex<HashMap<String, String>>>;
+
 /// Shared state for the transport tier.
 pub struct TransportState {
     broker: Arc<Broker>,
@@ -72,7 +80,8 @@ pub struct TransportState {
     /// Phase 3: connection_id -> logic_node_id affinity. A connection's
     /// non-room-scoped frames (Move/Resign/Leave/Disconnect) are routed to the
     /// logic node that seats it, so several logic instances do not mis-route.
-    conn_logic: Mutex<HashMap<String, String>>,
+    /// Sharded by connection_id to avoid global lock contention (task 2.1).
+    conn_logic: ConnLogicShards,
     /// Round-robin index for balancing new rooms across live logic nodes.
     /// Only used when placing a new room (create_room).
     placement_rr: std::sync::atomic::AtomicUsize,
@@ -80,13 +89,17 @@ pub struct TransportState {
 
 impl TransportState {
     pub fn new(broker: Arc<Broker>, node_id: String) -> Self {
+        let mut conn_logic = Vec::with_capacity(CONN_LOGIC_SHARDS);
+        for _ in 0..CONN_LOGIC_SHARDS {
+            conn_logic.push(Mutex::new(HashMap::new()));
+        }
         Self {
             broker,
             node_id,
             outboxes: Mutex::new(HashMap::new()),
             healthy: AtomicBool::new(true),
             liveness_task: Mutex::new(None),
-            conn_logic: Mutex::new(HashMap::new()),
+            conn_logic,
             placement_rr: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -151,11 +164,13 @@ impl TransportState {
             loop {
                 interval.tick().await;
                 let nodes: Vec<String> = {
-                    let map = state.conn_logic.lock().unwrap();
                     let mut seen: Vec<String> = Vec::new();
-                    for node in map.values() {
-                        if !seen.contains(node) {
-                            seen.push(node.clone());
+                    for shard in &state.conn_logic {
+                        let map = shard.lock().unwrap();
+                        for node in map.values() {
+                            if !seen.contains(node) {
+                                seen.push(node.clone());
+                            }
                         }
                     }
                     seen
@@ -165,11 +180,16 @@ impl TransportState {
                         Ok(true) => {}
                         Ok(false) => {
                             let ids: Vec<String> = {
-                                let map = state.conn_logic.lock().unwrap();
-                                map.iter()
-                                    .filter(|(_, n)| **n == node)
-                                    .map(|(id, _)| id.clone())
-                                    .collect()
+                                let mut ids = Vec::new();
+                                for shard in &state.conn_logic {
+                                    let map = shard.lock().unwrap();
+                                    for (id, n) in map.iter() {
+                                        if *n == node {
+                                            ids.push(id.clone());
+                                        }
+                                    }
+                                }
+                                ids
                             };
                             if ids.is_empty() {
                                 continue;
@@ -203,14 +223,33 @@ impl TransportState {
         });
     }
 
+    /// Get the shard index for a connection ID.
+    fn conn_logic_shard(&self, connection_id: &str) -> usize {
+        // Use FNV-1a hash for consistent distribution
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in connection_id.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        (hash as usize) % CONN_LOGIC_SHARDS
+    }
+
+    /// Get the shard mutex for a connection ID.
+    fn conn_logic_shard_mutex(&self, connection_id: &str) -> &Mutex<HashMap<String, String>> {
+        let shard_idx = self.conn_logic_shard(connection_id);
+        &self.conn_logic[shard_idx]
+    }
+
     /// Phase 3: the logic node a connection is seated on, if known.
     pub fn conn_logic_node(&self, connection_id: &str) -> Option<String> {
-        self.conn_logic.lock().unwrap().get(connection_id).cloned()
+        let shard = self.conn_logic_shard_mutex(connection_id);
+        shard.lock().unwrap().get(connection_id).cloned()
     }
 
     /// Phase 3: remember which logic node serves a connection.
     pub fn set_conn_logic_node(&self, connection_id: &str, logic_node_id: &str) {
-        self.conn_logic
+        let shard = self.conn_logic_shard_mutex(connection_id);
+        shard
             .lock()
             .unwrap()
             .insert(connection_id.to_string(), logic_node_id.to_string());
@@ -218,7 +257,8 @@ impl TransportState {
 
     /// Phase 3: forget a connection's logic affinity.
     pub fn remove_conn_logic_node(&self, connection_id: &str) {
-        self.conn_logic.lock().unwrap().remove(connection_id);
+        let shard = self.conn_logic_shard_mutex(connection_id);
+        shard.lock().unwrap().remove(connection_id);
     }
 
     /// Subscribe **once** to this node's outbound channel, fan each envelope to

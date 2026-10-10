@@ -31,19 +31,24 @@ per-command timer bookkeeping, not the network.
 
 ## Decisions
 
-### D1 - Publish without a per-command timer
-Configure the broker's Redis connection so the outbound publish does not arm a
-tokio timer per command - either by disabling the response timeout on the
-connection (if the pinned redis-rs skips the timer when it is zero) or by giving
-the publish path its own connection with no timeout. Alternative: a small pool
-of publish connections. All are equivalent in removing the timer-wheel
-contention; the cheapest that keeps failure behavior sane is chosen after
-checking the redis-rs version's semantics.
+### D1 - Publish over a dedicated no-timeout connection
+The hottest shared cost was a tokio timer armed for **every** Redis command: the
+publish path went through a `ConnectionManager`, whose config sets
+`response_timeout = Duration::MAX` (it never uses the `None`/no-timer path), so
+each command registers a timer under the shared timer-wheel lock. A URL parameter
+(`response_timeout=0`) does **not** help: redis-rs parses only
+`protocol`/`db`/`user`/`pass` from the URL and the manager ignores it anyway.
+
+Instead, the publish path uses its own plain `MultiplexedConnection` (created
+with no response timeout, so commands do not arm a timer), reconnected lazily
+when a publish fails. The `ConnectionManager` stays for all other commands
+(registry, leases, membership), which are periodic rather than per-message.
+Alternative: a small pool of no-timeout connections; rejected as unnecessary
+because one multiplexed connection already pipelines concurrent commands.
 
 Trade-off: without a per-command timeout, a hung Redis no longer fails a single
-publish quickly. The connection manager's own reconnect/error path still
-surfaces a dead broker (as it does today), so the failure mode is "the publish
-errors when the connection errors", which the split tests already cover.
+publish quickly; the connection error still surfaces (and the retry loop
+reconnects), which the broker-loss tests cover.
 
 ### D2 - Affinity map without a per-frame global lock
 Shard the transport's connection->logic map by `hash(connection_id) % N` (as the

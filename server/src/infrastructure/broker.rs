@@ -3,9 +3,11 @@
 //! Provides versioned envelopes, channel naming, and connection addressing
 //! for communication between the transport tier and the logic tier.
 
+use std::sync::RwLock;
+
 use redis::{
-    aio::ConnectionManager, AsyncCommands, Client as RedisClient, ExistenceCheck, SetExpiry,
-    SetOptions,
+    aio::{ConnectionManager, MultiplexedConnection}, AsyncCommands, Client as RedisClient,
+    ExistenceCheck, SetExpiry, SetOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -458,8 +460,15 @@ pub mod liveness {
 /// Broker client for publishing/subscribing to the Redis fabric.
 pub struct Broker {
     client: RedisClient,
-    /// Shared multiplexed connection for commands (publish, registry, ...).
+    /// Shared multiplexed connection for commands (registry, leases, ...). It
+    /// reconnects automatically but arms a per-command response timer, so it is
+    /// NOT used on the hot publish path.
     manager: ConnectionManager,
+    /// Dedicated connection for the hot publish path. It is a plain
+    /// `MultiplexedConnection` (no per-command response timeout), so publishing
+    /// does not arm a tokio timer per message and does not contend on the shared
+    /// timer wheel (design D1). Reconnected lazily on a connection error.
+    publish_conn: RwLock<Option<MultiplexedConnection>>,
     node_id: String,
 }
 
@@ -469,10 +478,13 @@ impl Broker {
     /// (spec `realtime-transport`) is enforced at the call site.
     pub async fn connect(redis_url: &str, node_id: String) -> redis::RedisResult<Self> {
         let client = RedisClient::open(redis_url)?;
+        // The manager auto-reconnects and is used for everything except the hot
+        // publish path (see `publish_connection`).
         let manager = client.get_connection_manager().await?;
         Ok(Self {
             client,
             manager,
+            publish_conn: RwLock::new(None),
             node_id,
         })
     }
@@ -486,9 +498,23 @@ impl Broker {
         self.manager.clone()
     }
 
+    /// A no-per-command-timeout connection for the hot publish path, (re)opened
+    /// lazily. A plain `MultiplexedConnection` is created with no response
+    /// timeout, so publishing never arms a tokio timer and does not contend on
+    /// the shared timer wheel (design D1). If the cached connection is gone
+    /// (broker restart), the next call reconnects.
+    async fn publish_connection(&self) -> redis::RedisResult<MultiplexedConnection> {
+        if let Some(conn) = self.publish_conn.read().unwrap().clone() {
+            return Ok(conn);
+        }
+        let conn = self.client.get_multiplexed_async_connection().await?;
+        *self.publish_conn.write().unwrap() = Some(conn.clone());
+        Ok(conn)
+    }
+
     /// Publish `payload` on `channel`, retrying a transient connection failure.
-    /// Returns the subscriber count. A broker restart can leave the manager's
-    /// connection dead, so the first command may fail before it reconnects
+    /// Returns the subscriber count. A broker restart kills the cached publish
+    /// connection, so the first attempt may fail and the next reconnects
     /// (design D10 / BUG-R1-F1).
     async fn publish_with_retry(
         &self,
@@ -497,13 +523,26 @@ impl Broker {
     ) -> redis::RedisResult<i64> {
         let mut last_err: Option<redis::RedisError> = None;
         for attempt in 0..PUBLISH_ATTEMPTS {
-            let mut conn = self.conn();
+            let mut conn = match self.publish_connection().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    last_err = Some(err);
+                    if attempt + 1 < PUBLISH_ATTEMPTS {
+                        tokio::time::sleep(PUBLISH_RETRY_DELAY).await;
+                    }
+                    continue;
+                }
+            };
             match conn
                 .publish::<_, _, i64>(channel.clone(), payload.clone())
                 .await
             {
                 Ok(subscribers) => return Ok(subscribers),
-                Err(err) => last_err = Some(err),
+                Err(err) => {
+                    // Drop the cached connection so the next attempt reconnects.
+                    *self.publish_conn.write().unwrap() = None;
+                    last_err = Some(err);
+                }
             }
             if attempt + 1 < PUBLISH_ATTEMPTS {
                 tokio::time::sleep(PUBLISH_RETRY_DELAY).await;
