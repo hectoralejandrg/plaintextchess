@@ -458,20 +458,28 @@ on the same host, driven by a self-paced load (games of 20 plies, a move every
 | Concurrent games | Players | move-ack p95 |
 |---|---|---|
 | 1,000 | 2,000 | 4 ms |
-| 2,000 | 4,000 | 24 ms |
-| ~2,000–2,700 | ~4,000–5,400 | 100 ms (crossing) |
-| 3,000 | 6,000 | 106 ms |
-| 4,000 | 8,000 | 286 ms (degraded) |
+| 2,000 | 4,000 | ~32 ms |
+| ~2,650–2,700 | ~5,300–5,400 | 100 ms (crossing) |
+| 3,000 | 6,000 | ~130 ms |
+| 4,000 | 8,000 | ~170–273 ms |
 
-Peak sustained throughput is ~23k moves/s at 2,000 games. Before this change the
-ceiling was ~950–1,250 games (~2.0k–2.5k players) and ~7.9k moves/s; the gain
-came from removing a per-frame fabric lookup from the transport hot path, not
-from the handler lanes (4 lanes == 1 lane). The sharded lanes preserve per-room
-ordering and isolate the control plane; they do not add per-node capacity.
+Peak sustained throughput is ~23.9k moves/s (one logic + one transport). The
+per-node ceiling rose from ~950–1,250 games (~7.9k moves/s) to this level through
+two fixes: removing a per-frame fabric lookup from the transport hot path, and
+removing per-command lock/timer contention on the publish path and the affinity
+map. The sharded handler lanes preserve per-room ordering and isolate the control
+plane, but they do not add capacity (4 lanes == 1 lane).
 
-The remaining lever is per-message lock/timer contention in the fabric
-(`reduce-fabric-contention`); new rooms are now distributed across live logic
-nodes, so adding logic instances multiplies capacity.
+Horizontal scaling is limited by the per-message fabric path, not by the nodes.
+New rooms are distributed ~50/50 across live logic instances (balanced
+placement), yet two logic instances give only ~1.10x and three ~1.05x. Profiling
+shows the logic lanes never queue (depth 0, ~65–80 us), Redis stays near 0.3 of a
+core, and both tiers spend most of their time parked in `cond_wait`; the shared
+cost is a single Redis instance plus per-seat socket fan-out over loopback (each
+move is roughly one inbound publish + two outbound publishes + WebSocket writes).
+Adding logic or transport nodes shares that same path, so it does not help.
+Lifting the ceiling further requires reducing per-message work (coalescing and
+batching), not more nodes.
 
-Caveats: single host, synthetic uniform load, one sample per point. These are a
-per-node baseline, not a production SLA.
+Caveats: single host, synthetic uniform closed-loop load, one sample per point.
+These are a per-node baseline, not a production SLA.
