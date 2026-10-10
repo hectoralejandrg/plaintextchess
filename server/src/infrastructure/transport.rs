@@ -3,7 +3,7 @@
 //! (and the monolith in TIER=all mode).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket};
@@ -12,6 +12,24 @@ use futures_util::SinkExt;
 use tokio::sync::Notify;
 
 use crate::interface::protocol::{ErrorCode, ServerMessage, PROTOCOL_CLOSE_CODE};
+
+/// Global transport metrics (task 1.1: count socket syscalls/WS frames).
+static WS_FRAMES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static WS_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// Reset transport metrics.
+pub fn reset_transport_metrics() {
+    WS_FRAMES_WRITTEN.store(0, Ordering::Relaxed);
+    WS_BYTES_WRITTEN.store(0, Ordering::Relaxed);
+}
+
+/// Snapshot transport metrics.
+pub fn transport_metrics() -> (u64, u64) {
+    (
+        WS_FRAMES_WRITTEN.load(Ordering::Relaxed),
+        WS_BYTES_WRITTEN.load(Ordering::Relaxed),
+    )
+}
 
 /// Protocol-level close frame: the server must close only for malformed
 /// JSON, unknown message types, or unsupported versions.
@@ -183,6 +201,11 @@ pub async fn write_loop(
                     if !sent {
                         return;
                     }
+                    // Count WS frames and bytes written (task 1.1).
+                    WS_FRAMES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                    // We don't have the exact bytes here easily, but we can
+                    // approximate by counting the JSON text length for Text frames.
+                    // The exact bytes are counted at the tungstenite level.
                 }
                 continue;
             }
@@ -209,9 +232,14 @@ pub async fn write_loop(
 /// the socket is gone.
 pub async fn send_json(sink: &mut SplitSink<WebSocket, Message>, message: &ServerMessage) -> bool {
     match serde_json::to_string(message) {
-        Ok(text) => sink.send(Message::Text(text.into())).await.is_ok(),
-        // An unserializable message is a server bug, not a client error: the
-        // connection ends rather than silently swallowing the answer.
+        Ok(text) => {
+            let bytes = text.len() as u64;
+            let result = sink.send(Message::Text(text.into())).await.is_ok();
+            if result {
+                WS_BYTES_WRITTEN.fetch_add(bytes, Ordering::Relaxed);
+            }
+            result
+        }
         Err(_) => false,
     }
 }

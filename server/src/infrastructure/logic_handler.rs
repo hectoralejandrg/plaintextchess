@@ -20,10 +20,11 @@ use crate::domain::account::Identity;
 use crate::domain::time_control::TimeControl;
 use crate::infrastructure::broker::{
     Broker, InboundEnvelope, InboundPayload, OutboundEnvelope, ENVELOPE_VERSION,
+    fabric_metrics,
 };
 use crate::infrastructure::password::now_ms;
 use crate::infrastructure::server::App;
-use crate::interface::protocol::{ClientMessage, ErrorCode, ServerMessage, VERSION};
+use crate::interface::protocol::{ClientMessage, ErrorCode, ServerMessage, VERSION, decode_incoming};
 
 /// Backoff bounds and failure budget for broker reconnection (design D10).
 const RECONNECT_MIN: Duration = Duration::from_millis(200);
@@ -57,6 +58,343 @@ fn reconnect_backoff(failures: u32) -> Duration {
 /// Capacity of each bounded inbound lane (design D3). The reader pauses when a
 /// lane is full, providing end-to-end backpressure.
 const LANE_CAPACITY: usize = 1024;
+
+/// Maximum number of items in a single outbound batch (design D3). The batch is
+/// bounded by item count; a byte cap was removed because it could not be
+/// enforced without re-serializing each item (which design D4 avoids), and the
+/// item cap already bounds the batch's size.
+const MAX_BATCH_ITEMS: usize = 32;
+/// Maximum time to wait for more messages before flushing a batch (design D3).
+const BATCH_WINDOW: Duration = Duration::from_millis(1);
+/// Maximum number of ready batches sent in one pipelined publish round trip
+/// (design D2). Bounds in-flight work while amortizing the Redis round trip.
+const PIPELINE_DEPTH: usize = 32;
+
+/// A batch item submitted by a forwarder: the envelope plus the connection
+/// ID it belongs to (needed for stale-route retry).
+struct BatchItem {
+    envelope: OutboundEnvelope,
+    connection_id: String,
+}
+
+/// Number of parallel outbound publish shards per transport node (design D3).
+/// A game's two seats share a shard (keyed by room), so they are still coalesced
+/// into one fabric message, while distinct rooms publish in parallel - restoring
+/// the throughput a single per-node task loses.
+const BATCH_SHARDS_PER_NODE: usize = 16;
+
+/// One outbound publish shard: an independent task with its own bounded channel.
+struct BatchShard {
+    tx: mpsc::Sender<BatchItem>,
+}
+
+/// Per-node outbound batchers, sharded so publishes run in parallel (design D3).
+struct NodeBatcher {
+    node_id: String,
+    shards: Vec<BatchShard>,
+}
+
+/// Stable shard index for a key (FNV-1a). The same key always maps to the same
+/// shard, so a connection's messages keep their order and a room's two seats
+/// land in the same shard (and coalesce).
+fn shard_index(key: &str, shard_count: usize) -> usize {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash as usize % shard_count
+}
+
+/// Decode a client frame exactly once and normalize it to the typed `Client`
+/// form so the rest of the logic tier (lane worker + `handle_inbound`) never
+/// decodes it again (design D4, "the logic decodes once"). An undecodable frame
+/// is left as `ClientFrame` and routed to the control lane; `handle_inbound`
+/// then drops it, matching the transport's own validation.
+fn normalize_inbound_payload(payload: &mut InboundPayload) {
+    let decoded = match payload {
+        InboundPayload::ClientFrame { data } => decode_incoming(data).ok(),
+        _ => None,
+    };
+    if let Some(message) = decoded {
+        *payload = InboundPayload::Client(message);
+    }
+}
+
+/// Whether a payload is a client move, used to record move-dispatch latency.
+/// A `ClientFrame` is normalized to `Client` before reaching the worker, so the
+/// `Client` arm is the one that matches on the transport hot path.
+fn is_move_payload(payload: &InboundPayload) -> bool {
+    matches!(
+        payload,
+        InboundPayload::Client(ClientMessage::Move { .. })
+            | InboundPayload::LegacyClient {
+                client: ClientMessage::Move { .. }
+            }
+    )
+}
+
+/// Collect the next batch of items (design D3): block for the first item, flush
+/// a lone item immediately (no window), otherwise drain up to `BATCH_WINDOW` or
+/// `MAX_BATCH_ITEMS`. Returns `None` when every sender has dropped, which ends
+/// the batcher task. Extracted so the batching decision is unit-testable.
+async fn next_batch(rx: &mut mpsc::Receiver<BatchItem>) -> Option<Vec<BatchItem>> {
+    let first = rx.recv().await?;
+    let mut items = vec![first];
+    // Lone item: flush right away so it pays no batching window (design D3).
+    match rx.try_recv() {
+        Ok(second) => items.push(second),
+        Err(_) => return Some(items), // channel empty (or disconnected): flush now
+    }
+    // Two or more: drain immediately-available items until the window closes or
+    // the item cap is hit.
+    let deadline = Instant::now() + BATCH_WINDOW;
+    while items.len() < MAX_BATCH_ITEMS {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = deadline - now;
+        tokio::select! {
+            item = rx.recv() => match item {
+                Some(item) => items.push(item),
+                None => break,
+            },
+            _ = tokio::time::sleep(wait) => break,
+        }
+    }
+    Some(items)
+}
+
+/// Serialize one ready batch: a lone item as the unchanged single envelope, or
+/// several items as one `OutboundBatch` for the node.
+fn serialize_unit(node_id: &str, items: &[BatchItem]) -> String {
+    if items.len() == 1 {
+        serde_json::to_string(&items[0].envelope).unwrap_or_default()
+    } else {
+        let batch = crate::infrastructure::broker::OutboundBatch {
+            v: ENVELOPE_VERSION,
+            node_id: node_id.to_string(),
+            items: items.iter().map(|i| i.envelope.clone()).collect(),
+        };
+        serde_json::to_string(&batch).unwrap_or_default()
+    }
+}
+
+/// Re-resolve each message's owner through the registry and retry it once
+/// against the node it names now (design D4: the registry is the stale-entry
+/// fallback). Used when a publish reports zero subscribers.
+async fn retry_stale(broker: &Broker, items: Vec<BatchItem>) {
+    for item in items {
+        let mut envelope = item.envelope;
+        let connection_id = item.connection_id;
+        match broker.lookup_connection_node(&connection_id).await {
+            Ok(Some(owner)) if owner != envelope.node_id => {
+                envelope.node_id = owner;
+                let _ = broker.publish_outbound(&envelope).await;
+            }
+            _ => {
+                debug!(
+                    connection_id = %connection_id,
+                    "registry names no owner or same node; dropping stale message"
+                );
+            }
+        }
+    }
+}
+
+/// Publish one collected batch: a lone item as the unchanged single envelope, or
+/// several items as one `OutboundBatch` for the node, with the stale-route retry.
+async fn publish_batch(broker: &Broker, items: Vec<BatchItem>) {
+    if items.len() == 1 {
+        let item = items.into_iter().next().expect("one item");
+        let _ = deliver_outbound_envelope(broker, item).await;
+        return;
+    }
+    let node_id = items[0].envelope.node_id.clone();
+    let batch = crate::infrastructure::broker::OutboundBatch {
+        v: ENVELOPE_VERSION,
+        node_id,
+        items: items.iter().map(|i| i.envelope.clone()).collect(),
+    };
+    match broker.publish_outbound_batch(&batch).await {
+        Ok(0) => retry_stale(broker, items).await,
+        Ok(_) => {}
+        Err(e) => {
+            error!(error = %e, "failed to publish outbound batch");
+        }
+    }
+}
+
+/// Publish a group of ready batches in one pipelined round trip (design D2), in
+/// order. Falls back to the per-batch path (with full retry semantics) if the
+/// pipeline fails, and runs the stale-route retry for any batch that reported
+/// zero subscribers.
+async fn publish_units(broker: &Broker, node_id: &str, units: Vec<Vec<BatchItem>>) {
+    if units.len() == 1 {
+        publish_batch(broker, units.into_iter().next().expect("one unit")).await;
+        return;
+    }
+    let payloads: Vec<String> = units.iter().map(|items| serialize_unit(node_id, items)).collect();
+    match broker.publish_outbound_pipelined(node_id, &payloads).await {
+        Ok(counts) if counts.len() == units.len() => {
+            for (items, count) in units.into_iter().zip(counts) {
+                if count == 0 {
+                    retry_stale(broker, items).await;
+                }
+            }
+        }
+        _ => {
+            warn!(
+                node_id = %node_id,
+                "pipelined outbound publish failed; falling back to per-batch publish"
+            );
+            for items in units {
+                publish_batch(broker, items).await;
+            }
+        }
+    }
+}
+
+/// Collect up to `PIPELINE_DEPTH` ready batches: block for the first (design D3
+/// window), then drain immediately-available items into further batches without
+/// waiting. Returns `None` when every sender has dropped.
+async fn collect_units(rx: &mut mpsc::Receiver<BatchItem>) -> Option<Vec<Vec<BatchItem>>> {
+    let first = next_batch(rx).await?;
+    let mut units = vec![first];
+    while units.len() < PIPELINE_DEPTH {
+        match rx.try_recv() {
+            Ok(item) => {
+                let mut batch = vec![item];
+                while batch.len() < MAX_BATCH_ITEMS {
+                    match rx.try_recv() {
+                        Ok(next) => batch.push(next),
+                        Err(_) => break,
+                    }
+                }
+                units.push(batch);
+            }
+            Err(_) => break,
+        }
+    }
+    Some(units)
+}
+
+impl BatchShard {
+    /// Spawn one publish shard for a node.
+    fn spawn(node_id: String, broker: Arc<Broker>) -> Self {
+        let (tx, mut rx) = mpsc::channel(1024);
+        tokio::spawn(async move {
+            // The task lives as long as any sender holds this shard; when the
+            // last drops, `collect_units` returns `None` and the task ends.
+            while let Some(units) = collect_units(&mut rx).await {
+                publish_units(&broker, &node_id, units).await;
+            }
+        });
+        Self { tx }
+    }
+
+    /// Submit a message to this shard. Awaits when the channel is full, so a
+    /// saturated shard applies backpressure instead of dropping the message
+    /// (design D3: no loss under load).
+    async fn submit(&self, connection_id: String, envelope: OutboundEnvelope) {
+        if self
+            .tx
+            .send(BatchItem {
+                envelope,
+                connection_id,
+            })
+            .await
+            .is_err()
+        {
+            crate::infrastructure::broker::record_outbound_drop();
+            warn!("outbound batcher shard is gone; dropping message");
+        }
+    }
+}
+
+impl NodeBatcher {
+    /// Spawn the sharded batcher for `node_id`.
+    fn spawn(node_id: String, broker: Arc<Broker>) -> Arc<Self> {
+        let shards = (0..BATCH_SHARDS_PER_NODE)
+            .map(|_| BatchShard::spawn(node_id.clone(), Arc::clone(&broker)))
+            .collect();
+        Arc::new(Self { node_id, shards })
+    }
+
+    /// The shard for a key: a connection's own id when it is not room-scoped, or
+    /// its room code so that both seats of a game share a shard.
+    fn shard_for(&self, key: &str) -> &BatchShard {
+        &self.shards[shard_index(key, self.shards.len())]
+    }
+
+    /// Submit an outbound message for `shard_key`, backpressured (never dropped
+    /// while the shard is alive).
+    async fn submit(&self, shard_key: &str, connection_id: String, envelope: OutboundEnvelope) {
+        self.shard_for(shard_key).submit(connection_id, envelope).await;
+    }
+}
+
+/// Deliver one outbound envelope to the transport node, with the
+/// stale-route retry logic (extracted from the old `deliver_outbound`).
+async fn deliver_outbound_envelope(
+    broker: &Broker,
+    item: BatchItem,
+) -> bool {
+    let mut envelope = item.envelope;
+    let connection_id = item.connection_id;
+
+    match broker.publish_outbound(&envelope).await {
+        Ok(0) => {
+            // No subscriber on that channel: the remembered owner is stale.
+            // Re-resolve through the registry and retry once against the node
+            // it names now (design D4: the registry is the stale-entry
+            // fallback).
+            match broker.lookup_connection_node(&connection_id).await {
+                Ok(Some(owner)) if owner != envelope.node_id => {
+                    envelope.node_id = owner;
+                    match broker.publish_outbound(&envelope).await {
+                        Ok(0) => {
+                            debug!(
+                                connection_id = %connection_id,
+                                "registry names a node with no subscriber; dropping stale message"
+                            );
+                            true
+                        }
+                        Ok(_) => true,
+                        Err(e) => {
+                            error!(error = %e, "failed to publish outbound envelope");
+                            false
+                        }
+                    }
+                }
+                Ok(Some(_)) => {
+                    debug!(
+                        connection_id = %connection_id,
+                        "owning node has no subscriber; dropping outbound message"
+                    );
+                    true
+                }
+                Ok(None) => {
+                    debug!(
+                        connection_id = %connection_id,
+                        "stale registry entry dropped; no owning node routes this message"
+                    );
+                    true
+                }
+                Err(e) => {
+                    warn!(error = %e, connection_id = %connection_id, "registry re-lookup failed; dropping message");
+                    true
+                }
+            }
+        }
+        Ok(_) => true,
+        Err(e) => {
+            error!(error = %e, "failed to publish outbound envelope");
+            false
+        }
+    }
+}
 
 /// One item on a lane: the envelope plus when the reader routed it, so a worker
 /// can record queue-wait + processing latency (task 6.1).
@@ -147,6 +485,8 @@ struct LogicConnection {
     identity: Identity,
     /// Room code if seated.
     room_code: Option<String>,
+    /// Per-node outbound batcher for this connection's transport node (design D3).
+    batcher: Option<Arc<NodeBatcher>>,
 }
 
 /// Shard count for partitioned connections map (matches room lanes for simplicity).
@@ -156,6 +496,13 @@ const CONNECTION_SHARDS: usize = 16;
 /// Each shard is an independent AsyncMutex<HashMap>.
 type ConnectionsShards = Vec<AsyncMutex<HashMap<String, LogicConnection>>>;
 
+/// Sharded batcher map to avoid a single global lock.
+/// Shard = hash(node_id) % BATCHER_SHARDS.
+/// Uses `Weak` references so a batcher whose task has ended (all its senders
+/// dropped) is recreated on the next `get_batcher`.
+type BatcherShards = Vec<AsyncMutex<HashMap<String, std::sync::Weak<NodeBatcher>>>>;
+const BATCHER_SHARDS: usize = 16;
+
 /// Shared state for the logic tier.
 pub struct LogicState {
     app: Arc<App>,
@@ -164,6 +511,8 @@ pub struct LogicState {
     /// Sharded connection maps to avoid a single global lock (task 3.1).
     /// Shard = hash(connection_id) % CONNECTION_SHARDS.
     connections: ConnectionsShards,
+    /// Sharded per-transport-node batchers (design D3).
+    batchers: BatcherShards,
     /// Bounded lane senders for room-scoped messages (design D1).
     /// Index = lane_id = hash(room_code) % K.
     room_lane_senders: Vec<LaneSender>,
@@ -218,6 +567,9 @@ impl LogicState {
             connections: (0..CONNECTION_SHARDS)
                 .map(|_| AsyncMutex::new(HashMap::new()))
                 .collect(),
+            batchers: (0..BATCHER_SHARDS)
+                .map(|_| AsyncMutex::new(HashMap::new()))
+                .collect(),
             room_lane_senders,
             room_lane_receivers: std::sync::Mutex::new(Some(room_lane_receivers)),
             control_lane_senders,
@@ -233,6 +585,28 @@ impl LogicState {
     /// Get the node ID.
     pub fn get_node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Get or create a batcher for the given transport node.
+    async fn get_batcher(&self, node_id: &str) -> Arc<NodeBatcher> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        node_id.hash(&mut hasher);
+        let shard_idx = (hasher.finish() as usize) % BATCHER_SHARDS;
+
+        let mut map = self.batchers[shard_idx].lock().await;
+        // Try to upgrade existing Weak reference; if dead or missing, create new.
+        if let Some(weak) = map.get(node_id) {
+            if let Some(batcher) = weak.upgrade() {
+                return batcher;
+            }
+            // Dead batcher: remove stale entry.
+            map.remove(node_id);
+        }
+        let batcher = NodeBatcher::spawn(node_id.to_string(), Arc::clone(&self.broker));
+        map.insert(node_id.to_string(), Arc::downgrade(&batcher));
+        batcher
     }
 
     /// Get the connections shard for a connection_id.
@@ -259,6 +633,7 @@ impl LogicState {
         let mm = &self.move_metrics;
         let mp = mm.processed.load(Ordering::Relaxed);
         let msum = mm.sum_us.load(Ordering::Relaxed);
+        let (inbound_pubs, outbound_pubs, outbound_batches, inbound_bytes, outbound_bytes) = fabric_metrics();
         serde_json::json!({
             "room_lanes": self.room_lane_count,
             "control_lanes": self.control_lane_count,
@@ -270,6 +645,14 @@ impl LogicState {
                 "max_us": mm.max_us.load(Ordering::Relaxed),
                 "avg_us": if mp > 0 { msum / mp } else { 0 },
             },
+            "fabric_metrics": {
+                "inbound_publishes": inbound_pubs,
+                "outbound_publishes": outbound_pubs,
+                "outbound_batches_published": outbound_batches,
+                "inbound_bytes": inbound_bytes,
+                "outbound_bytes": outbound_bytes,
+                "outbound_drops": crate::infrastructure::broker::outbound_drops(),
+            }
         })
     }
 
@@ -334,10 +717,7 @@ impl LogicState {
             tokio::spawn(async move {
                 info!(node_id = %state.node_id, lane_id, "room lane worker started");
                 while let Some(item) = lane_receiver.recv().await {
-                    let is_move = matches!(
-                        &item.envelope.payload,
-                        InboundPayload::Client(ClientMessage::Move { .. })
-                    );
+                    let is_move = is_move_payload(&item.envelope.payload);
                     state.handle_inbound(item.envelope).await;
                     let micros = item.routed_at.elapsed().as_micros() as u64;
                     metrics.record(micros);
@@ -487,7 +867,8 @@ impl LogicState {
                         warn!("dropped an unparseable inbound envelope");
                         continue;
                     };
-                    // Route to appropriate lane (design D1/D2).
+                    // Route to appropriate lane (design D1/D2). The function handles
+                    // lane selection and sending internally.
                     self.route_inbound(envelope).await;
                 }
             } // messages stream dropped here, releasing borrow on pubsub
@@ -526,24 +907,32 @@ impl LogicState {
     ///   connections go to control lane `hash(connection_id) % C`, keeping
     ///   argon2 auth and create-room Redis round trips off the move path.
     /// Bounded lanes apply backpressure through the reader.
-    async fn route_inbound(&self, envelope: InboundEnvelope) {
+    async fn route_inbound(&self, mut envelope: InboundEnvelope) {
+        // Decode the client frame once and normalize it so downstream stages do
+        // not decode again (design D4); this also keeps move-dispatch counting
+        // accurate for the transport hot path, which always sends `ClientFrame`.
+        normalize_inbound_payload(&mut envelope.payload);
         let lane_sender = match &envelope.payload {
             InboundPayload::Client(message) => {
                 let seated = self.connection_room_code(&envelope.connection_id).await;
-                match route_kind(message, seated.as_deref()) {
-                    Route::Room => match message {
-                        ClientMessage::JoinRoom { room_code, .. } => self.room_lane_for_room(room_code),
-                        _ => {
-                            let room = seated
-                                .as_deref()
-                                .expect("a room-scoped route requires the connection to be seated");
-                            self.room_lane_for_room(room)
-                        }
-                    },
-                    Route::Control => self.control_lane_for_connection(&envelope.connection_id),
-                }
+                Self::route_lane(message, seated.as_deref(), &envelope.connection_id, self)
+            }
+            InboundPayload::LegacyClient { client } => {
+                let seated = self.connection_room_code(&envelope.connection_id).await;
+                Self::route_lane(client, seated.as_deref(), &envelope.connection_id, self)
+            }
+            InboundPayload::ClientFrame { .. } => {
+                // Only reachable when the frame was undecodable: route it to
+                // control so `handle_inbound` can drop it as before.
+                self.control_lane_for_connection(&envelope.connection_id)
             }
             InboundPayload::Disconnect => {
+                match self.connection_room_code(&envelope.connection_id).await {
+                    Some(room_code) => self.room_lane_for_room(&room_code),
+                    None => self.control_lane_for_connection(&envelope.connection_id),
+                }
+            }
+            InboundPayload::LegacyDisconnect(_) => {
                 match self.connection_room_code(&envelope.connection_id).await {
                     Some(room_code) => self.room_lane_for_room(&room_code),
                     None => self.control_lane_for_connection(&envelope.connection_id),
@@ -574,6 +963,27 @@ impl LogicState {
     fn control_lane_for_connection(&self, connection_id: &str) -> &LaneSender {
         let lane_id = Self::hash_connection_id(connection_id) % self.control_lane_count;
         &self.control_lane_senders[lane_id]
+    }
+
+    /// Compute the lane for a typed client message (extracted to avoid duplication
+    /// between `Client` and `ClientFrame` paths).
+    fn route_lane<'a>(
+        message: &ClientMessage,
+        seated_room: Option<&str>,
+        connection_id: &str,
+        state: &'a LogicState,
+    ) -> &'a LaneSender {
+        match route_kind(message, seated_room) {
+            Route::Room => match message {
+                ClientMessage::JoinRoom { room_code, .. } => state.room_lane_for_room(room_code),
+                _ => {
+                    let room = seated_room
+                        .expect("a room-scoped route requires the connection to be seated");
+                    state.room_lane_for_room(room)
+                }
+            },
+            Route::Control => state.control_lane_for_connection(connection_id),
+        }
     }
 
     /// Hash a room code to a lane index.
@@ -685,9 +1095,21 @@ impl LogicState {
             InboundPayload::Disconnect => {
                 self.handle_disconnect(&envelope.connection_id).await;
             }
+            InboundPayload::LegacyDisconnect(_) => {
+                self.handle_disconnect(&envelope.connection_id).await;
+            }
             InboundPayload::Client(message) => {
                 self.handle_client(&envelope.connection_id, &envelope.node_id, message)
                     .await;
+            }
+            InboundPayload::LegacyClient { client } => {
+                self.handle_client(&envelope.connection_id, &envelope.node_id, client)
+                    .await;
+            }
+            InboundPayload::ClientFrame { .. } => {
+                // `route_inbound` already decoded this frame once; a payload
+                // still in `ClientFrame` form is undecodable and is dropped,
+                // matching the transport's own validation (no second decode).
             }
         }
     }
@@ -743,6 +1165,7 @@ impl LogicState {
                     device_id: connection_id.to_string(),
                 },
                 room_code: None,
+                batcher: None,
             });
         logic_conn.transport_node_id = transport_node_id.to_string();
 
@@ -808,7 +1231,7 @@ impl LogicState {
                 if let Err(e) = self.broker.claim_room(&room_code).await {
                     tracing::warn!(room_code = %room_code, error = %e, "failed to claim room ownership");
                 }
-                self.adopt_room(logic_conn, conn);
+                self.adopt_room(logic_conn, conn).await;
             }
             Err(err) => {
                 self.send_to_transport(
@@ -840,7 +1263,7 @@ impl LogicState {
         logic_conn.identity = identity;
 
         match self.app.join_room(logic_conn.identity.clone(), &room_code) {
-            Ok(conn) => self.adopt_room(logic_conn, conn),
+            Ok(conn) => self.adopt_room(logic_conn, conn).await,
             Err(err) => {
                 self.send_to_transport(
                     &logic_conn.connection_id,
@@ -854,10 +1277,12 @@ impl LogicState {
 
     /// Wire a freshly created/joined room connection to the transport: keep its
     /// mailbox and start draining its outbound stream to the broker.
-    fn adopt_room(&self, logic_conn: &mut LogicConnection, conn: crate::infrastructure::server::Conn) {
+    async fn adopt_room(&self, logic_conn: &mut LogicConnection, conn: crate::infrastructure::server::Conn) {
         logic_conn.room_mailbox = Some(conn.mailbox);
         logic_conn.out_rx = Some(conn.out_rx);
         logic_conn.room_code = Some(conn.code);
+        // Get or create the batcher for this connection's transport node.
+        logic_conn.batcher = Some(self.get_batcher(&logic_conn.transport_node_id).await);
         self.start_outbound_forwarder(logic_conn);
     }
 
@@ -1063,23 +1488,35 @@ impl LogicState {
     }
 
     /// Forward a room actor's outbound stream to the owning transport node.
+    /// Messages are submitted to the node's sharded batcher, keyed by the room
+    /// so a game's two seats share a shard and coalesce (design D3).
     fn start_outbound_forwarder(&self, logic_conn: &mut LogicConnection) {
         let Some(mut out_rx) = logic_conn.out_rx.take() else {
             return;
         };
         let connection_id = logic_conn.connection_id.clone();
-        let transport_node_id = logic_conn.transport_node_id.clone();
-        let broker = Arc::clone(&self.broker);
+        // Room-scoped messages shard by room; a connection is always seated for
+        // the lifetime of this forwarder, so the key is stable.
+        let shard_key = logic_conn
+            .room_code
+            .clone()
+            .unwrap_or_else(|| connection_id.clone());
+        let batcher = match logic_conn.batcher.take() {
+            Some(b) => b,
+            None => return,
+        };
 
         tokio::spawn(async move {
             while let Some(message) = out_rx.recv().await {
-                if !deliver_outbound(&broker, &connection_id, &transport_node_id, message).await {
-                    // The owning node cannot be resolved for this connection
-                    // anymore (stale/absent registry entry); the room stream
-                    // can only be forwarded through it, so stop early instead
-                    // of draining messages that can never be delivered.
-                    break;
-                }
+                let envelope = OutboundEnvelope {
+                    v: ENVELOPE_VERSION,
+                    node_id: batcher.node_id.clone(),
+                    connection_id: connection_id.clone(),
+                    payload: message,
+                };
+                batcher
+                    .submit(&shard_key, connection_id.clone(), envelope)
+                    .await;
             }
         });
     }
@@ -1104,106 +1541,17 @@ impl LogicState {
         transport_node_id: &str,
         message: ServerMessage,
     ) {
-        deliver_outbound(&self.broker, connection_id, transport_node_id, message).await;
-    }
-}
-
-/// Deliver one outbound message to the transport node that owns
-/// `connection_id` (design D4 "Owning node resolution").
-///
-/// Resolution order:
-/// 1. The node remembered for the connection (from the inbound envelope, or
-///    the registry when that is not already known).
-/// 2. If that publish reaches no subscriber (the node went away, or its id
-///    was stale), the `ptc.conn.<id>` registry is consulted once more and the
-///    message is re-routed to whatever node the registry now names.
-/// 3. If no owning node can be resolved, the message is dropped: a stale
-///    registry entry must not route messages after the disconnect.
-///
-/// Returns `false` when the Redis publish itself failed, so a room forwarder
-/// can stop instead of spinning on a dead fabric.
-async fn deliver_outbound(
-    broker: &Broker,
-    connection_id: &str,
-    remembered_node: &str,
-    message: ServerMessage,
-) -> bool {
-    // Primary route: the remembered owner, falling back to the registry when
-    // the owner is not already known.
-    let mut node_id = remembered_node.to_string();
-    if node_id.is_empty() {
-        match broker.lookup_connection_node(connection_id).await {
-            Ok(Some(lookup)) => node_id = lookup,
-            Ok(None) => {
-                debug!(
-                    connection_id,
-                    "no owning node in the connection registry; dropping outbound message"
-                );
-                return true;
-            }
-            Err(e) => {
-                warn!(error = %e, connection_id, "registry lookup failed; dropping message");
-                return true;
-            }
-        }
-    }
-
-    let mut envelope = OutboundEnvelope {
-        v: ENVELOPE_VERSION,
-        node_id,
-        connection_id: connection_id.to_string(),
-        payload: message,
-    };
-
-    match broker.publish_outbound(&envelope).await {
-        Ok(0) => {
-            // No subscriber on that channel: the remembered owner is stale.
-            // Re-resolve through the registry and retry once against the node
-            // it names now (design D4: the registry is the stale-entry
-            // fallback).
-            match broker.lookup_connection_node(connection_id).await {
-                Ok(Some(owner)) if owner != envelope.node_id => {
-                    envelope.node_id = owner;
-                    match broker.publish_outbound(&envelope).await {
-                        Ok(0) => {
-                            debug!(
-                                connection_id,
-                                "registry names a node with no subscriber; dropping stale message"
-                            );
-                            true
-                        }
-                        Ok(_) => true,
-                        Err(e) => {
-                            error!(error = %e, "failed to publish outbound envelope");
-                            false
-                        }
-                    }
-                }
-                Ok(Some(_)) => {
-                    debug!(
-                        connection_id,
-                        "owning node has no subscriber; dropping outbound message"
-                    );
-                    true
-                }
-                Ok(None) => {
-                    debug!(
-                        connection_id,
-                        "stale registry entry dropped; no owning node routes this message"
-                    );
-                    true
-                }
-                Err(e) => {
-                    warn!(error = %e, connection_id, "registry re-lookup failed; dropping message");
-                    true
-                }
-            }
-        }
-        Ok(_) => true,
-        Err(e) => {
-            error!(error = %e, "failed to publish outbound envelope");
-            false
-        }
+        let batcher = self.get_batcher(transport_node_id).await;
+        let envelope = OutboundEnvelope {
+            v: ENVELOPE_VERSION,
+            node_id: transport_node_id.to_string(),
+            connection_id: connection_id.to_string(),
+            payload: message,
+        };
+        // Control/error messages are not room-scoped: shard by connection.
+        batcher
+            .submit(connection_id, connection_id.to_string(), envelope)
+            .await;
     }
 }
 
@@ -1371,5 +1719,163 @@ mod tests {
         assert_eq!(recorded["last_us"], 80);
         assert_eq!(recorded["max_us"], 120);
         assert_eq!(recorded["avg_us"], 100);
+    }
+
+    // -- Batcher and inbound-normalization tests (optimize-fabric-message-path) --
+
+    /// A batch item for `conn`.
+    fn batch_item(conn: &str, code: &str) -> BatchItem {
+        BatchItem {
+            envelope: OutboundEnvelope {
+                v: ENVELOPE_VERSION,
+                node_id: "transport-abc".to_string(),
+                connection_id: conn.to_string(),
+                payload: ServerMessage::Error {
+                    v: VERSION,
+                    code: code.to_string(),
+                    message: code.to_string(),
+                },
+            },
+            connection_id: conn.to_string(),
+        }
+    }
+
+    /// Task 3.1 (real): two seats on one node are collected into ONE batch, so
+    /// the logic publishes a single fabric message instead of one per seat.
+    #[tokio::test]
+    async fn two_seats_one_fabric_message() {
+        let (tx, mut rx) = mpsc::channel::<BatchItem>(MAX_BATCH_ITEMS);
+        tx.try_send(batch_item("conn-white", "w")).unwrap();
+        tx.try_send(batch_item("conn-black", "b")).unwrap();
+
+        let items = next_batch(&mut rx).await.expect("a batch");
+
+        assert_eq!(items.len(), 2, "two seats must be collected into one batch");
+        assert_eq!(items[0].envelope.connection_id, "conn-white");
+        assert_eq!(items[1].envelope.connection_id, "conn-black");
+    }
+
+    /// Design D3: a lone message is flushed immediately (it does not wait for
+    /// the batching window).
+    #[tokio::test]
+    async fn lone_message_flushes_immediately() {
+        let (tx, mut rx) = mpsc::channel::<BatchItem>(MAX_BATCH_ITEMS);
+        tx.try_send(batch_item("conn-a", "a")).unwrap();
+
+        let started = Instant::now();
+        let items = next_batch(&mut rx).await.expect("a batch");
+        assert_eq!(items.len(), 1, "a lone message is its own batch of one");
+        assert!(
+            started.elapsed() < BATCH_WINDOW,
+            "a lone message must not wait for the {BATCH_WINDOW:?} window"
+        );
+    }
+
+    /// The batcher task ends only when every sender has dropped (no idle timer).
+    #[tokio::test]
+    async fn next_batch_ends_when_all_senders_drop() {
+        let (tx, mut rx) = mpsc::channel::<BatchItem>(MAX_BATCH_ITEMS);
+        drop(tx);
+        assert!(
+            next_batch(&mut rx).await.is_none(),
+            "no senders left means the batcher task should end"
+        );
+    }
+
+    /// Sharding by room keeps a game's two seats in the same shard (so they
+    /// coalesce) while distinct rooms spread across shards (so publishes run in
+    /// parallel).
+    #[test]
+    fn room_seats_share_a_shard_and_rooms_spread() {
+        let k = BATCH_SHARDS_PER_NODE;
+        // Both seats of one game carry the same room code -> same shard.
+        assert_eq!(shard_index("ROOM1", k), shard_index("ROOM1", k));
+        // Distinct rooms spread across shards.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..400 {
+            seen.insert(shard_index(&format!("ROOM{i:04}"), k));
+        }
+        assert!(
+            seen.len() >= k - 1,
+            "rooms should occupy most shards, got {}",
+            seen.len()
+        );
+    }
+
+    /// Pipelining groups ready batches but never reorders their messages.
+    #[tokio::test]
+    async fn collect_units_preserves_order() {
+        let (tx, mut rx) = mpsc::channel::<BatchItem>(64);
+        for (conn, code) in [
+            ("conn-a", "a1"),
+            ("conn-b", "b1"),
+            ("conn-a", "a2"),
+            ("conn-b", "b2"),
+        ] {
+            tx.try_send(batch_item(conn, code)).unwrap();
+        }
+        let units = collect_units(&mut rx).await.expect("units");
+        let flat: Vec<String> = units
+            .iter()
+            .flatten()
+            .map(|i| i.envelope.connection_id.clone())
+            .collect();
+        assert_eq!(flat, vec!["conn-a", "conn-b", "conn-a", "conn-b"]);
+        assert!(units.len() <= 4, "at least as compact as one unit per item");
+    }
+
+    /// A unit serializes to the same wire forms the transport already decodes:
+    /// a lone item as a single envelope, several as one `OutboundBatch`.
+    #[test]
+    fn serialize_unit_single_and_batch() {
+        let single = vec![batch_item("conn-a", "x")];
+        let json = serialize_unit("transport-abc", &single);
+        let env: OutboundEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(env.connection_id, "conn-a");
+
+        let batch = vec![batch_item("conn-a", "x"), batch_item("conn-b", "y")];
+        let json = serialize_unit("transport-abc", &batch);
+        match serde_json::from_str::<crate::infrastructure::broker::OutboundWire>(&json).unwrap() {
+            crate::infrastructure::broker::OutboundWire::Batch(b) => {
+                assert_eq!(b.items.len(), 2);
+            }
+            _ => panic!("expected a batch"),
+        }
+    }
+
+    /// H1 regression: the transport hot path sends `ClientFrame`, and the lane
+    /// worker must still count it as a move (after normalization) so
+    /// `move_dispatch` is accurate.
+    #[test]
+    fn client_frame_move_is_counted_after_normalization() {
+        let mut payload = InboundPayload::ClientFrame {
+            data: r#"{"v":1,"type":"move","uci":"e2e4"}"#.to_string(),
+        };
+        assert!(!is_move_payload(&payload), "a raw frame is not classified before normalization");
+        normalize_inbound_payload(&mut payload);
+        assert!(matches!(payload, InboundPayload::Client(ClientMessage::Move { .. })));
+        assert!(is_move_payload(&payload), "a move sent as ClientFrame must be counted");
+    }
+
+    /// A non-move frame is normalized but not counted as a move.
+    #[test]
+    fn client_frame_non_move_is_not_counted() {
+        let mut payload = InboundPayload::ClientFrame {
+            data: r#"{"v":1,"type":"create_room","player_id":"p1"}"#.to_string(),
+        };
+        normalize_inbound_payload(&mut payload);
+        assert!(matches!(payload, InboundPayload::Client(ClientMessage::CreateRoom { .. })));
+        assert!(!is_move_payload(&payload));
+    }
+
+    /// An undecodable frame stays as `ClientFrame` (and is later dropped).
+    #[test]
+    fn undecodable_client_frame_stays_a_frame() {
+        let mut payload = InboundPayload::ClientFrame {
+            data: "not json".to_string(),
+        };
+        normalize_inbound_payload(&mut payload);
+        assert!(matches!(payload, InboundPayload::ClientFrame { .. }));
+        assert!(!is_move_payload(&payload));
     }
 }

@@ -168,7 +168,6 @@ async fn start_split_tuned(ports: &[u16], grace: Duration, room_lanes: usize) ->
     config.random_colors = false;
     config.incremental_updates = true;
     config.reconnect_grace = grace;
-    let grace = config.reconnect_grace;
 
     let redis_url = test_redis_url();
 
@@ -3260,4 +3259,46 @@ async fn sample_rss_fds(pid: u32) -> (u64, u64) {
     {
         (0, 0)
     }
+}
+
+/// `publish_outbound_pipelined` sends several PUBLISH commands in one round
+/// trip, in order, and reports one subscriber count per payload (task 2.1).
+#[tokio::test]
+#[ignore]
+async fn pipelined_fabric_publish_preserves_order() {
+    let redis_url = test_redis_url();
+    let node = generate_node_id("transport");
+    let sub_broker = Broker::connect(&redis_url, node.clone())
+        .await
+        .expect("sub broker");
+    let pub_broker = Broker::connect(&redis_url, generate_node_id("logic"))
+        .await
+        .expect("pub broker");
+
+    let mut pubsub = sub_broker.subscribe_outbound().await.expect("subscribe");
+    let mut stream = pubsub.on_message();
+    // Let the subscription register with Redis before publishing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payloads: Vec<String> = (0..5).map(|i| format!("m{i}")).collect();
+    let counts = pub_broker
+        .publish_outbound_pipelined(&node, &payloads)
+        .await
+        .expect("publish");
+    assert_eq!(counts.len(), 5, "one count per payload");
+    assert!(
+        counts.iter().all(|c| *c >= 1),
+        "the subscriber must receive each: {counts:?}"
+    );
+
+    let mut got = Vec::new();
+    while got.len() < 5 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timeout waiting for a pipelined message")
+            .expect("a message");
+        let payload: String = msg.get_payload().expect("payload");
+        got.push(payload);
+    }
+    assert_eq!(got, payloads, "pipelined publishes must arrive in order");
 }

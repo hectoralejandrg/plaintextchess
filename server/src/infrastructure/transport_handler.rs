@@ -18,21 +18,26 @@ use axum::response::IntoResponse;
 use futures_util::StreamExt;
 
 use crate::infrastructure::broker::{
-    generate_connection_id, Broker, InboundEnvelope, InboundPayload, OutboundEnvelope,
-    ENVELOPE_VERSION, DEFAULT_LOGIC_NODE,
+    generate_connection_id, Broker, InboundEnvelope, InboundPayload, OutboundWire,
+    OutboundEnvelope, ENVELOPE_VERSION, DEFAULT_LOGIC_NODE,
 };
 use crate::interface::protocol::{VERSION, ClientMessage, decode_incoming};
-use crate::infrastructure::transport::{write_loop, Outbound, Outbox};
+use crate::infrastructure::transport::{write_loop, Outbound, Outbox, transport_metrics};
 
 use tokio::task::JoinHandle;
 
 /// Per-tier health endpoint for the transport tier.
 pub async fn healthz(State(state): State<Arc<TransportState>>) -> axum::Json<serde_json::Value> {
+    let (frames, bytes) = transport_metrics();
     axum::Json(serde_json::json!({
         "status": "ok",
         "tier": "transport",
         "node_id": state.node_id(),
         "protocol_version": VERSION,
+        "transport_metrics": {
+            "ws_frames_written": frames,
+            "ws_bytes_written": bytes,
+        }
     }))
 }
 
@@ -280,17 +285,11 @@ impl TransportState {
                         let Ok(payload) = message.get_payload::<String>() else {
                             continue;
                         };
-                        let Ok(envelope) = serde_json::from_str::<OutboundEnvelope>(&payload)
+                        let Ok(wire) = serde_json::from_str::<OutboundWire>(&payload)
                         else {
                             continue;
                         };
-                        let outbox = {
-                            let outboxes = state.outboxes.lock().unwrap();
-                            outboxes.get(&envelope.connection_id).cloned()
-                        };
-                        if let Some(outbox) = outbox {
-                            outbox.push(Outbound::Text(envelope.payload));
-                        }
+                        dispatch_outbound_wire(&state.outboxes, wire);
                     }
                 }
 
@@ -480,7 +479,7 @@ async fn handle_transport_socket(socket: WebSocket, state: Arc<TransportState>) 
 /// Handle one client text frame in the transport tier. Returns `false` when the
 /// connection must end (protocol failure). The frame is validated here so a
 /// malformed frame still closes with the monolith's protocol close code, then
-/// forwarded to the logic tier as a typed envelope.
+/// forwarded to the logic tier with the original frame text (design D4).
 async fn handle_transport_text(
     outbox: &Outbox,
     text: &str,
@@ -519,7 +518,7 @@ async fn handle_transport_text(
         v: ENVELOPE_VERSION,
         connection_id: connection_id.to_string(),
         node_id: node_id.to_string(),
-        payload: InboundPayload::Client(message),
+        payload: InboundPayload::ClientFrame { data: text.to_string() },
     };
 
     // 1) Hot path: try the specific target(s) without paying for the node list.
@@ -612,9 +611,39 @@ async fn resolve_room_owner(state: &Arc<TransportState>, room_code: &str) -> Opt
     }
 }
 
+/// Fan a decoded outbound wire message out to the per-connection outboxes.
+/// A batch's items are pushed in order, so each connection receives its own
+/// messages in the order they were published (design D2/D5).
+fn dispatch_outbound_wire(
+    outboxes: &Mutex<HashMap<String, Arc<Outbox>>>,
+    wire: OutboundWire,
+) {
+    let push = |envelope: OutboundEnvelope| {
+        let outbox = {
+            let outboxes = outboxes.lock().unwrap();
+            outboxes.get(&envelope.connection_id).cloned()
+        };
+        if let Some(outbox) = outbox {
+            outbox.push(Outbound::Text(envelope.payload));
+        }
+    };
+    match wire {
+        OutboundWire::Envelope(envelope) => push(envelope),
+        OutboundWire::Batch(batch) => {
+            for envelope in batch.items {
+                push(envelope);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use crate::infrastructure::transport::{Outbound, Outbox};
+    use crate::infrastructure::broker::OutboundWire;
 
     /// Round-robin placement distributes new rooms across live logic nodes.
     /// The counter increments modulo the number of candidates, so each call
@@ -661,5 +690,104 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 2);
+    }
+
+    /// Task 3.2: per-connection order is preserved when messages for two
+    /// connections on the same node are coalesced into one batch. Each
+    /// connection must still see its own messages in their original order.
+    #[test]
+    fn per_connection_order_preserved_under_batching() {
+        use crate::infrastructure::broker::{OutboundBatch, OutboundEnvelope, ENVELOPE_VERSION};
+        use crate::interface::protocol::{ServerMessage, VERSION};
+
+        let outboxes: Mutex<HashMap<String, Arc<Outbox>>> = Mutex::new(HashMap::new());
+        let out_a = Arc::new(Outbox::default());
+        let out_b = Arc::new(Outbox::default());
+        {
+            let mut map = outboxes.lock().unwrap();
+            map.insert("conn-a".to_string(), out_a.clone());
+            map.insert("conn-b".to_string(), out_b.clone());
+        }
+
+        let envelope = |conn: &str, code: &str| OutboundEnvelope {
+            v: ENVELOPE_VERSION,
+            node_id: "transport-abc".to_string(),
+            connection_id: conn.to_string(),
+            payload: ServerMessage::Error {
+                v: VERSION,
+                code: code.to_string(),
+                message: code.to_string(),
+            },
+        };
+
+        // Interleave: a1, b1, a2, b2 - per-connection order must be a1<a2 and b1<b2.
+        let batch = OutboundBatch {
+            v: ENVELOPE_VERSION,
+            node_id: "transport-abc".to_string(),
+            items: vec![
+                envelope("conn-a", "a1"),
+                envelope("conn-b", "b1"),
+                envelope("conn-a", "a2"),
+                envelope("conn-b", "b2"),
+            ],
+        };
+        super::dispatch_outbound_wire(&outboxes, OutboundWire::Batch(batch));
+
+        let drain = |outbox: &Outbox| -> Vec<String> {
+            outbox
+                .take_batch()
+                .into_iter()
+                .map(|item| match item {
+                    Outbound::Text(ServerMessage::Error { code, .. }) => code,
+                    _ => panic!("expected an error text frame"),
+                })
+                .collect()
+        };
+
+        assert_eq!(drain(&out_a), vec!["a1".to_string(), "a2".to_string()]);
+        assert_eq!(drain(&out_b), vec!["b1".to_string(), "b2".to_string()]);
+    }
+
+    /// A single-item envelope is still dispatched to its connection (rollout
+    /// compatibility), and a batch for an unknown connection is dropped.
+    #[test]
+    fn single_envelope_dispatch_and_unknown_connection_dropped() {
+        use crate::infrastructure::broker::{OutboundEnvelope, ENVELOPE_VERSION};
+        use crate::interface::protocol::{ServerMessage, VERSION};
+
+        let outboxes: Mutex<HashMap<String, Arc<Outbox>>> = Mutex::new(HashMap::new());
+        let out_a = Arc::new(Outbox::default());
+        {
+            let mut map = outboxes.lock().unwrap();
+            map.insert("conn-a".to_string(), out_a.clone());
+        }
+
+        let envelope = OutboundEnvelope {
+            v: ENVELOPE_VERSION,
+            node_id: "transport-abc".to_string(),
+            connection_id: "conn-a".to_string(),
+            payload: ServerMessage::Error {
+                v: VERSION,
+                code: "single".to_string(),
+                message: "single".to_string(),
+            },
+        };
+        super::dispatch_outbound_wire(&outboxes, OutboundWire::Envelope(envelope));
+
+        let unknown = OutboundEnvelope {
+            v: ENVELOPE_VERSION,
+            node_id: "transport-abc".to_string(),
+            connection_id: "conn-missing".to_string(),
+            payload: ServerMessage::Error {
+                v: VERSION,
+                code: "dropped".to_string(),
+                message: "dropped".to_string(),
+            },
+        };
+        // Must not panic when the connection has no outbox.
+        super::dispatch_outbound_wire(&outboxes, OutboundWire::Envelope(unknown));
+
+        let delivered = out_a.take_batch();
+        assert_eq!(delivered.len(), 1, "only the known connection receives the frame");
     }
 }

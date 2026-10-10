@@ -18,6 +18,30 @@ tiers park in `cond_wait`. Today, per move:
 Adding logic or transport nodes shares this path, so the fix is fewer/cheaper
 messages per move.
 
+## Measurement instrumentation (task 1.1)
+
+The counters needed to measure the per-move budget are built into the code and
+exposed for the load run (there is no committed load harness; the load run is
+external):
+
+- `broker.rs`: `INBOUND_PUBLISHES`, `OUTBOUND_PUBLISHES`,
+  `OUTBOUND_BATCHES_PUBLISHED`, `INBOUND_BYTES`, `OUTBOUND_BYTES`, read together
+  via `fabric_metrics()` and reset with `reset_fabric_metrics()`. Incremented in
+  `publish_inbound`/`publish_inbound_to`, `publish_outbound`, and
+  `publish_outbound_batch`.
+- `transport.rs`: `WS_FRAMES_WRITTEN`, `WS_BYTES_WRITTEN`, read via
+  `transport_metrics()` and reset with `reset_transport_metrics()`. Counted in
+  `write_loop` (per frame) and `send_json` (per text frame's bytes).
+- `logic_handler.rs` `/healthz` exposes `fabric_metrics` and per-lane
+  `move_dispatch`; `transport_handler.rs` `/healthz` exposes
+  `transport_metrics`. A dropped outbound message (only possible if a shard's task
+  has gone) is counted as `fabric_metrics.outbound_drops`.
+
+The numeric baseline (task 1.2: inbound/outbound publishes, WS frames and bytes,
+socket syscalls per move) and the before/after comparison (task 5.2) are read
+from these counters during a representative load run; they are recorded here once
+that run is executed.
+
 ## Goals / Non-Goals
 
 **Goals:**
@@ -48,12 +72,28 @@ The transport dispatcher fans a batch out to each connection's `Outbox` as if th
 items had arrived individually (so per-connection order and coalescing are
 unchanged). This is an internal fabric change; the client never sees it.
 
-### D3 - Batch at the logic forwarder, with a bounded size and a quick flush
+### D3 - Batch at the logic forwarder, sharded per node, with backpressure
 The logic's outbound forwarder groups messages for the same transport node within
-a short window (or until a small count/byte cap) and publishes one batch. A batch
-of one is published immediately, so a lone message pays nothing; the window is
-small enough not to add a perceptible move-ack delay. Alternative: no batching,
-keep per-seat publishes - rejected because the fan-out is the measured cost.
+a short window (or until a small **item** cap of 32) and publishes one batch. A
+batch of one is published immediately, so a lone message pays nothing; the window
+is small enough not to add a perceptible move-ack delay. There is no byte cap: it
+could not be enforced without re-serializing every item to measure it (the exact
+cost D4 removes), and the item cap already bounds the batch.
+
+Publishes are **sharded per node** (`BATCH_SHARDS_PER_NODE`, keyed by room code):
+a game's two seats share a shard and coalesce into one message, while distinct
+rooms publish in parallel, so one node's outbound is not serialized through a
+single task. Each shard's channel is bounded (1024) and `submit` **awaits** when
+full, applying backpressure instead of dropping: under sustained load latency
+rises (as it did before this change) but no Update is lost. A per-connection
+ordering guarantee holds because a seated connection stays in one shard for the
+lifetime of its forwarder.
+
+Alternative: no batching, keep per-seat publishes - rejected because the fan-out
+is the measured cost. Alternative: a single per-node task - rejected by the
+performance QA: it serialized publishes and its `try_send` dropped Updates,
+halving the per-node ceiling. Alternative: shard by connection - rejected because
+a game's two seats would land in different shards and never coalesce.
 
 ### D4 - Forward the decoded frame without re-encoding
 The transport already decodes the client frame to validate and route it. Instead
@@ -67,16 +107,54 @@ Client messages, per-connection order (the `Outbox` is drained in order per
 connection), state-class coalescing, and every close code are unchanged. The FFI
 and mobile clients are untouched.
 
+## Rollout order (task 5.1)
+
+The v1<->v2 fabric compatibility is **asymmetric**, so the deploy order matters:
+
+- The new logic accepts every v1 inbound form (`{"client": {...}}` and the
+  `"disconnect"` string) and the new v2 forms (`Client`, `ClientFrame`).
+- An **old** logic rejects the new transport's `ClientFrame` (its v1 decoder
+  knows only `client`/`disconnect`), so a transport upgraded first would have all
+  client frames dropped.
+- An **old** transport decodes only a single `OutboundEnvelope`, so it **drops a
+  batch**; a logic upgraded first (with batching on) would lose multi-seat
+  fan-outs during the window.
+
+Therefore neither raw order (`v` is currently stamped but never validated, so it
+cannot gate) is safe on its own. The safe rollout is:
+
+1. Deploy **logic** first with batching disabled: it accepts v1 inbound, still
+   publishes single per-seat envelopes, and loses nothing.
+2. Deploy **transport**: it starts sending `ClientFrame` (accepted by step 1's
+   logic) and decodes both single envelopes and batches.
+3. **Enable batching** only once every transport node is on the new build, so no
+   batch is ever sent to a v1 transport.
+
+Batching is enabled today, so a real deploy must gate it (a config flag or by
+requiring all transports to report v2) before step 3. This section is the
+documented requirement until that flag exists.
+
 ## Risks / Trade-offs
 
 - [Batching adds latency] -> flush a batch immediately when it has one item, cap
   the window tightly, and never hold a message across a turn; measure p95.
 - [Ordering across a batch] -> items keep their per-connection order when fanned
   out, and the window is small; a per-connection order test guards it.
-- [Envelope change is internal but broad] -> the batch envelope is versioned like
-  the existing envelopes; decode both forms during rollout.
+- [Envelope change is internal but broad] -> `ENVELOPE_VERSION` is bumped to 2,
+  and the inbound payload decodes both wire forms during rollout: the v1
+  externally-tagged form (`{"client": {...}}`, decoded as `LegacyClient`) and the
+  v2 form (`Client(ClientMessage)` / `ClientFrame { data }`). The outbound wire is
+  `untagged`, so a batch decodes to a batch and a single envelope stays a single
+  envelope.
 - [Optimizing the wrong cost] -> D1 measures first and the change is gated on the
   measured share.
+- [Batcher saturation can drop] -> the per-node outbound path is sharded
+  (`BATCH_SHARDS_PER_NODE`) and each shard applies backpressure (`submit` awaits
+  when its bounded channel is full), so a saturated shard slows the affected
+  rooms instead of dropping their Updates. The old single per-node task with a
+  dropping `try_send` halved the per-node ceiling in the performance QA; the
+  redesign removes that failure mode. `fabric_metrics.outbound_drops` counts only
+  the rare case of a shard whose task has gone (no receiver).
 
 ## Open Questions
 
