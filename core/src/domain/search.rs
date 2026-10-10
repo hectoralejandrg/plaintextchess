@@ -122,23 +122,35 @@ fn piece_value(role: Role) -> i32 {
 /// Static evaluation from the perspective of the side to move: material plus
 /// small piece-square bonuses. `noisy` (easy difficulty only) adds xorshift
 /// jitter to the result so easy games vary.
+///
+/// Two allocation-free passes over the 64 squares (design D3): the first
+/// sums non-king material (to pick the endgame or middlegame king tables),
+/// the second accumulates material plus piece-square bonuses. No `Vec` is
+/// built, so leaf nodes allocate nothing; the scores are identical to the
+/// previous implementation (guarded by the equivalence test below).
 fn evaluate(pos: &Chess, rng: &mut XorShift64, noisy: bool) -> i32 {
     let board = pos.board();
     // First pass: total non-king material, to decide endgame PSTs.
     let mut material: i32 = 0;
-    let mut pieces: Vec<(Square, Role, Color)> = Vec::new();
     for sq in 0..64 {
-        let square = Square::new(sq);
-        if let Some(piece) = board.piece_at(square) {
+        if let Some(piece) = board.piece_at(Square::new(sq)) {
             material += piece_value(piece.role);
-            pieces.push((square, piece.role, piece.color));
         }
     }
     let endgame = material < 1300;
+    // Second pass: material plus piece-square bonuses.
     let mut score: i32 = 0;
-    for (sq, role, color) in pieces {
-        let value = piece_value(role) + pst_bonus(role, sq, color, endgame);
-        score += if color == Color::White { value } else { -value };
+    for sq in 0..64 {
+        let square = Square::new(sq);
+        if let Some(piece) = board.piece_at(square) {
+            let value = piece_value(piece.role)
+                + pst_bonus(piece.role, square, piece.color, endgame);
+            score += if piece.color == Color::White {
+                value
+            } else {
+                -value
+            };
+        }
     }
     let score = if pos.turn() == Color::White {
         score
@@ -293,6 +305,62 @@ mod tests {
         Chess::from_setup(&parsed).unwrap_or_else(|e| panic!("setup from fen: {e:?}"))
     }
 
+    /// The pre-rewrite `evaluate` (the version that built a `Vec` of
+    /// the pieces), kept as the reference so the allocation-free
+    /// rewrite cannot drift the scores (design D3).
+    fn evaluate_reference(pos: &Chess) -> i32 {
+        let board = pos.board();
+        let mut material: i32 = 0;
+        let mut pieces: Vec<(Square, Role, Color)> = Vec::new();
+        for sq in 0..64 {
+            let square = Square::new(sq);
+            if let Some(piece) = board.piece_at(square) {
+                material += piece_value(piece.role);
+                pieces.push((square, piece.role, piece.color));
+            }
+        }
+        let endgame = material < 1300;
+        let mut score: i32 = 0;
+        for (sq, role, color) in pieces {
+            let value = piece_value(role) + pst_bonus(role, sq, color, endgame);
+            score += if color == Color::White { value } else { -value };
+        }
+        if pos.turn() == Color::White {
+            score
+        } else {
+            -score
+        }
+    }
+
+    /// The allocation-free evaluation must return exactly the scores of
+    /// the previous implementation on fixed positions (design D3), so
+    /// engine strength cannot drift.
+    #[test]
+    fn evaluation_scores_match_the_previous_implementation() {
+        for fen in [
+            // Start position.
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            // Middlegames (the benchmark positions).
+            "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+            "r1bqk2r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 2 5",
+            // Endgame: king and rook vs king (500 material < 1300).
+            "8/8/8/3k4/8/3K4/8/4R3 w - - 0 1",
+            // Boundary around the 1300-material threshold:
+            // queen + rook (1400, middlegame king tables)...
+            "k7/8/8/8/8/8/8/K3Q2R w - - 0 1",
+            // ...and queen alone (900, endgame king tables).
+            "k7/8/8/8/8/8/8/K3Q3 w - - 0 1",
+        ] {
+            let pos = fen_position(fen);
+            let mut rng = XorShift64::new();
+            assert_eq!(
+                evaluate(&pos, &mut rng, false),
+                evaluate_reference(&pos),
+                "score drift on {fen}"
+            );
+        }
+    }
+
     #[test]
     fn each_difficulty_returns_a_legal_move_from_start() {
         let start = Chess::default();
@@ -326,6 +394,27 @@ mod tests {
         assert_eq!(best_move(&start, 3), best_move(&start, 3));
     }
 
+    /// Easy (difficulty 1) perturbs leaf evaluations with
+    /// xorshift noise (design D6), so consecutive CPU moves
+    /// are not all the same, unlike deterministic medium/hard.
+    /// Over enough calls the ±100 cp jitter must produce at
+    /// least two distinct moves from the start position — it
+    /// effectively always does, because the jitter dwarfs the
+    /// small evaluation differences between opening moves.
+    #[test]
+    fn easy_moves_vary_between_calls() {
+        let start = Chess::default();
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let uci = best_move(&start, 1).expect("a move");
+            distinct.insert(uci);
+            if distinct.len() > 1 {
+                return;
+            }
+        }
+        panic!("easy returned the same move 100 times; noise lost?");
+    }
+
     #[test]
     fn hard_move_from_start_fits_time_budget() {
         let start = Chess::default();
@@ -336,6 +425,50 @@ mod tests {
             "hard move took {:?}",
             t0.elapsed()
         );
+    }
+
+    /// Documented CPU move time budget per difficulty, in
+    /// milliseconds, on the reference hardware (Apple M2 Max,
+    /// release build — see `core/benches/README.md`). A
+    /// synchronous `get_cpu_move` call has this bounded cost.
+    /// Debug builds are ~20x slower on the same hardware, so
+    /// they get a 2 s per-difficulty allowance; run
+    /// `cargo test --release` to assert the documented budgets.
+    #[cfg(not(debug_assertions))]
+    const CPU_MOVE_BUDGET_MS: [u64; 3] = [5, 50, 100];
+    #[cfg(debug_assertions)]
+    const CPU_MOVE_BUDGET_MS: [u64; 3] = [2000, 2000, 2000];
+
+    /// The hardest move stays within the documented time budget
+    /// (spec: "CPU Move Within a Documented Time Budget"): every
+    /// difficulty returns within its budget, from the start
+    /// position and the representative midgame positions.
+    #[test]
+    fn cpu_move_fits_documented_budget() {
+        let positions = [
+            ("start", Chess::default()),
+            (
+                "italian",
+                fen_position("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3"),
+            ),
+            (
+                "ruy_lopez",
+                fen_position("r1bqk2r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 2 5"),
+            ),
+        ];
+        for (difficulty, budget_ms) in (1..=3u8).zip(CPU_MOVE_BUDGET_MS) {
+            for (name, pos) in &positions {
+                let start = std::time::Instant::now();
+                let uci = best_move(pos, difficulty);
+                assert!(uci.is_some(), "no move at difficulty {difficulty}");
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed < std::time::Duration::from_millis(budget_ms),
+                    "difficulty {difficulty} from {name} took {elapsed:?}, \
+                     over the {budget_ms} ms budget"
+                );
+            }
+        }
     }
 
     #[test]

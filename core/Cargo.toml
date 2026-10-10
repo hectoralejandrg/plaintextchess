@@ -17,3 +17,8 @@ uniffi = { version = "0.28.0", features = ["build"] }
 [dev-dependencies]
 anyhow = "1.0.0"
 tracing = "0.1.40"
+criterion = "0.8"
+
+[[bench]]
+name = "chess_bench"
+harness = false
