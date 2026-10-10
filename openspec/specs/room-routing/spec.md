@@ -49,7 +49,10 @@ re-resolve ownership before discarding a message.
 ### Requirement: Logic Node Membership and Leases
 Each logic instance MUST register itself with the event fabric and hold a lease
 that it renews while alive, and ownership MUST be re-resolved when a lease
-expires.
+expires. Renewal of the room-ownership leases it holds MUST be batched so a
+sweep costs a bounded number of round trips rather than one per room, and the
+renewal sweep MUST be able to complete within the lease TTL while the node is
+under load, so an active node never spuriously re-claims its own rooms.
 
 #### Scenario: A live node renews its lease
 - **WHEN** a logic instance is running
@@ -62,6 +65,10 @@ expires.
 #### Scenario: An expired lease triggers re-resolution
 - **WHEN** a logic instance's lease expires
 - **THEN** its rooms are no longer owned by it and are eligible for re-claiming
+
+#### Scenario: Renewal keeps up under load
+- **WHEN** a node owns many rooms under sustained load
+- **THEN** it renews all of its ownership leases within the lease TTL and does not spuriously re-claim rooms it still holds
 
 ### Requirement: Failover of Owned Rooms
 When the owner of a room is lost, its ownership record MUST be freed so the room
@@ -106,3 +113,26 @@ database concurrently.
 #### Scenario: Auth state stays consistent across nodes
 - **WHEN** a session is issued on one logic instance and used through another
 - **THEN** the session is validated consistently rather than rejected for being unknown to that node
+
+### Requirement: Balanced Room Placement
+When a player creates a room, the system MUST choose among the live logic
+instances so that new rooms are distributed across them, rather than always
+selecting the same instance. Placement MUST NOT change the ownership contract:
+exactly one instance owns each room, the ownership record is written before a
+join can be routed, and failover keeps working.
+
+#### Scenario: Two live instances each receive rooms
+- **WHEN** two logic instances are live and many rooms are created
+- **THEN** the rooms are distributed across both instances instead of all landing on one
+
+#### Scenario: A single instance takes every room
+- **WHEN** only one logic instance is live
+- **THEN** it receives every new room (placement has nothing to balance)
+
+#### Scenario: A dead instance is never chosen
+- **WHEN** a logic instance has stopped renewing its lease
+- **THEN** new rooms are not placed on it
+
+#### Scenario: Ownership is unchanged by placement
+- **WHEN** a room is created on a chosen instance
+- **THEN** its ownership record names exactly that instance before any join routes to it
