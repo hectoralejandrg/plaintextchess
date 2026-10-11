@@ -24,6 +24,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use chess_server::infrastructure::broker::{
     generate_node_id, Broker, InboundEnvelope, InboundPayload, OutboundEnvelope, ENVELOPE_VERSION,
+    fabric_metrics, reset_fabric_metrics,
 };
 use chess_server::infrastructure::config::Config;
 use chess_server::infrastructure::logic_handler::LogicState;
@@ -83,6 +84,14 @@ const PORT_CONTROL: u16 = 18847;
 
 const PORT_DISTRIBUTION_1: u16 = 18849;
 const PORT_DISTRIBUTION_2: u16 = 18851;
+
+// colocate-room-hot-path (tasks 2.1/2.2/3.1/3.2/3.3)
+const PORT_ROOM_TRANSPORT_1: u16 = 18853;
+const PORT_ROOM_TRANSPORT_2: u16 = 18855;
+const PORT_COMBINED_SKIPS: u16 = 18857;
+const PORT_COMBINED_ORDER: u16 = 18859;
+const PORT_COMBINED_FALLBACK: u16 = 18861;
+const PORT_COMBINED_FALLBACK_EXTRA: u16 = 18863;
 
 /// The Redis the split tests connect to: `REDIS_URL` when set (the design's
 /// gate), otherwise the local default.
@@ -173,7 +182,7 @@ async fn start_split_tuned(ports: &[u16], grace: Duration, room_lanes: usize) ->
 
     let logic_node = generate_node_id("logic");
     let logic_broker = Arc::new(
-        Broker::connect(&redis_url, logic_node.clone())
+        Broker::connect(&[redis_url.clone()], logic_node.clone())
             .await
             .expect("connect logic broker"),
     );
@@ -222,7 +231,7 @@ async fn start_split_tuned(ports: &[u16], grace: Duration, room_lanes: usize) ->
     for &port in ports {
         let transport_node = generate_node_id("transport");
         let transport_broker = Arc::new(
-            Broker::connect(&redis_url, transport_node.clone())
+            Broker::connect(&[redis_url.clone()], transport_node.clone())
                 .await
                 .expect("connect transport broker"),
         );
@@ -259,6 +268,117 @@ async fn start_split_tuned(ports: &[u16], grace: Duration, room_lanes: usize) ->
         _logic: logic_handle,
         db_dir,
         grace,
+    }
+}
+
+/// A `TIER=combined` node under test (colocate-room-hot-path), optionally
+/// paired with a second, plain `TIER=transport` node for the fallback tests
+/// (a seat served by a transport node other than the combined one).
+struct CombinedHarness {
+    port: u16,
+    extra_port: Option<u16>,
+    node_id: String,
+    _logic_task: JoinHandle<()>,
+    _combined_serve: JoinHandle<()>,
+    _extra_serve: Option<JoinHandle<()>>,
+    db_dir: PathBuf,
+}
+
+impl Drop for CombinedHarness {
+    fn drop(&mut self) {
+        self._logic_task.abort();
+        self._combined_serve.abort();
+        if let Some(h) = &self._extra_serve {
+            h.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.db_dir);
+    }
+}
+
+/// Start one `TIER=combined` node (transport and logic cross-linked in one
+/// process, design D2/D3), and optionally a second plain transport node on
+/// `extra_port` for the split-fallback test (3.3): a seat connected there is
+/// served by a different transport node than the one hosting the room's logic.
+async fn start_combined(port: u16, extra_port: Option<u16>) -> CombinedHarness {
+    let db_dir = std::env::temp_dir().join(format!("ptc-combined-e2e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&db_dir).expect("create temp dir");
+    let mut config = Config::with_database(format!("sqlite:{}/e2e.db", db_dir.display()));
+    config.random_colors = false;
+    config.incremental_updates = true;
+
+    let redis_url = test_redis_url();
+    let node_id = generate_node_id("combined");
+    let broker = Arc::new(
+        Broker::connect(&[redis_url.clone()], node_id.clone())
+            .await
+            .expect("connect combined broker"),
+    );
+
+    let mut app = App::init(config).await.expect("App::init needs a database");
+    app.set_broker(Arc::clone(&broker));
+    let app = Arc::new(app);
+
+    let transport_state = Arc::new(TransportState::new(Arc::clone(&broker), node_id.clone()));
+    let logic_state = Arc::new(LogicState::new(app, Arc::clone(&broker), node_id.clone(), 1, 1));
+    transport_state.set_local_logic(Arc::clone(&logic_state));
+    logic_state.set_local_transport(Arc::clone(&transport_state));
+
+    transport_state.spawn_dispatcher().await.expect("spawn dispatcher");
+    transport_state.spawn_liveness().await.expect("spawn liveness");
+    transport_state.spawn_logic_watch();
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let logic_for_task = Arc::clone(&logic_state);
+    let logic_task = tokio::spawn(async move {
+        let _ = logic_for_task.run(Some(ready_tx)).await;
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ready_rx.await.expect("combined logic ready signal");
+
+    let listener = TcpListener::bind((TEST_BIND, port)).await.expect("bind combined");
+    let router = axum::Router::new()
+        .route("/ws", axum::routing::get(transport_handler::ws_upgrade))
+        .with_state(transport_state.clone());
+    let combined_serve = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve combined");
+    });
+
+    let extra_serve = if let Some(extra_port) = extra_port {
+        let extra_node = generate_node_id("transport");
+        let extra_broker = Arc::new(
+            Broker::connect(&[redis_url.clone()], extra_node.clone())
+                .await
+                .expect("connect extra transport broker"),
+        );
+        let extra_state = Arc::new(TransportState::new(extra_broker, extra_node));
+        extra_state.spawn_dispatcher().await.expect("spawn extra dispatcher");
+        extra_state.spawn_liveness().await.expect("spawn extra liveness");
+        extra_state.spawn_logic_watch();
+        let extra_listener = TcpListener::bind((TEST_BIND, extra_port))
+            .await
+            .expect("bind extra transport");
+        let extra_router = axum::Router::new()
+            .route("/ws", axum::routing::get(transport_handler::ws_upgrade))
+            .with_state(extra_state);
+        Some(tokio::spawn(async move {
+            axum::serve(extra_listener, extra_router).await.expect("serve extra transport");
+        }))
+    } else {
+        None
+    };
+
+    // Let every node subscribe before the first client arrives.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    CombinedHarness {
+        port,
+        extra_port,
+        node_id,
+        _logic_task: logic_task,
+        _combined_serve: combined_serve,
+        _extra_serve: extra_serve,
+        db_dir,
     }
 }
 
@@ -432,6 +552,33 @@ async fn wait_room_owner_secs(room_code: &str, present: bool, secs: u64) -> Opti
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     room_owner_key(room_code).await
+}
+
+/// The transport node recorded for a room's first seat, if any
+/// (colocate-room-hot-path task 2.1).
+async fn room_transport_key(room_code: &str) -> Option<String> {
+    let client = redis::Client::open(test_redis_url()).expect("redis client");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("redis conn");
+    redis::cmd("GET")
+        .arg(format!("ptc.room_transport.{}", room_code))
+        .query_async(&mut conn)
+        .await
+        .expect("GET room transport")
+}
+
+/// Wait (bounded) until a room's transport-locality record is present or absent.
+async fn wait_room_transport(room_code: &str, present: bool) -> Option<String> {
+    for _ in 0..30 {
+        let node = room_transport_key(room_code).await;
+        if node.is_some() == present {
+            return node;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    room_transport_key(room_code).await
 }
 
 /// Ensure no logic tier is registered/subscribed, so the "no logic" tests are
@@ -1662,7 +1809,7 @@ async fn simultaneous_lease_loss_cross_node_keeps_the_room() {
 #[ignore]
 async fn publish_retries_after_the_connection_dies() {
     let _guard = e2e_guard();
-    let broker = Broker::connect(&test_redis_url(), "test-publish-retry".into())
+    let broker = Broker::connect(&[test_redis_url()], "test-publish-retry".into())
         .await
         .expect("connect broker");
 
@@ -1688,7 +1835,7 @@ async fn publish_retries_after_the_connection_dies() {
         payload: ServerMessage::error(ErrorCode::NotConnected),
     };
     let subscribers = broker
-        .publish_outbound(&envelope)
+        .publish_outbound(&envelope, 0)
         .await
         .expect("the retry must make the publish succeed");
     assert_eq!(subscribers, 0, "no node is subscribed to that channel");
@@ -1740,7 +1887,7 @@ async fn publish_inbound_reports_zero_subscribers_when_logic_is_absent() {
     let _guard = e2e_guard();
     wait_for_no_logic().await;
 
-    let broker = Broker::connect(&test_redis_url(), "test-inbound-count".into())
+    let broker = Broker::connect(&[test_redis_url()], "test-inbound-count".into())
         .await
         .expect("connect broker");
     let envelope = InboundEnvelope {
@@ -1769,7 +1916,7 @@ async fn transport_closes_a_client_when_no_logic_is_subscribed() {
 
     let node_id = generate_node_id("transport");
     let broker = Arc::new(
-        Broker::connect(&test_redis_url(), node_id.clone())
+        Broker::connect(&[test_redis_url()], node_id.clone())
             .await
             .expect("connect broker"),
     );
@@ -2001,10 +2148,10 @@ async fn failover_has_no_double_owner() {
 
     let redis_url = test_redis_url();
     let room_code = "FALVR1";
-    let broker_a = Broker::connect(&redis_url, "failover-a".to_string())
+    let broker_a = Broker::connect(&[redis_url.clone()], "failover-a".to_string())
         .await
         .expect("broker A");
-    let broker_b = Broker::connect(&redis_url, "failover-b".to_string())
+    let broker_b = Broker::connect(&[redis_url.clone()], "failover-b".to_string())
         .await
         .expect("broker B");
 
@@ -2186,7 +2333,7 @@ async fn renew_pipelined_renews_all_and_survives_script_flush() {
 
     let redis_url = test_redis_url();
     let node = "renew-pipelined".to_string();
-    let broker = Broker::connect(&redis_url, node.clone())
+    let broker = Broker::connect(&[redis_url.clone()], node.clone())
         .await
         .expect("broker");
 
@@ -2253,7 +2400,7 @@ async fn graceful_shutdown_releases_ownership_and_membership() {
 
     let redis_url = test_redis_url();
     let node = "shutdown-node".to_string();
-    let broker = Broker::connect(&redis_url, node.clone())
+    let broker = Broker::connect(&[redis_url.clone()], node.clone())
         .await
         .expect("broker");
 
@@ -2296,10 +2443,10 @@ async fn session_issued_on_one_node_accepted_on_another() {
     flush_ptc_keys().await;
 
     let redis_url = test_redis_url();
-    let broker_a = Broker::connect(&redis_url, "session-a".to_string())
+    let broker_a = Broker::connect(&[redis_url.clone()], "session-a".to_string())
         .await
         .expect("broker A");
-    let broker_b = Broker::connect(&redis_url, "session-b".to_string())
+    let broker_b = Broker::connect(&[redis_url.clone()], "session-b".to_string())
         .await
         .expect("broker B");
 
@@ -2594,7 +2741,7 @@ async fn start_split_multi_logic(logic_count: usize, ports: &[u16]) -> MultiLogi
 
         let node_id = generate_node_id("logic");
         let broker = Arc::new(
-            Broker::connect(&redis_url, node_id.clone())
+            Broker::connect(&[redis_url.clone()], node_id.clone())
                 .await
                 .expect("connect logic broker"),
         );
@@ -2622,7 +2769,7 @@ async fn start_split_multi_logic(logic_count: usize, ports: &[u16]) -> MultiLogi
     for &port in ports {
         let transport_node = generate_node_id("transport");
         let transport_broker = Arc::new(
-            Broker::connect(&redis_url, transport_node.clone())
+            Broker::connect(&[redis_url.clone()], transport_node.clone())
                 .await
                 .expect("connect transport broker"),
         );
@@ -3042,6 +3189,180 @@ async fn logic_survives_a_broker_restart() {
     let _ = std::fs::remove_dir_all(&db_dir);
 }
 
+/// Shard the fabric follow-up: an inbound envelope is published through the
+/// Redis shard its `connection_id` hashes to, not any other shard, and a
+/// single connection's successive messages stay in order on its own shard.
+/// Spawns a second real redis-server so the two shards are genuinely separate
+/// Redis instances, not just two labels on one (which would prove nothing
+/// about isolation).
+#[tokio::test]
+#[ignore]
+#[allow(deprecated)]
+async fn inbound_publish_routes_to_the_connection_shard() {
+    let _guard = e2e_guard();
+    let shard1_port: u16 = 16500;
+
+    let mut shard1_redis = std::process::Command::new("redis-server")
+        .arg("--port")
+        .arg(shard1_port.to_string())
+        .arg("--save")
+        .arg("")
+        .arg("--appendonly")
+        .arg("no")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn redis-server (required for this test)");
+    wait_for_redis(shard1_port).await;
+
+    let shard0_url = test_redis_url();
+    let shard1_url = format!("redis://127.0.0.1:{shard1_port}");
+    let logic_node = generate_node_id("logic");
+    let broker = Broker::connect(&[shard0_url.clone(), shard1_url.clone()], logic_node.clone())
+        .await
+        .expect("connect sharded broker");
+    assert_eq!(broker.n_shards(), 2);
+
+    // Find a connection id hashing to shard 0 and one hashing to shard 1
+    // (shard_index is a pure function, so a handful of UUIDs always find both).
+    let conn_shard0 = (0..100)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .find(|id| chess_server::infrastructure::transport::shard_index(id, 2) == 0)
+        .expect("found a connection id hashing to shard 0");
+    let conn_shard1 = (0..100)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .find(|id| chess_server::infrastructure::transport::shard_index(id, 2) == 1)
+        .expect("found a connection id hashing to shard 1");
+    assert_eq!(broker.shard_for(&conn_shard0), 0);
+    assert_eq!(broker.shard_for(&conn_shard1), 1);
+
+    // Subscribe directly on each physical Redis to the logic node's inbound
+    // channel, so we observe which instance actually carried each publish.
+    let channel = format!("ptc.ws.in.{logic_node}");
+    let mut sub0 = redis::Client::open(shard0_url.as_str())
+        .unwrap()
+        .get_async_connection()
+        .await
+        .unwrap()
+        .into_pubsub();
+    sub0.subscribe(&channel).await.unwrap();
+    let mut stream0 = sub0.into_on_message();
+    let mut sub1 = redis::Client::open(shard1_url.as_str())
+        .unwrap()
+        .get_async_connection()
+        .await
+        .unwrap()
+        .into_pubsub();
+    sub1.subscribe(&channel).await.unwrap();
+    let mut stream1 = sub1.into_on_message();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let envelope_for = |connection_id: &str, uci: &str| InboundEnvelope {
+        v: ENVELOPE_VERSION,
+        connection_id: connection_id.to_string(),
+        node_id: "transport-test".to_string(),
+        payload: InboundPayload::ClientFrame {
+            data: format!(r#"{{"v":1,"type":"move","uci":"{uci}"}}"#),
+        },
+    };
+
+    // A message for conn_shard0 arrives on shard 0's Redis, not shard 1's.
+    broker
+        .publish_inbound_to(&envelope_for(&conn_shard0, "a1"), &logic_node)
+        .await
+        .expect("publish to shard 0");
+    let msg0 = tokio::time::timeout(Duration::from_secs(2), stream0.next())
+        .await
+        .expect("shard 0 subscriber must receive the message")
+        .expect("a message");
+    let payload0: String = msg0.get_payload().unwrap();
+    assert!(payload0.contains(&conn_shard0), "shard 0 saw the right envelope");
+    let nothing_on_1 = tokio::time::timeout(Duration::from_millis(300), stream1.next()).await;
+    assert!(nothing_on_1.is_err(), "shard 1 must not see a message routed to shard 0");
+
+    // A message for conn_shard1 arrives on shard 1's Redis, not shard 0's.
+    broker
+        .publish_inbound_to(&envelope_for(&conn_shard1, "b1"), &logic_node)
+        .await
+        .expect("publish to shard 1");
+    let msg1 = tokio::time::timeout(Duration::from_secs(2), stream1.next())
+        .await
+        .expect("shard 1 subscriber must receive the message")
+        .expect("a message");
+    let payload1: String = msg1.get_payload().unwrap();
+    assert!(payload1.contains(&conn_shard1), "shard 1 saw the right envelope");
+    let nothing_on_0 = tokio::time::timeout(Duration::from_millis(300), stream0.next()).await;
+    assert!(nothing_on_0.is_err(), "shard 0 must not see a message routed to shard 1");
+
+    // conn_shard0's own successive messages stay in order on its shard.
+    broker
+        .publish_inbound_to(&envelope_for(&conn_shard0, "a2"), &logic_node)
+        .await
+        .expect("publish a2");
+    broker
+        .publish_inbound_to(&envelope_for(&conn_shard0, "a3"), &logic_node)
+        .await
+        .expect("publish a3");
+    for expected_uci in ["a2", "a3"] {
+        let msg = tokio::time::timeout(Duration::from_secs(2), stream0.next())
+            .await
+            .expect("shard 0 message")
+            .expect("a message");
+        let payload: String = msg.get_payload().unwrap();
+        // The inner client frame is JSON stored inside the envelope's "data"
+        // string field, so its quotes are backslash-escaped in `payload`.
+        let needle = format!("\\\"uci\\\":\\\"{expected_uci}\\\"");
+        assert!(
+            payload.contains(&needle),
+            "expected {expected_uci} next, got: {payload}"
+        );
+    }
+
+    let _ = shard1_redis.kill();
+    let _ = shard1_redis.wait();
+}
+
+/// Shard the fabric follow-up: low-volume lifecycle operations (logic node
+/// membership) always use shard 0, so they stay consistent across every
+/// broker instance even when those brokers are configured with multiple
+/// Redis shards. This is the control-shard counterpart of the fabric-sharding
+/// change — a regression check, not new behavior.
+#[tokio::test]
+#[ignore]
+async fn logic_membership_is_consistent_across_shards() {
+    let _guard = e2e_guard();
+    let shard1_port: u16 = 16501;
+
+    let mut shard1_redis = std::process::Command::new("redis-server")
+        .arg("--port")
+        .arg(shard1_port.to_string())
+        .arg("--save")
+        .arg("")
+        .arg("--appendonly")
+        .arg("no")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn redis-server (required for this test)");
+    wait_for_redis(shard1_port).await;
+
+    let redis_urls = vec![test_redis_url(), format!("redis://127.0.0.1:{shard1_port}")];
+    let node_a = generate_node_id("logic");
+    let node_b = generate_node_id("logic");
+    let broker_a = Broker::connect(&redis_urls, node_a.clone()).await.expect("broker a");
+    let broker_b = Broker::connect(&redis_urls, node_b.clone()).await.expect("broker b");
+
+    broker_a.register_logic_node(None).await.expect("register a");
+    broker_b.register_logic_node(None).await.expect("register b");
+
+    let nodes = broker_a.logic_nodes().await.expect("logic_nodes");
+    assert!(nodes.contains(&node_a), "registry must list node a");
+    assert!(nodes.contains(&node_b), "registry must list node b (control shard is shared)");
+
+    let _ = shard1_redis.kill();
+    let _ = shard1_redis.wait();
+}
+
 /// Phase 3 (task 5.2): load smoke test — many concurrent
 /// connections across multiple transport nodes; measure RSS
 /// and open handles per node and verify per-connection budget.
@@ -3268,21 +3589,21 @@ async fn sample_rss_fds(pid: u32) -> (u64, u64) {
 async fn pipelined_fabric_publish_preserves_order() {
     let redis_url = test_redis_url();
     let node = generate_node_id("transport");
-    let sub_broker = Broker::connect(&redis_url, node.clone())
+    let sub_broker = Broker::connect(&[redis_url.clone()], node.clone())
         .await
         .expect("sub broker");
-    let pub_broker = Broker::connect(&redis_url, generate_node_id("logic"))
+    let pub_broker = Broker::connect(&[redis_url.clone()], generate_node_id("logic"))
         .await
         .expect("pub broker");
 
-    let mut pubsub = sub_broker.subscribe_outbound().await.expect("subscribe");
+    let mut pubsub = sub_broker.subscribe_outbound(0).await.expect("subscribe");
     let mut stream = pubsub.on_message();
     // Let the subscription register with Redis before publishing.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let payloads: Vec<String> = (0..5).map(|i| format!("m{i}")).collect();
     let counts = pub_broker
-        .publish_outbound_pipelined(&node, &payloads)
+        .publish_outbound_pipelined(&node, 0, &payloads)
         .await
         .expect("publish");
     assert_eq!(counts.len(), 5, "one count per payload");
@@ -3301,4 +3622,296 @@ async fn pipelined_fabric_publish_preserves_order() {
         got.push(payload);
     }
     assert_eq!(got, payloads, "pipelined publishes must arrive in order");
+}
+
+// colocate-room-hot-path (tasks 2.1/2.2/3.1/3.2/3.3)
+
+#[tokio::test]
+#[ignore]
+async fn unseated_connections_stay_unbound() {
+    let _guard = e2e_guard();
+    let harness = start_split(&[PORT_ROOM_TRANSPORT_1]).await;
+
+    // Other tests in this run leave their own (TTL'd) room-transport keys
+    // behind, so assert "no *new* key", not "none exist".
+    let before = scan_keys("ptc.room_transport.*").await.len();
+
+    // Auth-only activity on an unseated connection never writes a
+    // room-transport record: there is no room yet to record locality for.
+    let mut guest = connect(harness.port(0)).await;
+    send(
+        &mut guest,
+        ClientMessage::Register {
+            v: VERSION,
+            username: "rt-guest".into(),
+            password: "hunter2hunter2".into(),
+            device_id: None,
+        },
+    )
+    .await;
+    recv(&mut guest, "register session", is_session, 5).await;
+    assert_eq!(
+        scan_keys("ptc.room_transport.*").await.len(),
+        before,
+        "an unseated connection must not create a room-transport record"
+    );
+
+    // A subsequent CreateRoom still round-robins/creates normally, and now
+    // does get a record - proving the earlier auth-only frame wrote nothing.
+    send(
+        &mut guest,
+        ClientMessage::CreateRoom {
+            v: VERSION,
+            player_id: "rt-guest".into(),
+            time_control: None,
+            token: None,
+        },
+    )
+    .await;
+    let room_code = match recv(&mut guest, "guest room_ready", is_room_ready, 5).await {
+        ServerMessage::RoomReady { room_code, .. } => room_code,
+        other => panic!("expected RoomReady, got {other:?}"),
+    };
+    let recorded = wait_room_transport(&room_code, true).await;
+    assert_eq!(
+        recorded.as_deref(),
+        Some(harness.node_id(0)),
+        "the room-transport record must name the creating seat's transport node"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn room_seats_co_locate() {
+    let _guard = e2e_guard();
+    let harness = start_split(&[PORT_ROOM_TRANSPORT_2]).await;
+
+    let mut p1 = connect(harness.port(0)).await;
+    send(
+        &mut p1,
+        ClientMessage::CreateRoom {
+            v: VERSION,
+            player_id: "rt-p1".into(),
+            time_control: None,
+            token: None,
+        },
+    )
+    .await;
+    let room_code = match recv(&mut p1, "p1 room_ready", is_room_ready, 5).await {
+        ServerMessage::RoomReady { room_code, .. } => room_code,
+        other => panic!("expected RoomReady, got {other:?}"),
+    };
+    let after_create = wait_room_transport(&room_code, true).await;
+    assert_eq!(after_create.as_deref(), Some(harness.node_id(0)));
+
+    // The second seat joins (same node in this single-transport-node harness,
+    // the only topology this server can place without an external LB); the
+    // record must stay exactly what the creating seat wrote, not be
+    // overwritten by the join (task 2.1: write-only on create).
+    let mut p2 = connect(harness.port(0)).await;
+    send(
+        &mut p2,
+        ClientMessage::JoinRoom {
+            v: VERSION,
+            player_id: "rt-p2".into(),
+            room_code: room_code.clone(),
+            token: None,
+        },
+    )
+    .await;
+    recv(&mut p2, "p2 room_ready", is_room_ready, 5).await;
+
+    let after_join = room_transport_key(&room_code).await;
+    assert_eq!(
+        after_join, after_create,
+        "joining must not change the recorded room-transport locality"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn colocated_move_skips_fabric() {
+    let _guard = e2e_guard();
+    reset_fabric_metrics();
+    let harness = start_combined(PORT_COMBINED_SKIPS, None).await;
+
+    let mut p1 = connect(harness.port).await;
+    send(
+        &mut p1,
+        ClientMessage::CreateRoom {
+            v: VERSION,
+            player_id: "cs-p1".into(),
+            time_control: Some("15+10".into()),
+            token: None,
+        },
+    )
+    .await;
+    let room_code = match recv(&mut p1, "p1 room_ready", is_room_ready, 5).await {
+        ServerMessage::RoomReady { room_code, .. } => room_code,
+        other => panic!("expected RoomReady, got {other:?}"),
+    };
+    assert_eq!(
+        wait_room_transport(&room_code, true).await.as_deref(),
+        Some(harness.node_id.as_str())
+    );
+
+    let mut p2 = connect(harness.port).await;
+    send(
+        &mut p2,
+        ClientMessage::JoinRoom {
+            v: VERSION,
+            player_id: "cs-p2".into(),
+            room_code,
+            token: None,
+        },
+    )
+    .await;
+    recv(&mut p2, "p2 room_ready", is_room_ready, 5).await;
+
+    // Both seats are on the one combined node: the move must stay in-process.
+    let (before_in, before_out, before_batches, _, _) = fabric_metrics();
+    send(&mut p1, ClientMessage::Move { v: VERSION, uci: "e2e4".into() }).await;
+    recv(&mut p1, "p1 update e2e4", is_move("e2e4"), 5).await;
+    recv(&mut p2, "p2 update e2e4", is_move("e2e4"), 5).await;
+    let (after_in, after_out, after_batches, _, _) = fabric_metrics();
+
+    assert_eq!(after_in, before_in, "a colocated move must not publish inbound to the fabric");
+    assert_eq!(after_out, before_out, "a colocated move must not publish outbound to the fabric");
+    assert_eq!(after_batches, before_batches, "a colocated move must not publish an outbound batch to the fabric");
+}
+
+#[tokio::test]
+#[ignore]
+async fn order_and_frames_unchanged_under_colocation() {
+    let _guard = e2e_guard();
+    let harness = start_combined(PORT_COMBINED_ORDER, None).await;
+
+    let mut p1 = connect(harness.port).await;
+    send(
+        &mut p1,
+        ClientMessage::CreateRoom {
+            v: VERSION,
+            player_id: "co-p1".into(),
+            time_control: Some("15+10".into()),
+            token: None,
+        },
+    )
+    .await;
+    let room_code = match recv(&mut p1, "p1 room_ready", is_room_ready, 5).await {
+        ServerMessage::RoomReady { room_code, .. } => room_code,
+        other => panic!("expected RoomReady, got {other:?}"),
+    };
+    let mut p2 = connect(harness.port).await;
+    send(
+        &mut p2,
+        ClientMessage::JoinRoom {
+            v: VERSION,
+            player_id: "co-p2".into(),
+            room_code,
+            token: None,
+        },
+    )
+    .await;
+    recv(&mut p2, "p2 room_ready", is_room_ready, 5).await;
+
+    // Same move sequence and assertions as `split_mode_full_game`: a
+    // colocated room's client-visible frames and per-connection order must
+    // be identical to the split path.
+    send(&mut p1, ClientMessage::Move { v: VERSION, uci: "e2e4".into() }).await;
+    recv(&mut p1, "p1 update e2e4", is_move("e2e4"), 5).await;
+    recv(&mut p2, "p2 update e2e4", is_move("e2e4"), 5).await;
+
+    send(&mut p2, ClientMessage::Move { v: VERSION, uci: "e7e5".into() }).await;
+    recv(&mut p1, "p1 update e7e5", is_move("e7e5"), 5).await;
+    recv(&mut p2, "p2 update e7e5", is_move("e7e5"), 5).await;
+
+    send(&mut p1, ClientMessage::Resign { v: VERSION }).await;
+    let terminal = recv(
+        &mut p1,
+        "p1 resign terminal",
+        |m| matches!(m, ServerMessage::Update { status: Status::Resigned { .. }, .. }),
+        5,
+    )
+    .await;
+    assert!(matches!(
+        terminal,
+        ServerMessage::Update { status: Status::Resigned { .. }, .. }
+    ));
+    recv(
+        &mut p2,
+        "p2 resign terminal",
+        |m| matches!(m, ServerMessage::Update { status: Status::Resigned { .. }, .. }),
+        5,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn split_fallback_still_works() {
+    let _guard = e2e_guard();
+    reset_fabric_metrics();
+    let harness = start_combined(PORT_COMBINED_FALLBACK, Some(PORT_COMBINED_FALLBACK_EXTRA)).await;
+    let extra_port = harness.extra_port.expect("extra transport port configured");
+
+    // Seat 1 on the combined node (its room's logic lives here too); seat 2
+    // on a plain transport node connected only through the fabric - the
+    // mismatch (3.3) that must still use the fabric path, unchanged.
+    let mut p1 = connect(harness.port).await;
+    send(
+        &mut p1,
+        ClientMessage::CreateRoom {
+            v: VERSION,
+            player_id: "sf-p1".into(),
+            time_control: Some("15+10".into()),
+            token: None,
+        },
+    )
+    .await;
+    let room_code = match recv(&mut p1, "p1 room_ready", is_room_ready, 5).await {
+        ServerMessage::RoomReady { room_code, .. } => room_code,
+        other => panic!("expected RoomReady, got {other:?}"),
+    };
+
+    let mut p2 = connect(extra_port).await;
+    send(
+        &mut p2,
+        ClientMessage::JoinRoom {
+            v: VERSION,
+            player_id: "sf-p2".into(),
+            room_code,
+            token: None,
+        },
+    )
+    .await;
+    recv(&mut p2, "p2 room_ready", is_room_ready, 5).await;
+
+    // p1 (White, on the combined node) is local for both its own inbound and
+    // its half of the outbound fan-out; p2 (Black, on the plain transport
+    // node) is never local. Play both colors so each fabric leg is exercised:
+    // p1's move proves the outbound-to-p2 leg still uses the fabric, and
+    // p2's move additionally proves the inbound-from-p2 leg does too.
+    let (_before_in, before_out, _, _, _) = fabric_metrics();
+    send(&mut p1, ClientMessage::Move { v: VERSION, uci: "e2e4".into() }).await;
+    recv(&mut p1, "p1 update e2e4", is_move("e2e4"), 5).await;
+    recv(&mut p2, "p2 update e2e4", is_move("e2e4"), 5).await;
+    let (mid_in, mid_out, _, _, _) = fabric_metrics();
+    assert!(
+        mid_out > before_out,
+        "the update to p2 (a different transport node) must still publish outbound to the fabric"
+    );
+
+    send(&mut p2, ClientMessage::Move { v: VERSION, uci: "e7e5".into() }).await;
+    recv(&mut p1, "p1 update e7e5", is_move("e7e5"), 5).await;
+    recv(&mut p2, "p2 update e7e5", is_move("e7e5"), 5).await;
+    let (after_in, after_out, _, _, _) = fabric_metrics();
+
+    assert!(
+        after_in > mid_in,
+        "p2's move (sent from a different transport node than the room's logic) must publish inbound to the fabric"
+    );
+    assert!(
+        after_out > mid_out,
+        "the update to p2 after its own move must still publish outbound to the fabric"
+    );
 }

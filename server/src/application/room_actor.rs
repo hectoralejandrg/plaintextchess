@@ -3,6 +3,8 @@
 //! where room state mutates, so seat, turn, and timer logic is free of races.
 //! It depends on the domain layer and on ports only (design D1).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Instant};
 
@@ -16,6 +18,18 @@ use crate::interface::protocol::{Color, ErrorCode, ServerMessage, State, Status,
 
 const WHITE: usize = 0;
 const BLACK: usize = 1;
+
+/// High-water mark of a room actor's mailbox depth, sampled on every receive.
+/// The mailbox is `mpsc::unbounded_channel` (a room actor must never block on
+/// send), so this is the visibility that stands in for backpressure: if it
+/// climbs under load, the room actor is falling behind its mailbox.
+static ROOM_MAILBOX_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
+
+/// Current high-water mark of room mailbox depth across all rooms on this
+/// process, for `/healthz`.
+pub fn room_mailbox_max_depth() -> u64 {
+    ROOM_MAILBOX_MAX_DEPTH.load(Ordering::Relaxed)
+}
 
 /// The seat the room creator is placed in: a coin flip when `random_colors`,
 /// otherwise White (the deterministic default the tests pin).
@@ -885,22 +899,25 @@ pub async fn run_room(
         // messages or the grace window.
         let deadline = clock_deadline(&room);
         tokio::select! {
-            msg = mailbox.recv() => match msg {
-                Some(RoomMsg::Connect {
-                    identity,
-                    code: join_code,
-                    out,
-                }) => room.handle_connect(identity, join_code, out).await,
-                Some(RoomMsg::Move { identity, uci }) => room.handle_move(&identity, &uci).await,
-                Some(RoomMsg::Resign { identity }) => room.handle_resign(&identity).await,
-                Some(RoomMsg::Leave { identity, ack }) => {
-                    room.handle_leave(&identity).await;
-                    if let Some(ack) = ack {
-                        let _ = ack.send(());
+            msg = mailbox.recv() => {
+                ROOM_MAILBOX_MAX_DEPTH.fetch_max(mailbox.len() as u64, Ordering::Relaxed);
+                match msg {
+                    Some(RoomMsg::Connect {
+                        identity,
+                        code: join_code,
+                        out,
+                    }) => room.handle_connect(identity, join_code, out).await,
+                    Some(RoomMsg::Move { identity, uci }) => room.handle_move(&identity, &uci).await,
+                    Some(RoomMsg::Resign { identity }) => room.handle_resign(&identity).await,
+                    Some(RoomMsg::Leave { identity, ack }) => {
+                        room.handle_leave(&identity).await;
+                        if let Some(ack) = ack {
+                            let _ = ack.send(());
+                        }
                     }
+                    Some(RoomMsg::Detach { identity }) => room.handle_detach(&identity),
+                    None => break, // both connection tasks gave up: room is dead
                 }
-                Some(RoomMsg::Detach { identity }) => room.handle_detach(&identity),
-                None => break, // both connection tasks gave up: room is dead
             },
             _ = sleep_until_opt(deadline) => room.tick_flags().await,
             seat = grace_timeout(&room.grace) => room.handle_grace_expiry(seat).await,

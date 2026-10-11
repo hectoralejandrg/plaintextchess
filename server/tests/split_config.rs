@@ -10,6 +10,7 @@ fn split_requires_redis() {
     let output = Command::new(env!("CARGO_BIN_EXE_ws-server"))
         .env("TIER", "transport")
         .env_remove("REDIS_URL")
+        .env_remove("REDIS_URLS")
         .env("BIND", "127.0.0.1")
         .env("PORT", "0")
         .output()
@@ -36,6 +37,7 @@ fn invalid_tier_is_rejected() {
     let output = Command::new(env!("CARGO_BIN_EXE_ws-server"))
         .env("TIER", "banana")
         .env_remove("REDIS_URL")
+        .env_remove("REDIS_URLS")
         .output()
         .expect("run ws-server");
 

@@ -12,6 +12,7 @@ use redis::{
 use serde::{Deserialize, Serialize};
 
 use crate::infrastructure::password::{hash_token, now_ms};
+use crate::infrastructure::transport::shard_index;
 use crate::interface::protocol::{ClientMessage, ServerMessage};
 
 /// Version of the cross-tier envelope format (design D3). Distinct from the
@@ -45,6 +46,13 @@ static OUTBOUND_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// (design D3 drop-on-full policy).
 static OUTBOUND_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Time an outbound batch shard spends awaiting a publish reply from Redis
+/// (gate task 1.1 of `pipeline-fabric-publishes`), summed across every shard.
+static OUTBOUND_PUBLISH_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Time an outbound batch shard spends building the batch/payloads before
+/// publishing (serialization, not I/O), summed across every shard.
+static OUTBOUND_PROCESS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Reset all fabric metrics counters.
 pub fn reset_fabric_metrics() {
     INBOUND_PUBLISHES.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -53,6 +61,27 @@ pub fn reset_fabric_metrics() {
     INBOUND_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
     OUTBOUND_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
     OUTBOUND_DROPS.store(0, std::sync::atomic::Ordering::Relaxed);
+    OUTBOUND_PUBLISH_WAIT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+    OUTBOUND_PROCESS_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record time spent awaiting a publish reply (gate task 1.1).
+pub fn record_publish_wait_ns(ns: u64) {
+    OUTBOUND_PUBLISH_WAIT_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record time spent building a batch/payload before publishing (gate task 1.1).
+pub fn record_publish_process_ns(ns: u64) {
+    OUTBOUND_PROCESS_NS.fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot of outbound publish timing: (wait_ns, process_ns), summed across
+/// every outbound batch shard since the last reset.
+pub fn fabric_timing_metrics() -> (u64, u64) {
+    (
+        OUTBOUND_PUBLISH_WAIT_NS.load(std::sync::atomic::Ordering::Relaxed),
+        OUTBOUND_PROCESS_NS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// Record an outbound message dropped because the batcher channel was full.
@@ -345,6 +374,43 @@ pub mod ownership {
     }
 }
 
+/// Records which transport node holds a room's first seat (colocate-room-hot-path,
+/// task 2.1). Informational only: nothing in this repo reads it back yet, since
+/// the in-process colocated hot path decides locality per-connection
+/// (`LogicConnection.transport_node_id` vs the local node's own id), not by
+/// looking up this key. It exists so an external load balancer can consistently
+/// route a room's second seat to the same transport node as the first (design
+/// D2's open question), without this server building that LB itself.
+pub mod room_transport {
+    use super::*;
+    use redis::AsyncCommands;
+
+    /// Prefix for room-transport-locality keys.
+    const PREFIX: &str = "ptc.room_transport.";
+
+    /// TTL matches room ownership: both describe the same room's lifetime.
+    pub const TTL_SECS: u64 = ownership::TTL_SECS;
+
+    /// Record the transport node serving a room's first seat. Write-only
+    /// bookkeeping: unconditionally overwrites, since only the creating seat
+    /// ever calls this (the second seat only reads, if anything ever does).
+    pub async fn set(
+        conn: &mut ConnectionManager,
+        room_code: &str,
+        transport_node_id: &str,
+    ) -> redis::RedisResult<()> {
+        let key = format!("{}{}", PREFIX, room_code);
+        let opts = SetOptions::default().with_expiration(SetExpiry::EX(TTL_SECS));
+        conn.set_options(key, transport_node_id, opts).await
+    }
+
+    /// Read the transport node recorded for a room, if any.
+    pub async fn get(conn: &mut ConnectionManager, room_code: &str) -> redis::RedisResult<Option<String>> {
+        let key = format!("{}{}", PREFIX, room_code);
+        conn.get(key).await
+    }
+}
+
 /// Shared session mirror (Phase 3, task 4.5): a logic node that issues
 /// a session mirrors it to Redis so another logic node accepts the same
 /// token. SQLite remains the durable mirror (written by the issuing
@@ -535,8 +601,10 @@ pub mod liveness {
     }
 }
 
-/// Broker client for publishing/subscribing to the Redis fabric.
-pub struct Broker {
+/// One Redis shard's connections. Mirrors what `Broker` held as a single set
+/// before sharding; every shard gets its own `client`/`manager`/`publish_conn`
+/// so publishing/subscribing on one shard never contends with another.
+struct ShardConn {
     client: RedisClient,
     /// Shared multiplexed connection for commands (registry, leases, ...). It
     /// reconnects automatically but arms a per-command response timer, so it is
@@ -547,24 +615,48 @@ pub struct Broker {
     /// does not arm a tokio timer per message and does not contend on the shared
     /// timer wheel (design D1). Reconnected lazily on a connection error.
     publish_conn: RwLock<Option<MultiplexedConnection>>,
+}
+
+/// Broker client for publishing/subscribing to the Redis fabric, sharded
+/// across N independent Redis instances (colocate-room-hot-path follow-up:
+/// a single shared Redis becomes the throughput ceiling once more than one
+/// node pair relies on it, measured directly - see
+/// `openspec/changes/.../design.md` "shard the fabric" section). High-volume
+/// per-move traffic is routed to a shard by room/connection key; low-volume
+/// lifecycle bookkeeping (room ownership, registries, leases, sessions)
+/// always uses `shards[0]`, the "control shard" - it's low enough traffic
+/// that it doesn't need splitting, and keeping it on one instance avoids a
+/// cross-shard consistency problem for things like "list every logic node".
+pub struct Broker {
+    shards: Vec<ShardConn>,
     node_id: String,
 }
 
 impl Broker {
-    /// Connect to Redis and build the shared command connection. Fails if the
-    /// broker is unreachable, which is how "refuse to start without Redis"
-    /// (spec `realtime-transport`) is enforced at the call site.
-    pub async fn connect(redis_url: &str, node_id: String) -> redis::RedisResult<Self> {
-        let client = RedisClient::open(redis_url)?;
-        // The manager auto-reconnects and is used for everything except the hot
-        // publish path (see `publish_connection`).
-        let manager = client.get_connection_manager().await?;
-        Ok(Self {
-            client,
-            manager,
-            publish_conn: RwLock::new(None),
-            node_id,
-        })
+    /// Connect to every Redis shard and build each one's shared command
+    /// connection. Fails if any shard is unreachable, which is how "refuse to
+    /// start without Redis" (spec `realtime-transport`) is enforced at the
+    /// call site, now per shard.
+    pub async fn connect(redis_urls: &[String], node_id: String) -> redis::RedisResult<Self> {
+        if redis_urls.is_empty() {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::InvalidClientConfig,
+                "Broker::connect needs at least one Redis URL",
+            )));
+        }
+        let mut shards = Vec::with_capacity(redis_urls.len());
+        for url in redis_urls {
+            let client = RedisClient::open(url.as_str())?;
+            // The manager auto-reconnects and is used for everything except the
+            // hot publish path (see `publish_connection`).
+            let manager = client.get_connection_manager().await?;
+            shards.push(ShardConn {
+                client,
+                manager,
+                publish_conn: RwLock::new(None),
+            });
+        }
+        Ok(Self { shards, node_id })
     }
 
     /// Get the node identifier.
@@ -572,36 +664,50 @@ impl Broker {
         &self.node_id
     }
 
-    fn conn(&self) -> ConnectionManager {
-        self.manager.clone()
+    /// Number of Redis shards this broker spreads traffic across.
+    pub fn n_shards(&self) -> usize {
+        self.shards.len()
     }
 
-    /// A no-per-command-timeout connection for the hot publish path, (re)opened
-    /// lazily. A plain `MultiplexedConnection` is created with no response
-    /// timeout, so publishing never arms a tokio timer and does not contend on
-    /// the shared timer wheel (design D1). If the cached connection is gone
-    /// (broker restart), the next call reconnects.
-    async fn publish_connection(&self) -> redis::RedisResult<MultiplexedConnection> {
-        if let Some(conn) = self.publish_conn.read().unwrap().clone() {
+    /// The shard a room/connection-scoped key routes to. Shared helper so
+    /// callers (the outbound batcher, inbound publish) agree on the mapping.
+    pub fn shard_for(&self, key: &str) -> usize {
+        shard_index(key, self.shards.len())
+    }
+
+    /// The control shard: every low-volume lifecycle operation (room
+    /// ownership, registries, leases, sessions) lives here, not split.
+    fn conn(&self) -> ConnectionManager {
+        self.shards[0].manager.clone()
+    }
+
+    /// A no-per-command-timeout connection for the hot publish path on one
+    /// shard, (re)opened lazily. A plain `MultiplexedConnection` is created
+    /// with no response timeout, so publishing never arms a tokio timer and
+    /// does not contend on the shared timer wheel (design D1). If the cached
+    /// connection is gone (broker restart), the next call reconnects.
+    async fn publish_connection(&self, shard: usize) -> redis::RedisResult<MultiplexedConnection> {
+        if let Some(conn) = self.shards[shard].publish_conn.read().unwrap().clone() {
             return Ok(conn);
         }
-        let conn = self.client.get_multiplexed_async_connection().await?;
-        *self.publish_conn.write().unwrap() = Some(conn.clone());
+        let conn = self.shards[shard].client.get_multiplexed_async_connection().await?;
+        *self.shards[shard].publish_conn.write().unwrap() = Some(conn.clone());
         Ok(conn)
     }
 
-    /// Publish `payload` on `channel`, retrying a transient connection failure.
-    /// Returns the subscriber count. A broker restart kills the cached publish
-    /// connection, so the first attempt may fail and the next reconnects
-    /// (design D10 / BUG-R1-F1).
+    /// Publish `payload` on `channel` via `shard`, retrying a transient
+    /// connection failure. Returns the subscriber count. A broker restart
+    /// kills the cached publish connection, so the first attempt may fail and
+    /// the next reconnects (design D10 / BUG-R1-F1).
     async fn publish_with_retry(
         &self,
+        shard: usize,
         channel: String,
         payload: String,
     ) -> redis::RedisResult<i64> {
         let mut last_err: Option<redis::RedisError> = None;
         for attempt in 0..PUBLISH_ATTEMPTS {
-            let mut conn = match self.publish_connection().await {
+            let mut conn = match self.publish_connection(shard).await {
                 Ok(conn) => conn,
                 Err(err) => {
                     last_err = Some(err);
@@ -618,7 +724,7 @@ impl Broker {
                 Ok(subscribers) => return Ok(subscribers),
                 Err(err) => {
                     // Drop the cached connection so the next attempt reconnects.
-                    *self.publish_conn.write().unwrap() = None;
+                    *self.shards[shard].publish_conn.write().unwrap() = None;
                     last_err = Some(err);
                 }
             }
@@ -638,49 +744,58 @@ impl Broker {
         let payload = serde_json::to_string(envelope).map_err(serialize_error)?;
         INBOUND_PUBLISHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         INBOUND_BYTES.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.publish_with_retry(channel, payload).await
+        // Legacy/unused Phase 1 path (no caller in this repo): control shard.
+        self.publish_with_retry(0, channel, payload).await
     }
 
     /// Publish an inbound envelope to a specific logic node (Phase 3).
-    /// Returns the number of subscribers that received it.
+    /// Returns the number of subscribers that received it. Sharded by
+    /// `connection_id`: the transport tier does not know a connection's room
+    /// code for an in-flight move, but it always knows the connection id, and
+    /// a connection's messages always hash to the same shard (order-preserving).
     pub async fn publish_inbound_to(
         &self,
         envelope: &InboundEnvelope,
         logic_node_id: &str,
     ) -> redis::RedisResult<i64> {
+        let shard = self.shard_for(&envelope.connection_id);
         let channel = channels::inbound_to_logic(logic_node_id);
         let payload = serde_json::to_string(envelope).map_err(serialize_error)?;
         INBOUND_PUBLISHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         INBOUND_BYTES.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.publish_with_retry(channel, payload).await
+        self.publish_with_retry(shard, channel, payload).await
     }
 
-    /// Publish an outbound envelope to a specific transport node. Returns the
-    /// number of subscriber connections that received it (0 when no node is
-    /// listening on that channel), which lets the caller detect a stale route
-    /// (design D4 "Owning node resolution").
+    /// Publish an outbound envelope to a specific transport node on `redis_shard`
+    /// (chosen by the caller, which already knows the room/connection key).
+    /// Returns the number of subscriber connections that received it (0 when no
+    /// node is listening on that channel), which lets the caller detect a stale
+    /// route (design D4 "Owning node resolution").
     pub async fn publish_outbound(
         &self,
         envelope: &OutboundEnvelope,
+        redis_shard: usize,
     ) -> redis::RedisResult<i64> {
         let channel = channels::outbound_to_transport(&envelope.node_id);
         let payload = serde_json::to_string(envelope).map_err(serialize_error)?;
         OUTBOUND_PUBLISHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         OUTBOUND_BYTES.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.publish_with_retry(channel, payload).await
+        self.publish_with_retry(redis_shard, channel, payload).await
     }
 
-    /// Publish a batch of outbound envelopes to a specific transport node.
-    /// Returns the number of subscriber connections that received it.
+    /// Publish a batch of outbound envelopes to a specific transport node on
+    /// `redis_shard`. Returns the number of subscriber connections that
+    /// received it.
     pub async fn publish_outbound_batch(
         &self,
         batch: &OutboundBatch,
+        redis_shard: usize,
     ) -> redis::RedisResult<i64> {
         let channel = channels::outbound_to_transport(&batch.node_id);
         let payload = serde_json::to_string(batch).map_err(serialize_error)?;
         OUTBOUND_BATCHES_PUBLISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         OUTBOUND_BYTES.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        self.publish_with_retry(channel, payload).await
+        self.publish_with_retry(redis_shard, channel, payload).await
     }
 
     /// Publish several already-serialized outbound payloads to one transport
@@ -693,6 +808,7 @@ impl Broker {
     pub async fn publish_outbound_pipelined(
         &self,
         node_id: &str,
+        redis_shard: usize,
         payloads: &[String],
     ) -> redis::RedisResult<Vec<i64>> {
         if payloads.is_empty() {
@@ -705,7 +821,7 @@ impl Broker {
 
         let mut last_err: Option<redis::RedisError> = None;
         for attempt in 0..PUBLISH_ATTEMPTS {
-            let mut conn = match self.publish_connection().await {
+            let mut conn = match self.publish_connection(redis_shard).await {
                 Ok(conn) => conn,
                 Err(err) => {
                     last_err = Some(err);
@@ -723,7 +839,7 @@ impl Broker {
                 Ok(counts) => return Ok(counts),
                 Err(err) => {
                     // Drop the cached connection so the next attempt reconnects.
-                    *self.publish_conn.write().unwrap() = None;
+                    *self.shards[redis_shard].publish_conn.write().unwrap() = None;
                     last_err = Some(err);
                 }
             }
@@ -734,11 +850,11 @@ impl Broker {
         Err(last_err.expect("at least one publish attempt runs"))
     }
 
-    /// Subscribe to this node's outbound channel. Uses a dedicated connection:
-    /// a multiplexed/manager connection cannot enter subscriber mode.
+    /// Subscribe to this node's outbound channel on `shard`. Uses a dedicated
+    /// connection: a multiplexed/manager connection cannot enter subscriber mode.
     #[allow(deprecated)]
-    pub async fn subscribe_outbound(&self) -> redis::RedisResult<redis::aio::PubSub> {
-        let conn = self.client.get_async_connection().await?;
+    pub async fn subscribe_outbound(&self, shard: usize) -> redis::RedisResult<redis::aio::PubSub> {
+        let conn = self.shards[shard].client.get_async_connection().await?;
         let mut pubsub = conn.into_pubsub();
         pubsub
             .subscribe(channels::outbound_to_transport(&self.node_id))
@@ -747,9 +863,10 @@ impl Broker {
     }
 
     /// Subscribe to the Phase 1 inbound channel (transport -> logic).
+    /// Legacy/unused path (no caller in this repo): control shard.
     #[allow(deprecated)]
     pub async fn subscribe_inbound(&self) -> redis::RedisResult<redis::aio::PubSub> {
-        let conn = self.client.get_async_connection().await?;
+        let conn = self.shards[0].client.get_async_connection().await?;
         let mut pubsub = conn.into_pubsub();
         pubsub
             .subscribe(channels::inbound_to_logic(DEFAULT_LOGIC_NODE))
@@ -757,11 +874,11 @@ impl Broker {
         Ok(pubsub)
     }
 
-    /// Subscribe to this logic node's own inbound channel (Phase 3).
+    /// Subscribe to this logic node's own inbound channel on `shard` (Phase 3).
     /// Channel format: `ptc.ws.in.{logic_node_id}`.
     #[allow(deprecated)]
-    pub async fn subscribe_inbound_self(&self) -> redis::RedisResult<redis::aio::PubSub> {
-        let conn = self.client.get_async_connection().await?;
+    pub async fn subscribe_inbound_self(&self, shard: usize) -> redis::RedisResult<redis::aio::PubSub> {
+        let conn = self.shards[shard].client.get_async_connection().await?;
         let mut pubsub = conn.into_pubsub();
         pubsub
             .subscribe(channels::inbound_to_logic(&self.node_id))
@@ -769,19 +886,19 @@ impl Broker {
         Ok(pubsub)
     }
 
-    /// Subscribe to room broadcasts (Phase 2).
+    /// Subscribe to room broadcasts (Phase 2). Legacy/unused path: control shard.
     #[allow(deprecated)]
     pub async fn subscribe_room(&self, room_code: &str) -> redis::RedisResult<redis::aio::PubSub> {
-        let conn = self.client.get_async_connection().await?;
+        let conn = self.shards[0].client.get_async_connection().await?;
         let mut pubsub = conn.into_pubsub();
         pubsub.subscribe(channels::room(room_code)).await?;
         Ok(pubsub)
     }
 
-    /// Subscribe to site-wide broadcasts (Phase 2).
+    /// Subscribe to site-wide broadcasts (Phase 2). Legacy/unused path: control shard.
     #[allow(deprecated)]
     pub async fn subscribe_site(&self) -> redis::RedisResult<redis::aio::PubSub> {
-        let conn = self.client.get_async_connection().await?;
+        let conn = self.shards[0].client.get_async_connection().await?;
         let mut pubsub = conn.into_pubsub();
         pubsub.subscribe(channels::SITE).await?;
         Ok(pubsub)
@@ -834,6 +951,18 @@ impl Broker {
     pub async fn renew_room_lease(&self, room_code: &str) -> redis::RedisResult<bool> {
         let mut conn = self.conn();
         ownership::renew(&mut conn, room_code, &self.node_id).await
+    }
+
+    /// Record the transport node serving a room's first seat (colocate-room-hot-path, task 2.1).
+    pub async fn set_room_transport(&self, room_code: &str, transport_node_id: &str) -> redis::RedisResult<()> {
+        let mut conn = self.conn();
+        room_transport::set(&mut conn, room_code, transport_node_id).await
+    }
+
+    /// Read the transport node recorded for a room, if any (colocate-room-hot-path, task 2.1).
+    pub async fn get_room_transport(&self, room_code: &str) -> redis::RedisResult<Option<String>> {
+        let mut conn = self.conn();
+        room_transport::get(&mut conn, room_code).await
     }
 
     /// Renew multiple room ownership leases in a single pipeline (Phase 3, task 5.1).

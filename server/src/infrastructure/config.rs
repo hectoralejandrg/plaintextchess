@@ -18,13 +18,16 @@ pub const DEFAULT_RECONNECT_GRACE_SECS: u64 = 120;
 pub const DEFAULT_DATABASE_URL: &str = "sqlite:./data/chess-server.db";
 
 /// Server tier role (design D8): `all` = monolith (default), `transport` = WS
-/// termination only, `logic` = authoritative game logic only.
+/// termination only, `logic` = authoritative game logic only, `combined` =
+/// transport and logic in one process over Redis, so a room whose both seats
+/// land on it skips the fabric hop (colocate-room-hot-path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     All,
     Transport,
     Logic,
+    Combined,
 }
 
 impl Default for Tier {
@@ -41,8 +44,9 @@ impl Tier {
                 "all" => Ok(Tier::All),
                 "transport" => Ok(Tier::Transport),
                 "logic" => Ok(Tier::Logic),
+                "combined" => Ok(Tier::Combined),
                 other => Err(format!(
-                    "TIER={other:?} is invalid; must be 'all', 'transport', or 'logic'"
+                    "TIER={other:?} is invalid; must be 'all', 'transport', 'logic', or 'combined'"
                 )),
             },
         }
@@ -157,8 +161,11 @@ pub struct Config {
     pub incremental_updates: bool,
     /// Server tier role (design D8). Defaults to `all` (monolith).
     pub tier: Tier,
-    /// Redis connection URL (required when tier is `transport` or `logic`).
-    pub redis_url: Option<String>,
+    /// Redis shard connection URLs (required when tier is not `all`). Every
+    /// fabric node (transport/logic/combined) must be given the same list, so
+    /// each can reach every shard. From `REDIS_URLS` (comma-separated), or
+    /// `REDIS_URL` alone as a 1-shard fallback.
+    pub redis_urls: Vec<String>,
     /// Number of inbound processing lanes for the logic tier (design D1/D5).
     /// When `TIER=logic`, this controls how many concurrent workers process
     /// room-scoped messages. Each room maps to `hash(room_code) % LOGIC_LANES`,
@@ -229,7 +236,14 @@ impl Config {
         argon2.validate()?;
 
         let tier = Tier::from_env()?;
-        let redis_url = std::env::var("REDIS_URL").ok();
+        let redis_urls: Vec<String> = match std::env::var("REDIS_URLS") {
+            Ok(raw) => raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Err(_) => std::env::var("REDIS_URL").ok().into_iter().collect(),
+        };
 
         // LOGIC_LANES: number of inbound processing lanes (design D1/D5)
         let logic_lanes = match std::env::var("LOGIC_LANES") {
@@ -277,7 +291,7 @@ impl Config {
             random_colors: true,
             incremental_updates: true,
             tier,
-            redis_url,
+            redis_urls,
             logic_lanes,
             logic_control_lanes,
         })
@@ -310,7 +324,7 @@ impl Config {
             random_colors: false,
             incremental_updates: false,
             tier: Tier::All,
-            redis_url: None,
+            redis_urls: Vec::new(),
             logic_lanes: DEFAULT_LOGIC_LANES,
             logic_control_lanes: DEFAULT_LOGIC_CONTROL_LANES,
         }
@@ -468,6 +482,37 @@ mod tests {
         std::env::set_var("LOGIC_CONTROL_LANES", "not-a-number");
         let err = Config::from_env().expect_err("invalid control lanes must be refused");
         assert!(err.contains("LOGIC_CONTROL_LANES") && err.contains("valid positive integer"));
+    }
+
+    #[test]
+    fn redis_urls_unset_is_empty() {
+        let _guard = env_guard();
+        std::env::remove_var("REDIS_URL");
+        std::env::remove_var("REDIS_URLS");
+        let config = Config::from_env().expect("defaults must be valid");
+        assert!(config.redis_urls.is_empty());
+    }
+
+    #[test]
+    fn redis_url_singular_is_a_one_shard_fallback() {
+        let _guard = env_guard();
+        std::env::remove_var("REDIS_URLS");
+        std::env::set_var("REDIS_URL", "redis://127.0.0.1:6379");
+        let config = Config::from_env().expect("a single REDIS_URL must be accepted");
+        assert_eq!(config.redis_urls, vec!["redis://127.0.0.1:6379".to_string()]);
+        std::env::remove_var("REDIS_URL");
+    }
+
+    #[test]
+    fn redis_urls_plural_splits_on_commas() {
+        let _guard = env_guard();
+        std::env::set_var("REDIS_URLS", "redis://127.0.0.1:6380, redis://127.0.0.1:6381");
+        let config = Config::from_env().expect("REDIS_URLS must be accepted");
+        assert_eq!(
+            config.redis_urls,
+            vec!["redis://127.0.0.1:6380".to_string(), "redis://127.0.0.1:6381".to_string()]
+        );
+        std::env::remove_var("REDIS_URLS");
     }
 
     #[test]

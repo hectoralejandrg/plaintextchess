@@ -1,9 +1,15 @@
 //! Tiered server entry point: `TIER=all` (monolith, default), `TIER=transport`
-//! (WebSocket termination only), `TIER=logic` (authoritative game logic only).
+//! (WebSocket termination only), `TIER=logic` (authoritative game logic only),
+//! `TIER=combined` (both tiers in one process, sharing a Redis fabric with
+//! other nodes but skipping it for a room whose connections are colocated
+//! here — colocate-room-hot-path).
 //!
-//! When `TIER=transport` or `TIER=logic`, `REDIS_URL` must be set and a
-//! working Redis connection is required. The monolith (`TIER=all`) runs
-//! without Redis and is the backward-compatible default for dev and tests.
+//! When `TIER` is not `all`, `REDIS_URL` (single shard) or `REDIS_URLS`
+//! (comma-separated, N shards - the fabric is sharded by room/connection key
+//! so a single Redis doesn't become the throughput ceiling once more than one
+//! node pair relies on it) must be set, and every shard must be reachable.
+//! The monolith (`TIER=all`) runs without Redis and is the backward-compatible
+//! default for dev and tests.
 //!
 //! The transport tier deliberately does **not** open the database or load
 //! authentication state (design D5): it holds no authoritative state.
@@ -35,8 +41,8 @@ async fn main() {
     };
 
     // Spec `realtime-transport`: a split tier refuses to start without Redis.
-    if config.tier != Tier::All && config.redis_url.is_none() {
-        tracing::error!("REDIS_URL must be set when TIER=transport or TIER=logic");
+    if config.tier != Tier::All && config.redis_urls.is_empty() {
+        tracing::error!("REDIS_URL or REDIS_URLS must be set when TIER is not 'all'");
         std::process::exit(1);
     }
 
@@ -53,6 +59,10 @@ async fn main() {
         Tier::Logic => {
             let app = init_app(&config).await;
             run_logic(config, app).await
+        }
+        Tier::Combined => {
+            let app = init_app(&config).await;
+            run_combined(config, app).await
         }
     }
 }
@@ -121,13 +131,8 @@ async fn run_monolith(config: Config, app: Arc<App>) {
 }
 
 async fn run_transport(config: Config) {
-    let redis_url = config
-        .redis_url
-        .as_ref()
-        .expect("REDIS_URL required for the transport tier");
-
     let node_id = generate_node_id("transport");
-    let broker = match Broker::connect(redis_url, node_id.clone()).await {
+    let broker = match Broker::connect(&config.redis_urls, node_id.clone()).await {
         Ok(broker) => Arc::new(broker),
         Err(err) => {
             tracing::error!(error = %err, "cannot connect to Redis; refusing to start");
@@ -169,13 +174,8 @@ async fn run_transport(config: Config) {
 }
 
 async fn run_logic(config: Config, mut app: Arc<App>) {
-    let redis_url = config
-        .redis_url
-        .as_ref()
-        .expect("REDIS_URL required for the logic tier");
-
     let node_id = generate_node_id("logic");
-    let broker = match Broker::connect(redis_url, node_id.clone()).await {
+    let broker = match Broker::connect(&config.redis_urls, node_id.clone()).await {
         Ok(broker) => Arc::new(broker),
         Err(err) => {
             tracing::error!(error = %err, "cannot connect to Redis; refusing to start");
@@ -237,6 +237,116 @@ async fn run_logic(config: Config, mut app: Arc<App>) {
     });
 
     // Keep one Arc to trigger graceful shutdown while the reader loop runs.
+    let shutdown_state = Arc::clone(&logic_state);
+    tokio::select! {
+        result = logic_state.run(None) => {
+            if let Err(e) = result {
+                tracing::error!(error = %e, "logic tier exited with error");
+                std::process::exit(1);
+            }
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received; releasing rooms and membership");
+            shutdown_state.shutdown().await;
+        }
+    }
+}
+
+/// `TIER=combined`: transport and logic share one process and one Redis
+/// connection, cross-linked so a room whose both seats land on this node
+/// skips the fabric hop entirely (colocate-room-hot-path design D2/D3).
+/// Cross-node rooms and reconnects still go through the fabric unchanged,
+/// exactly as a real `TIER=transport`/`TIER=logic` pair would.
+async fn run_combined(config: Config, mut app: Arc<App>) {
+    let node_id = generate_node_id("combined");
+    let broker = match Broker::connect(&config.redis_urls, node_id.clone()).await {
+        Ok(broker) => Arc::new(broker),
+        Err(err) => {
+            tracing::error!(error = %err, "cannot connect to Redis; refusing to start");
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(app_mut) = Arc::get_mut(&mut app) {
+        app_mut.set_broker(Arc::clone(&broker));
+    } else {
+        tracing::warn!("could not set broker on App (shared reference); room ownership release may not work");
+    }
+
+    let transport_state = Arc::new(TransportState::new(Arc::clone(&broker), node_id.clone()));
+    let logic_state = Arc::new(LogicState::new(
+        app,
+        Arc::clone(&broker),
+        node_id.clone(),
+        config.logic_lanes,
+        config.logic_control_lanes,
+    ));
+    // Wire the cross-links before either side serves traffic, so the hot path
+    // never observes a half-wired state.
+    transport_state.set_local_logic(Arc::clone(&logic_state));
+    logic_state.set_local_transport(Arc::clone(&transport_state));
+
+    if let Err(err) = transport_state.spawn_dispatcher().await {
+        tracing::error!(error = %err, "cannot subscribe to the outbound channel; refusing to start");
+        std::process::exit(1);
+    }
+    if let Err(err) = transport_state.spawn_liveness().await {
+        tracing::error!(error = %err, "cannot register node liveness lease; refusing to start");
+        std::process::exit(1);
+    }
+    // Close connections whose logic owner is lost (GAP-P3-D); harmless here
+    // since this process is its own logic owner, but keeps combined mode
+    // behaviorally identical to transport for a cross-node room's seat.
+    transport_state.spawn_logic_watch();
+
+    let listener = tokio::net::TcpListener::bind((config.bind, config.port))
+        .await
+        .expect("bind listener");
+    tracing::info!(
+        bind = %config.bind,
+        port = config.port,
+        tier = "combined",
+        node_id = %node_id,
+        "ws-server (combined) listening"
+    );
+
+    // One merged /healthz (simpler than a second listener): the logic tier's
+    // metrics plus the process-global transport egress metrics, under the
+    // same keys each tier already exposes on its own `/healthz`.
+    let health_logic = Arc::clone(&logic_state);
+    let health_node_id = node_id.clone();
+    let router = axum::Router::new()
+        .route("/ws", axum::routing::get(transport_handler::ws_upgrade))
+        .route(
+            "/healthz",
+            axum::routing::get(move || {
+                let logic = Arc::clone(&health_logic);
+                let node_id = health_node_id.clone();
+                async move {
+                    let mut body = logic.metrics_snapshot();
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("status".to_string(), serde_json::json!("ok"));
+                        obj.insert("tier".to_string(), serde_json::json!("combined"));
+                        obj.insert("node_id".to_string(), serde_json::json!(node_id));
+                        obj.insert("protocol_version".to_string(), serde_json::json!(VERSION));
+                        obj.insert(
+                            "transport_metrics".to_string(),
+                            chess_server::infrastructure::transport::transport_metrics(),
+                        );
+                    }
+                    axum::Json(body)
+                }
+            }),
+        )
+        .with_state(transport_state);
+
+    let server = axum::serve(listener, router).into_future();
+    tokio::spawn(async move {
+        if let Err(err) = server.await {
+            tracing::error!(%err, "ws-server (combined) exited");
+        }
+    });
+
     let shutdown_state = Arc::clone(&logic_state);
     tokio::select! {
         result = logic_state.run(None) => {

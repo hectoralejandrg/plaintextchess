@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, oneshot};
 use futures_util::StreamExt;
 use tracing::{debug, error, info, warn};
 
-use crate::application::room_actor::RoomMsg;
+use crate::application::room_actor::{RoomMsg, room_mailbox_max_depth};
 use crate::domain::account::Identity;
 use crate::domain::time_control::TimeControl;
 use crate::infrastructure::broker::{
@@ -24,6 +24,8 @@ use crate::infrastructure::broker::{
 };
 use crate::infrastructure::password::now_ms;
 use crate::infrastructure::server::App;
+use crate::infrastructure::transport::{shard_index, Outbound, Outbox};
+use crate::infrastructure::transport_handler::TransportState;
 use crate::interface::protocol::{ClientMessage, ErrorCode, ServerMessage, VERSION, decode_incoming};
 
 /// Backoff bounds and failure budget for broker reconnection (design D10).
@@ -59,6 +61,13 @@ fn reconnect_backoff(failures: u32) -> Duration {
 /// lane is full, providing end-to-end backpressure.
 const LANE_CAPACITY: usize = 1024;
 
+/// High-water mark of a connection's outbound `mpsc::unbounded_channel` depth,
+/// sampled on every receive in `start_outbound_forwarder`. The channel is
+/// unbounded by design (a room actor must never block broadcasting), so this
+/// stands in for backpressure visibility: if it climbs under load, the
+/// forwarder/batcher is falling behind the room actor's output.
+static OUT_CHANNEL_MAX_DEPTH: AtomicU64 = AtomicU64::new(0);
+
 /// Maximum number of items in a single outbound batch (design D3). The batch is
 /// bounded by item count; a byte cap was removed because it could not be
 /// enforced without re-serializing each item (which design D4 avoids), and the
@@ -77,10 +86,11 @@ struct BatchItem {
     connection_id: String,
 }
 
-/// Number of parallel outbound publish shards per transport node (design D3).
-/// A game's two seats share a shard (keyed by room), so they are still coalesced
-/// into one fabric message, while distinct rooms publish in parallel - restoring
-/// the throughput a single per-node task loses.
+/// Representative shard count for the shard-distribution unit test below. The
+/// real `NodeBatcher` sizes itself from `Broker::n_shards()` (one `BatchShard`
+/// per Redis shard, design: shard the fabric), not this constant; it only
+/// remains to exercise `shard_index`'s distribution at a realistic width.
+#[cfg(test)]
 const BATCH_SHARDS_PER_NODE: usize = 16;
 
 /// One outbound publish shard: an independent task with its own bounded channel.
@@ -92,18 +102,6 @@ struct BatchShard {
 struct NodeBatcher {
     node_id: String,
     shards: Vec<BatchShard>,
-}
-
-/// Stable shard index for a key (FNV-1a). The same key always maps to the same
-/// shard, so a connection's messages keep their order and a room's two seats
-/// land in the same shard (and coalesce).
-fn shard_index(key: &str, shard_count: usize) -> usize {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in key.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash as usize % shard_count
 }
 
 /// Decode a client frame exactly once and normalize it to the typed `Client`
@@ -184,14 +182,14 @@ fn serialize_unit(node_id: &str, items: &[BatchItem]) -> String {
 /// Re-resolve each message's owner through the registry and retry it once
 /// against the node it names now (design D4: the registry is the stale-entry
 /// fallback). Used when a publish reports zero subscribers.
-async fn retry_stale(broker: &Broker, items: Vec<BatchItem>) {
+async fn retry_stale(broker: &Broker, redis_shard: usize, items: Vec<BatchItem>) {
     for item in items {
         let mut envelope = item.envelope;
         let connection_id = item.connection_id;
         match broker.lookup_connection_node(&connection_id).await {
             Ok(Some(owner)) if owner != envelope.node_id => {
                 envelope.node_id = owner;
-                let _ = broker.publish_outbound(&envelope).await;
+                let _ = broker.publish_outbound(&envelope, redis_shard).await;
             }
             _ => {
                 debug!(
@@ -205,20 +203,27 @@ async fn retry_stale(broker: &Broker, items: Vec<BatchItem>) {
 
 /// Publish one collected batch: a lone item as the unchanged single envelope, or
 /// several items as one `OutboundBatch` for the node, with the stale-route retry.
-async fn publish_batch(broker: &Broker, items: Vec<BatchItem>) {
+async fn publish_batch(broker: &Broker, redis_shard: usize, items: Vec<BatchItem>) {
     if items.len() == 1 {
         let item = items.into_iter().next().expect("one item");
-        let _ = deliver_outbound_envelope(broker, item).await;
+        let _ = deliver_outbound_envelope(broker, redis_shard, item).await;
         return;
     }
+    let t_process = Instant::now();
     let node_id = items[0].envelope.node_id.clone();
     let batch = crate::infrastructure::broker::OutboundBatch {
         v: ENVELOPE_VERSION,
         node_id,
         items: items.iter().map(|i| i.envelope.clone()).collect(),
     };
-    match broker.publish_outbound_batch(&batch).await {
-        Ok(0) => retry_stale(broker, items).await,
+    crate::infrastructure::broker::record_publish_process_ns(t_process.elapsed().as_nanos() as u64);
+
+    let t_wait = Instant::now();
+    let result = broker.publish_outbound_batch(&batch, redis_shard).await;
+    crate::infrastructure::broker::record_publish_wait_ns(t_wait.elapsed().as_nanos() as u64);
+
+    match result {
+        Ok(0) => retry_stale(broker, redis_shard, items).await,
         Ok(_) => {}
         Err(e) => {
             error!(error = %e, "failed to publish outbound batch");
@@ -227,20 +232,27 @@ async fn publish_batch(broker: &Broker, items: Vec<BatchItem>) {
 }
 
 /// Publish a group of ready batches in one pipelined round trip (design D2), in
-/// order. Falls back to the per-batch path (with full retry semantics) if the
-/// pipeline fails, and runs the stale-route retry for any batch that reported
-/// zero subscribers.
-async fn publish_units(broker: &Broker, node_id: &str, units: Vec<Vec<BatchItem>>) {
+/// order, on `redis_shard`. Falls back to the per-batch path (with full retry
+/// semantics) if the pipeline fails, and runs the stale-route retry for any
+/// batch that reported zero subscribers.
+async fn publish_units(broker: &Broker, node_id: &str, redis_shard: usize, units: Vec<Vec<BatchItem>>) {
     if units.len() == 1 {
-        publish_batch(broker, units.into_iter().next().expect("one unit")).await;
+        publish_batch(broker, redis_shard, units.into_iter().next().expect("one unit")).await;
         return;
     }
+    let t_process = Instant::now();
     let payloads: Vec<String> = units.iter().map(|items| serialize_unit(node_id, items)).collect();
-    match broker.publish_outbound_pipelined(node_id, &payloads).await {
+    crate::infrastructure::broker::record_publish_process_ns(t_process.elapsed().as_nanos() as u64);
+
+    let t_wait = Instant::now();
+    let result = broker.publish_outbound_pipelined(node_id, redis_shard, &payloads).await;
+    crate::infrastructure::broker::record_publish_wait_ns(t_wait.elapsed().as_nanos() as u64);
+
+    match result {
         Ok(counts) if counts.len() == units.len() => {
             for (items, count) in units.into_iter().zip(counts) {
                 if count == 0 {
-                    retry_stale(broker, items).await;
+                    retry_stale(broker, redis_shard, items).await;
                 }
             }
         }
@@ -250,7 +262,7 @@ async fn publish_units(broker: &Broker, node_id: &str, units: Vec<Vec<BatchItem>
                 "pipelined outbound publish failed; falling back to per-batch publish"
             );
             for items in units {
-                publish_batch(broker, items).await;
+                publish_batch(broker, redis_shard, items).await;
             }
         }
     }
@@ -281,14 +293,15 @@ async fn collect_units(rx: &mut mpsc::Receiver<BatchItem>) -> Option<Vec<Vec<Bat
 }
 
 impl BatchShard {
-    /// Spawn one publish shard for a node.
-    fn spawn(node_id: String, broker: Arc<Broker>) -> Self {
+    /// Spawn one publish shard for a node, permanently bound to `redis_shard`
+    /// (the Redis instance its key range maps to - design: shard the fabric).
+    fn spawn(node_id: String, broker: Arc<Broker>, redis_shard: usize) -> Self {
         let (tx, mut rx) = mpsc::channel(1024);
         tokio::spawn(async move {
             // The task lives as long as any sender holds this shard; when the
             // last drops, `collect_units` returns `None` and the task ends.
             while let Some(units) = collect_units(&mut rx).await {
-                publish_units(&broker, &node_id, units).await;
+                publish_units(&broker, &node_id, redis_shard, units).await;
             }
         });
         Self { tx }
@@ -314,10 +327,12 @@ impl BatchShard {
 }
 
 impl NodeBatcher {
-    /// Spawn the sharded batcher for `node_id`.
+    /// Spawn the sharded batcher for `node_id`: one `BatchShard` per Redis
+    /// shard, each permanently bound to that shard's connection.
     fn spawn(node_id: String, broker: Arc<Broker>) -> Arc<Self> {
-        let shards = (0..BATCH_SHARDS_PER_NODE)
-            .map(|_| BatchShard::spawn(node_id.clone(), Arc::clone(&broker)))
+        let n_shards = broker.n_shards();
+        let shards = (0..n_shards)
+            .map(|redis_shard| BatchShard::spawn(node_id.clone(), Arc::clone(&broker), redis_shard))
             .collect();
         Arc::new(Self { node_id, shards })
     }
@@ -339,12 +354,13 @@ impl NodeBatcher {
 /// stale-route retry logic (extracted from the old `deliver_outbound`).
 async fn deliver_outbound_envelope(
     broker: &Broker,
+    redis_shard: usize,
     item: BatchItem,
 ) -> bool {
     let mut envelope = item.envelope;
     let connection_id = item.connection_id;
 
-    match broker.publish_outbound(&envelope).await {
+    match broker.publish_outbound(&envelope, redis_shard).await {
         Ok(0) => {
             // No subscriber on that channel: the remembered owner is stale.
             // Re-resolve through the registry and retry once against the node
@@ -353,7 +369,7 @@ async fn deliver_outbound_envelope(
             match broker.lookup_connection_node(&connection_id).await {
                 Ok(Some(owner)) if owner != envelope.node_id => {
                     envelope.node_id = owner;
-                    match broker.publish_outbound(&envelope).await {
+                    match broker.publish_outbound(&envelope, redis_shard).await {
                         Ok(0) => {
                             debug!(
                                 connection_id = %connection_id,
@@ -534,6 +550,11 @@ pub struct LogicState {
     control_lane_metrics: Vec<Arc<LaneMetrics>>,
     /// Aggregate inbound move-dispatch latency (task 6.1).
     move_metrics: Arc<LaneMetrics>,
+    /// `TIER=combined` only: the `TransportState` sharing this process, set
+    /// once by `run_combined` right after both are constructed. `None` for a
+    /// real `TIER=logic` process, which always publishes to the fabric
+    /// (colocate-room-hot-path design D3).
+    local_transport: std::sync::OnceLock<Arc<TransportState>>,
 }
 
 impl LogicState {
@@ -579,12 +600,31 @@ impl LogicState {
             room_lane_metrics,
             control_lane_metrics,
             move_metrics: Arc::new(LaneMetrics::default()),
+            local_transport: std::sync::OnceLock::new(),
         }
     }
 
     /// Get the node ID.
     pub fn get_node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// `TIER=combined` only: wire this logic state to the `TransportState`
+    /// sharing its process, so the outbound forwarder can skip the fabric for
+    /// a connection served by this same process (colocate-room-hot-path).
+    /// Called once by `run_combined`; a second call is a no-op.
+    pub fn set_local_transport(&self, transport: Arc<TransportState>) {
+        let _ = self.local_transport.set(transport);
+    }
+
+    /// Handle one inbound frame in-process, skipping the fabric publish and
+    /// the inbound lane (colocate-room-hot-path task 3.1). The frame arrives
+    /// undecoded (`ClientFrame`) exactly as a fabric envelope would, so it is
+    /// normalized the same way `route_inbound` normalizes a fabric envelope
+    /// before dispatch.
+    pub async fn handle_inbound_local(&self, mut envelope: InboundEnvelope) {
+        normalize_inbound_payload(&mut envelope.payload);
+        self.handle_inbound(envelope).await;
     }
 
     /// Get or create a batcher for the given transport node.
@@ -634,6 +674,7 @@ impl LogicState {
         let mp = mm.processed.load(Ordering::Relaxed);
         let msum = mm.sum_us.load(Ordering::Relaxed);
         let (inbound_pubs, outbound_pubs, outbound_batches, inbound_bytes, outbound_bytes) = fabric_metrics();
+        let (publish_wait_ns, publish_process_ns) = crate::infrastructure::broker::fabric_timing_metrics();
         serde_json::json!({
             "room_lanes": self.room_lane_count,
             "control_lanes": self.control_lane_count,
@@ -652,6 +693,12 @@ impl LogicState {
                 "inbound_bytes": inbound_bytes,
                 "outbound_bytes": outbound_bytes,
                 "outbound_drops": crate::infrastructure::broker::outbound_drops(),
+                "outbound_publish_wait_ns": publish_wait_ns,
+                "outbound_publish_process_ns": publish_process_ns,
+            },
+            "channel_depth": {
+                "room_mailbox_max_depth": room_mailbox_max_depth(),
+                "out_channel_max_depth": OUT_CHANNEL_MAX_DEPTH.load(Ordering::Relaxed),
             }
         })
     }
@@ -685,9 +732,14 @@ impl LogicState {
         }
         info!(ttl_secs, sweep_interval, sweep_max, "room ownership TTL invariant satisfied");
 
-        // Subscribe to our inbound channel immediately so we're ready to receive
-        // messages before spawning background tasks (helps with test harness timing).
-        let mut pubsub = self.broker.subscribe_inbound_self().await?;
+        // Subscribe to our inbound channel on every Redis shard immediately so
+        // we're ready to receive messages before spawning background tasks
+        // (helps with test harness timing).
+        let n_shards = self.broker.n_shards();
+        let mut initial_pubsubs = Vec::with_capacity(n_shards);
+        for shard in 0..n_shards {
+            initial_pubsubs.push(self.broker.subscribe_inbound_self(shard).await?);
+        }
 
         // Take the lane receivers once. They live behind a Mutex so `run()` does
         // not need unique ownership of the Arc: the caller keeps a second Arc to
@@ -847,13 +899,36 @@ impl LogicState {
             }
         });
 
-        // Reader fan-out loop (design D1/D3): a single reader parses envelopes
-        // and routes them to bounded lanes. The reader is the backpressure
-        // point: `route_inbound` awaits a lane when it is full, so memory is
-        // bounded and no envelope is dropped. Because the reader is single, a
-        // saturated lane also backpressures the other lanes; this is a
-        // documented limitation (see design D3) whose durable fix is per-shard
-        // consumption. Per-room ordering is always preserved.
+        // Reader fan-out (design D1/D3): one reader task per Redis shard (sharded
+        // fabric follow-up), each parsing envelopes and routing them to bounded
+        // lanes exactly as the single reader did before sharding. The reader is
+        // the backpressure point: `route_inbound` awaits a lane when it is full,
+        // so memory is bounded and no envelope is dropped. A saturated lane
+        // backpressures the readers feeding it (documented limitation, design
+        // D3). Per-room ordering is always preserved. `run()` treats any one
+        // shard's permanent failure as the whole node's failure (same "exit
+        // non-zero so a supervisor notices" behavior as before sharding).
+        let mut readers = Vec::with_capacity(n_shards);
+        for (shard, pubsub) in initial_pubsubs.into_iter().enumerate() {
+            readers.push(tokio::spawn(Arc::clone(&self).run_inbound_reader(shard, pubsub)));
+        }
+        let (result, _index, _rest) = futures_util::future::select_all(readers).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.into()),
+            Err(join_err) => Err(format!("inbound reader task panicked: {join_err}").into()),
+        }
+    }
+
+    /// One Redis shard's inbound reader: parses envelopes from `pubsub` and
+    /// routes them to bounded lanes, reconnecting with bounded backoff when the
+    /// subscription is lost. Returns `Err` only after exhausting the reconnect
+    /// budget for this shard.
+    async fn run_inbound_reader(
+        self: Arc<Self>,
+        shard: usize,
+        mut pubsub: redis::aio::PubSub,
+    ) -> Result<(), String> {
         let mut failures: u32 = 0;
         'reader: loop {
             // Process messages in a scope that drops the stream before reassigning pubsub.
@@ -874,25 +949,26 @@ impl LogicState {
             } // messages stream dropped here, releasing borrow on pubsub
 
             // Subscription ended (broker lost); reconnect within failure budget.
-            error!(node_id = %self.node_id, "inbound subscription ended (broker lost); reconnecting");
+            error!(node_id = %self.node_id, shard, "inbound subscription ended (broker lost); reconnecting");
             loop {
                 failures += 1;
                 if failures >= MAX_SUBSCRIBE_FAILURES {
                     // Give up: drop the membership key so this node is not
-                    // mistaken for a live logic node, then exit non-zero.
+                    // mistaken for a live logic node, then report failure (the
+                    // caller exits non-zero so a supervisor notices).
                     let _ = self.broker.unregister_logic_node().await;
-                    return Err(format!("broker unavailable after {failures} attempts").into());
+                    return Err(format!("shard {shard} broker unavailable after {failures} attempts"));
                 }
                 tokio::time::sleep(reconnect_backoff(failures)).await;
-                match self.broker.subscribe_inbound_self().await {
+                match self.broker.subscribe_inbound_self(shard).await {
                     Ok(new_pubsub) => {
-                        info!(node_id = %self.node_id, "broker reconnected: inbound subscription restored");
+                        info!(node_id = %self.node_id, shard, "broker reconnected: inbound subscription restored");
                         failures = 0;
                         pubsub = new_pubsub;
                         continue 'reader;
                     }
                     Err(e) => {
-                        warn!(error = %e, failures, "failed to re-subscribe to the inbound channel; retrying");
+                        warn!(error = %e, shard, failures, "failed to re-subscribe to the inbound channel; retrying");
                     }
                 }
             }
@@ -1231,6 +1307,16 @@ impl LogicState {
                 if let Err(e) = self.broker.claim_room(&room_code).await {
                     tracing::warn!(room_code = %room_code, error = %e, "failed to claim room ownership");
                 }
+                // colocate-room-hot-path task 2.1: record the creating seat's
+                // transport node, so an external LB can route the second seat
+                // to it (nothing in this repo reads this back yet).
+                if let Err(e) = self
+                    .broker
+                    .set_room_transport(&room_code, &logic_conn.transport_node_id)
+                    .await
+                {
+                    tracing::warn!(room_code = %room_code, error = %e, "failed to record room transport locality");
+                }
                 self.adopt_room(logic_conn, conn).await;
             }
             Err(err) => {
@@ -1505,9 +1591,24 @@ impl LogicState {
             Some(b) => b,
             None => return,
         };
+        // colocate-room-hot-path task 3.1: a connection's transport node does
+        // not change for the forwarder's lifetime (the batcher above already
+        // relies on that same invariant), so decide local-vs-fabric once here
+        // instead of per message. `None` on a real `TIER=logic` process or a
+        // connection served by another node (task 3.3 fallback).
+        let local_outbox: Option<Arc<Outbox>> = self
+            .local_transport
+            .get()
+            .filter(|t| t.node_id() == logic_conn.transport_node_id)
+            .and_then(|t| t.outbox_for(&connection_id));
 
         tokio::spawn(async move {
             while let Some(message) = out_rx.recv().await {
+                OUT_CHANNEL_MAX_DEPTH.fetch_max(out_rx.len() as u64, Ordering::Relaxed);
+                if let Some(outbox) = &local_outbox {
+                    outbox.push(Outbound::Text(message));
+                    continue;
+                }
                 let envelope = OutboundEnvelope {
                     v: ENVELOPE_VERSION,
                     node_id: batcher.node_id.clone(),

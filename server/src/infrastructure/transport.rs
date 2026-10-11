@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket};
 use futures_util::stream::SplitSink;
@@ -13,22 +14,33 @@ use tokio::sync::Notify;
 
 use crate::interface::protocol::{ErrorCode, ServerMessage, PROTOCOL_CLOSE_CODE};
 
-/// Global transport metrics (task 1.1: count socket syscalls/WS frames).
+/// Global transport metrics (task 1.1: count socket syscalls/WS frames and where
+/// the egress time goes: serialization vs the socket write).
 static WS_FRAMES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static WS_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static WS_SOCKET_WRITES: AtomicU64 = AtomicU64::new(0);
+static WS_SERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+static WS_WRITE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Reset transport metrics.
 pub fn reset_transport_metrics() {
     WS_FRAMES_WRITTEN.store(0, Ordering::Relaxed);
     WS_BYTES_WRITTEN.store(0, Ordering::Relaxed);
+    WS_SOCKET_WRITES.store(0, Ordering::Relaxed);
+    WS_SERIALIZE_NS.store(0, Ordering::Relaxed);
+    WS_WRITE_NS.store(0, Ordering::Relaxed);
 }
 
-/// Snapshot transport metrics.
-pub fn transport_metrics() -> (u64, u64) {
-    (
-        WS_FRAMES_WRITTEN.load(Ordering::Relaxed),
-        WS_BYTES_WRITTEN.load(Ordering::Relaxed),
-    )
+/// Snapshot transport metrics: frames and bytes written, the number of socket
+/// writes (one per text frame), and the time spent serializing vs writing.
+pub fn transport_metrics() -> serde_json::Value {
+    serde_json::json!({
+        "ws_frames_written": WS_FRAMES_WRITTEN.load(Ordering::Relaxed),
+        "ws_bytes_written": WS_BYTES_WRITTEN.load(Ordering::Relaxed),
+        "ws_socket_writes": WS_SOCKET_WRITES.load(Ordering::Relaxed),
+        "ws_serialize_ns": WS_SERIALIZE_NS.load(Ordering::Relaxed),
+        "ws_write_ns": WS_WRITE_NS.load(Ordering::Relaxed),
+    })
 }
 
 /// Protocol-level close frame: the server must close only for malformed
@@ -106,6 +118,19 @@ pub fn room_ended_close() -> Message {
     }))
 }
 
+/// Stable shard index for a key (FNV-1a hash). Shared by the transport and
+/// logic tiers so a sharded map (connection affinity, outbound batcher,
+/// per-connection outbox registry, ...) never serializes on one lock as the
+/// connection count grows.
+pub fn shard_index(key: &str, shard_count: usize) -> usize {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in key.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash as usize) % shard_count
+}
+
 /// Whether a frame is a state-class snapshot/update: these coalesce so a slow
 /// client always converges to the newest authoritative state, while one-shot
 /// control frames are never dropped.
@@ -172,14 +197,30 @@ pub async fn write_loop(
         loop {
             let batch = outbox.take_batch();
             if !batch.is_empty() {
+                let mut fed = false;
                 for item in batch {
-                    let sent = match item {
-                        Outbound::Text(message) => send_json(&mut sink, &message).await,
+                    match item {
+                        Outbound::Text(message) => {
+                            let Some(text) = encode_text(&message) else {
+                                return;
+                            };
+                            if sink.feed(Message::Text(text.into())).await.is_err() {
+                                return;
+                            }
+                            WS_FRAMES_WRITTEN.fetch_add(1, Ordering::Relaxed);
+                            fed = true;
+                        }
                         Outbound::Ping => {
-                            sink.send(Message::Ping(Default::default())).await.is_ok()
+                            if sink.send(Message::Ping(Default::default())).await.is_err() {
+                                return;
+                            }
+                            WS_FRAMES_WRITTEN.fetch_add(1, Ordering::Relaxed);
                         }
                         Outbound::Pong(payload) => {
-                            sink.send(Message::Pong(payload.into())).await.is_ok()
+                            if sink.send(Message::Pong(payload.into())).await.is_err() {
+                                return;
+                            }
+                            WS_FRAMES_WRITTEN.fetch_add(1, Ordering::Relaxed);
                         }
                         Outbound::Close => {
                             let _ = sink.send(protocol_close()).await;
@@ -197,15 +238,18 @@ pub async fn write_loop(
                             let _ = sink.send(room_ended_close()).await;
                             return;
                         }
-                    };
-                    if !sent {
+                    }
+                }
+                // One flush for the whole drained batch (design D2): fewer flush
+                // syscalls than one per frame when several frames are ready.
+                if fed {
+                    let t_write = Instant::now();
+                    let flushed = sink.flush().await.is_ok();
+                    WS_WRITE_NS.fetch_add(t_write.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    if !flushed {
                         return;
                     }
-                    // Count WS frames and bytes written (task 1.1).
-                    WS_FRAMES_WRITTEN.fetch_add(1, Ordering::Relaxed);
-                    // We don't have the exact bytes here easily, but we can
-                    // approximate by counting the JSON text length for Text frames.
-                    // The exact bytes are counted at the tungstenite level.
+                    WS_SOCKET_WRITES.fetch_add(1, Ordering::Relaxed);
                 }
                 continue;
             }
@@ -230,18 +274,33 @@ pub async fn write_loop(
 
 /// Serialize and send one server message over the writer half. `false` means
 /// the socket is gone.
-pub async fn send_json(sink: &mut SplitSink<WebSocket, Message>, message: &ServerMessage) -> bool {
+/// Serialize one server message, counting its bytes and the time spent
+/// serializing (design D1). `None` means the message could not be encoded.
+fn encode_text(message: &ServerMessage) -> Option<String> {
+    let t = Instant::now();
     match serde_json::to_string(message) {
         Ok(text) => {
-            let bytes = text.len() as u64;
-            let result = sink.send(Message::Text(text.into())).await.is_ok();
-            if result {
-                WS_BYTES_WRITTEN.fetch_add(bytes, Ordering::Relaxed);
-            }
-            result
+            WS_SERIALIZE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            WS_BYTES_WRITTEN.fetch_add(text.len() as u64, Ordering::Relaxed);
+            Some(text)
         }
-        Err(_) => false,
+        Err(_) => None,
     }
+}
+
+/// Serialize and send one server message, flushing immediately. `false` means
+/// the socket is gone.
+pub async fn send_json(sink: &mut SplitSink<WebSocket, Message>, message: &ServerMessage) -> bool {
+    let Some(text) = encode_text(message) else {
+        return false;
+    };
+    let t_write = Instant::now();
+    let result = sink.send(Message::Text(text.into())).await.is_ok();
+    WS_WRITE_NS.fetch_add(t_write.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    if result {
+        WS_SOCKET_WRITES.fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 /// Map an `ErrorCode` to a protocol `ServerMessage::Error`.
@@ -257,6 +316,41 @@ pub fn error_message(code: ErrorCode) -> ServerMessage {
 mod tests {
     use super::*;
     use crate::interface::protocol::Status;
+
+    /// The transport metrics expose the egress breakdown and reset cleanly.
+    #[test]
+    fn egress_metrics_shape_and_reset() {
+        reset_transport_metrics();
+        let m = transport_metrics();
+        for key in [
+            "ws_frames_written",
+            "ws_bytes_written",
+            "ws_socket_writes",
+            "ws_serialize_ns",
+            "ws_write_ns",
+        ] {
+            assert_eq!(m.get(key).and_then(|v| v.as_u64()), Some(0), "{key} should start at 0");
+        }
+        WS_SOCKET_WRITES.fetch_add(3, Ordering::Relaxed);
+        WS_SERIALIZE_NS.fetch_add(120, Ordering::Relaxed);
+        WS_WRITE_NS.fetch_add(340, Ordering::Relaxed);
+        let m = transport_metrics();
+        assert_eq!(m["ws_socket_writes"], 3);
+        assert_eq!(m["ws_serialize_ns"], 120);
+        assert_eq!(m["ws_write_ns"], 340);
+        reset_transport_metrics();
+        assert_eq!(transport_metrics()["ws_socket_writes"], 0);
+    }
+
+    /// `encode_text` counts the serialized bytes and time for a frame.
+    #[test]
+    fn encode_text_counts_bytes() {
+        reset_transport_metrics();
+        let msg = update("e2e4");
+        let text = encode_text(&msg).expect("encodes");
+        assert!(!text.is_empty());
+        assert_eq!(transport_metrics()["ws_bytes_written"], text.len() as u64);
+    }
 
     fn update(uci: &str) -> ServerMessage {
         ServerMessage::Update {

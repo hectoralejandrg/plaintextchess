@@ -22,22 +22,19 @@ use crate::infrastructure::broker::{
     OutboundEnvelope, ENVELOPE_VERSION, DEFAULT_LOGIC_NODE,
 };
 use crate::interface::protocol::{VERSION, ClientMessage, decode_incoming};
-use crate::infrastructure::transport::{write_loop, Outbound, Outbox, transport_metrics};
+use crate::infrastructure::transport::{write_loop, Outbound, Outbox, transport_metrics, shard_index};
+use crate::infrastructure::logic_handler::LogicState;
 
 use tokio::task::JoinHandle;
 
 /// Per-tier health endpoint for the transport tier.
 pub async fn healthz(State(state): State<Arc<TransportState>>) -> axum::Json<serde_json::Value> {
-    let (frames, bytes) = transport_metrics();
     axum::Json(serde_json::json!({
         "status": "ok",
         "tier": "transport",
         "node_id": state.node_id(),
         "protocol_version": VERSION,
-        "transport_metrics": {
-            "ws_frames_written": frames,
-            "ws_bytes_written": bytes,
-        }
+        "transport_metrics": transport_metrics(),
     }))
 }
 
@@ -71,15 +68,29 @@ const CONN_LOGIC_SHARDS: usize = 16;
 /// Shard = hash(connection_id) % CONN_LOGIC_SHARDS.
 type ConnLogicShards = Vec<Mutex<HashMap<String, String>>>;
 
+/// Number of shards for the per-connection outbox registry. Without this, the
+/// single dispatcher task locks one Mutex shared by every live connection on
+/// the node for every dispatched frame; sharding keeps that lock's hot path
+/// cost from growing with the connection count.
+const OUTBOX_SHARDS: usize = 16;
+
+/// Sharded connection_id -> outbox map. Shard = shard_index(connection_id, OUTBOX_SHARDS).
+type OutboxShards = Vec<Mutex<HashMap<String, Arc<Outbox>>>>;
+
 /// Shared state for the transport tier.
 pub struct TransportState {
     broker: Arc<Broker>,
     node_id: String,
     /// connection_id -> that socket's outbound buffer. One entry per live
     /// connection, used by the single node dispatcher to route envelopes.
-    outboxes: Mutex<HashMap<String, Arc<Outbox>>>,
-    /// Whether the outbound subscription is currently up.
-    healthy: AtomicBool,
+    outboxes: OutboxShards,
+    /// Per-Redis-shard dispatcher health: `shard_healthy[s]` is true while
+    /// shard `s`'s outbound subscription is up. The node accepts new
+    /// connections and is considered healthy while at least one shard works
+    /// (all-or-nothing would be overly pessimistic once there is more than
+    /// one shard - a connection whose room lives on a working shard should
+    /// not be refused just because another shard is down).
+    shard_healthy: Vec<AtomicBool>,
     /// Background task that renews the node liveness lease.
     liveness_task: Mutex<Option<JoinHandle<()>>>,
     /// Phase 3: connection_id -> logic_node_id affinity. A connection's
@@ -90,6 +101,11 @@ pub struct TransportState {
     /// Round-robin index for balancing new rooms across live logic nodes.
     /// Only used when placing a new room (create_room).
     placement_rr: std::sync::atomic::AtomicUsize,
+    /// `TIER=combined` only: the `LogicState` sharing this process, set once by
+    /// `run_combined` right after both are constructed. `None` for a real
+    /// `TIER=transport` process, which always goes through the fabric
+    /// (colocate-room-hot-path design D3).
+    local_logic: std::sync::OnceLock<Arc<LogicState>>,
 }
 
 impl TransportState {
@@ -98,20 +114,46 @@ impl TransportState {
         for _ in 0..CONN_LOGIC_SHARDS {
             conn_logic.push(Mutex::new(HashMap::new()));
         }
+        let mut outboxes = Vec::with_capacity(OUTBOX_SHARDS);
+        for _ in 0..OUTBOX_SHARDS {
+            outboxes.push(Mutex::new(HashMap::new()));
+        }
+        let shard_healthy = (0..broker.n_shards()).map(|_| AtomicBool::new(true)).collect();
         Self {
             broker,
             node_id,
-            outboxes: Mutex::new(HashMap::new()),
-            healthy: AtomicBool::new(true),
+            outboxes,
+            shard_healthy,
             liveness_task: Mutex::new(None),
             conn_logic,
             placement_rr: std::sync::atomic::AtomicUsize::new(0),
+            local_logic: std::sync::OnceLock::new(),
         }
     }
 
     /// Get the node identifier.
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// `TIER=combined` only: wire this transport to the `LogicState` sharing
+    /// its process, so the hot path can skip the fabric when a connection's
+    /// owning logic node is this same process (colocate-room-hot-path).
+    /// Called once by `run_combined`; a second call is a no-op.
+    pub fn set_local_logic(&self, logic: Arc<LogicState>) {
+        let _ = self.local_logic.set(logic);
+    }
+
+    /// The `LogicState` colocated in this process, if any.
+    fn local_logic(&self) -> Option<&Arc<LogicState>> {
+        self.local_logic.get()
+    }
+
+    /// This connection's outbox, if it is live on this node. Used by the
+    /// colocated logic forwarder to push a message directly, skipping the
+    /// fabric and the dispatcher (colocate-room-hot-path task 3.1).
+    pub fn outbox_for(&self, connection_id: &str) -> Option<Arc<Outbox>> {
+        self.outbox_shard_mutex(connection_id).lock().unwrap().get(connection_id).cloned()
     }
 
     /// Start the node liveness lease and renewal task (design D11).
@@ -206,7 +248,7 @@ impl TransportState {
                             );
                             for id in ids {
                                 let outbox = {
-                                    let map = state.outboxes.lock().unwrap();
+                                    let map = state.outbox_shard_mutex(&id).lock().unwrap();
                                     map.get(&id).cloned()
                                 };
                                 if let Some(outbox) = outbox {
@@ -230,19 +272,18 @@ impl TransportState {
 
     /// Get the shard index for a connection ID.
     fn conn_logic_shard(&self, connection_id: &str) -> usize {
-        // Use FNV-1a hash for consistent distribution
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for byte in connection_id.as_bytes() {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        (hash as usize) % CONN_LOGIC_SHARDS
+        shard_index(connection_id, CONN_LOGIC_SHARDS)
     }
 
     /// Get the shard mutex for a connection ID.
     fn conn_logic_shard_mutex(&self, connection_id: &str) -> &Mutex<HashMap<String, String>> {
         let shard_idx = self.conn_logic_shard(connection_id);
         &self.conn_logic[shard_idx]
+    }
+
+    /// Get the outbox shard mutex for a connection ID.
+    fn outbox_shard_mutex(&self, connection_id: &str) -> &Mutex<HashMap<String, Arc<Outbox>>> {
+        &self.outboxes[shard_index(connection_id, OUTBOX_SHARDS)]
     }
 
     /// Phase 3: the logic node a connection is seated on, if known.
@@ -266,85 +307,117 @@ impl TransportState {
         shard.lock().unwrap().remove(connection_id);
     }
 
-    /// Subscribe **once** to this node's outbound channel, fan each envelope to
-    /// the connection that owns it, and reconnect with bounded backoff when the
-    /// subscription is lost (design D4/D10). Startup fails fast if the first
-    /// subscribe fails (spec `realtime-transport`).
+    /// Subscribe to this node's outbound channel **on every Redis shard**, fan
+    /// each envelope to the connection that owns it, and reconnect with
+    /// bounded backoff when a shard's subscription is lost (design D4/D10).
+    /// Startup fails fast if any shard's first subscribe fails (spec
+    /// `realtime-transport`). One independent task per shard, mirroring the
+    /// single-subscription loop this had before sharding, N times.
     pub async fn spawn_dispatcher(self: &Arc<Self>) -> redis::RedisResult<()> {
-        let pubsub = self.broker.subscribe_outbound().await?;
-        self.healthy.store(true, Ordering::SeqCst);
-        let state = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut pubsub = pubsub;
-            loop {
-                {
-                    // Create the message stream once per subscription: re-creating
-                    // it each iteration drops messages that arrive between polls.
-                    let mut messages = pubsub.on_message();
-                    while let Some(message) = messages.next().await {
-                        let Ok(payload) = message.get_payload::<String>() else {
-                            continue;
-                        };
-                        let Ok(wire) = serde_json::from_str::<OutboundWire>(&payload)
-                        else {
-                            continue;
-                        };
-                        dispatch_outbound_wire(&state.outboxes, wire);
-                    }
-                }
-
-                // The subscription ended: the broker is gone. Surface it to the
-                // live clients, then reconnect.
-                state.mark_unhealthy("outbound subscription ended");
-                let mut backoff = RECONNECT_MIN;
+        let n_shards = self.broker.n_shards();
+        let mut initial_pubsubs = Vec::with_capacity(n_shards);
+        for shard in 0..n_shards {
+            initial_pubsubs.push(self.broker.subscribe_outbound(shard).await?);
+        }
+        for (shard, pubsub) in initial_pubsubs.into_iter().enumerate() {
+            let state = Arc::clone(self);
+            tokio::spawn(async move {
+                let mut pubsub = pubsub;
                 loop {
-                    tokio::time::sleep(backoff).await;
-                    match state.broker.subscribe_outbound().await {
-                        Ok(new_pubsub) => {
-                            state.healthy.store(true, Ordering::SeqCst);
-                            tracing::info!(
-                                node_id = %state.node_id,
-                                "broker reconnected: outbound subscription restored"
-                            );
-                            pubsub = new_pubsub;
-                            break;
+                    {
+                        // Create the message stream once per subscription: re-creating
+                        // it each iteration drops messages that arrive between polls.
+                        let mut messages = pubsub.on_message();
+                        while let Some(message) = messages.next().await {
+                            let Ok(payload) = message.get_payload::<String>() else {
+                                continue;
+                            };
+                            let Ok(wire) = serde_json::from_str::<OutboundWire>(&payload)
+                            else {
+                                continue;
+                            };
+                            dispatch_outbound_wire(&state.outboxes, wire);
                         }
-                        Err(err) => {
-                            tracing::error!(
-                                node_id = %state.node_id,
-                                error = %err,
-                                "broker reconnect failed; retrying"
-                            );
-                            backoff = (backoff * 2).min(RECONNECT_MAX);
+                    }
+
+                    // The subscription ended: this shard's broker is gone.
+                    state.mark_shard_unhealthy(shard, "outbound subscription ended");
+                    let mut backoff = RECONNECT_MIN;
+                    loop {
+                        tokio::time::sleep(backoff).await;
+                        match state.broker.subscribe_outbound(shard).await {
+                            Ok(new_pubsub) => {
+                                state.mark_shard_healthy(shard);
+                                tracing::info!(
+                                    node_id = %state.node_id,
+                                    shard,
+                                    "broker reconnected: outbound subscription restored"
+                                );
+                                pubsub = new_pubsub;
+                                break;
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    node_id = %state.node_id,
+                                    shard,
+                                    error = %err,
+                                    "broker reconnect failed; retrying"
+                                );
+                                backoff = (backoff * 2).min(RECONNECT_MAX);
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
+        }
         Ok(())
     }
 
-    /// Mark the outbound path down and close every live client with a visible
-    /// `broker unavailable` frame, so no socket silently stops receiving
-    /// (design D10, spec "Broker loss is surfaced").
-    fn mark_unhealthy(&self, reason: &str) {
-        self.healthy.store(false, Ordering::SeqCst);
+    /// Whether this node accepts new connections: true while at least one
+    /// Redis shard's outbound subscription is up.
+    fn is_healthy(&self) -> bool {
+        self.shard_healthy.iter().any(|h| h.load(Ordering::SeqCst))
+    }
+
+    /// Mark one shard's outbound subscription down. If that was the last
+    /// healthy shard, close every live client with a visible `broker
+    /// unavailable` frame, so no socket silently stops receiving (design D10,
+    /// spec "Broker loss is surfaced").
+    fn mark_shard_unhealthy(&self, shard: usize, reason: &str) {
+        self.shard_healthy[shard].store(false, Ordering::SeqCst);
+        if self.is_healthy() {
+            tracing::warn!(node_id = %self.node_id, shard, reason, "one outbound shard lost; other shards still serving");
+            return;
+        }
         tracing::error!(
             node_id = %self.node_id,
             reason,
-            "broker lost; closing live clients until it recovers"
+            "broker lost on every shard; closing live clients until it recovers"
         );
-        let outboxes: Vec<Arc<Outbox>> = self.outboxes.lock().unwrap().values().cloned().collect();
+        let outboxes: Vec<Arc<Outbox>> = self
+            .outboxes
+            .iter()
+            .flat_map(|shard| shard.lock().unwrap().values().cloned().collect::<Vec<_>>())
+            .collect();
         for outbox in outboxes {
             outbox.push(Outbound::BrokerUnavailable);
         }
+    }
+
+    /// Mark one shard's outbound subscription back up.
+    fn mark_shard_healthy(&self, shard: usize) {
+        self.shard_healthy[shard].store(true, Ordering::SeqCst);
     }
 
     /// A lapsed lease means the authoritative tier may have dropped this node's
     /// connections. Close every live client with a "reconnect" frame so a
     /// present player is never silently orphaned (design D11).
     fn on_lease_lost(&self) {
-        let outboxes: Vec<Arc<Outbox>> = self.outboxes.lock().unwrap().values().cloned().collect();
+        let outboxes: Vec<Arc<Outbox>> = self
+            .outboxes
+            .iter()
+            .flat_map(|shard| shard.lock().unwrap().values().cloned().collect::<Vec<_>>())
+            .collect();
         for outbox in outboxes {
             outbox.push(Outbound::LeaseLost);
         }
@@ -386,7 +459,7 @@ async fn handle_transport_socket(socket: WebSocket, state: Arc<TransportState>) 
 
     // If the broker is currently down, tell the client right away rather than
     // accepting a socket that could never receive anything.
-    if !state.healthy.load(Ordering::SeqCst) {
+    if !state.is_healthy() {
         outbox.push(Outbound::BrokerUnavailable);
         let _ = writer.await;
         return;
@@ -394,7 +467,7 @@ async fn handle_transport_socket(socket: WebSocket, state: Arc<TransportState>) 
 
     // Make this socket reachable by the node's single dispatcher.
     state
-        .outboxes
+        .outbox_shard_mutex(&connection_id)
         .lock()
         .unwrap()
         .insert(connection_id.clone(), Arc::clone(&outbox));
@@ -471,7 +544,7 @@ async fn handle_transport_socket(socket: WebSocket, state: Arc<TransportState>) 
         .await;
     });
 
-    state.outboxes.lock().unwrap().remove(&connection_id);
+    state.outbox_shard_mutex(&connection_id).lock().unwrap().remove(&connection_id);
     state.remove_conn_logic_node(&connection_id);
     let _ = writer.await;
 }
@@ -524,6 +597,10 @@ async fn handle_transport_text(
     // 1) Hot path: try the specific target(s) without paying for the node list.
     if !candidates.is_empty() {
         for candidate in &candidates {
+            if try_local_logic(state, candidate, &envelope).await {
+                state.set_conn_logic_node(connection_id, candidate);
+                return true;
+            }
             match state.broker.publish_inbound_to(&envelope, candidate).await {
                 Ok(subscribers) if subscribers > 0 => {
                     state.set_conn_logic_node(connection_id, candidate);
@@ -576,6 +653,10 @@ async fn handle_transport_text(
 
         // Try any candidate not already tried above (the appended ones).
         for candidate in candidates.clone() {
+            if try_local_logic(state, &candidate, &envelope).await {
+                state.set_conn_logic_node(connection_id, &candidate);
+                return true;
+            }
             match state.broker.publish_inbound_to(&envelope, &candidate).await {
                 Ok(subscribers) if subscribers > 0 => {
                     state.set_conn_logic_node(connection_id, &candidate);
@@ -611,17 +692,33 @@ async fn resolve_room_owner(state: &Arc<TransportState>, room_code: &str) -> Opt
     }
 }
 
+/// `TIER=combined` only: if `candidate` names this process's own colocated
+/// `LogicState`, hand the frame to it directly and report handled. Skips the
+/// fabric publish and the inbound lane entirely for the common case (both
+/// seats and the room's logic on one node), falling back to the fabric for
+/// everything else (colocate-room-hot-path design D3/D4).
+async fn try_local_logic(state: &Arc<TransportState>, candidate: &str, envelope: &InboundEnvelope) -> bool {
+    let Some(local) = state.local_logic() else {
+        return false;
+    };
+    if local.get_node_id() != candidate {
+        return false;
+    }
+    local.handle_inbound_local(envelope.clone()).await;
+    true
+}
+
 /// Fan a decoded outbound wire message out to the per-connection outboxes.
 /// A batch's items are pushed in order, so each connection receives its own
 /// messages in the order they were published (design D2/D5).
 fn dispatch_outbound_wire(
-    outboxes: &Mutex<HashMap<String, Arc<Outbox>>>,
+    outboxes: &OutboxShards,
     wire: OutboundWire,
 ) {
     let push = |envelope: OutboundEnvelope| {
         let outbox = {
-            let outboxes = outboxes.lock().unwrap();
-            outboxes.get(&envelope.connection_id).cloned()
+            let shard = outboxes[shard_index(&envelope.connection_id, OUTBOX_SHARDS)].lock().unwrap();
+            shard.get(&envelope.connection_id).cloned()
         };
         if let Some(outbox) = outbox {
             outbox.push(Outbound::Text(envelope.payload));
@@ -700,12 +797,15 @@ mod tests {
         use crate::infrastructure::broker::{OutboundBatch, OutboundEnvelope, ENVELOPE_VERSION};
         use crate::interface::protocol::{ServerMessage, VERSION};
 
-        let outboxes: Mutex<HashMap<String, Arc<Outbox>>> = Mutex::new(HashMap::new());
+        let outboxes: super::OutboxShards = (0..super::OUTBOX_SHARDS).map(|_| Mutex::new(HashMap::new())).collect();
         let out_a = Arc::new(Outbox::default());
         let out_b = Arc::new(Outbox::default());
         {
-            let mut map = outboxes.lock().unwrap();
+            let mut map = outboxes[super::shard_index("conn-a", super::OUTBOX_SHARDS)].lock().unwrap();
             map.insert("conn-a".to_string(), out_a.clone());
+        }
+        {
+            let mut map = outboxes[super::shard_index("conn-b", super::OUTBOX_SHARDS)].lock().unwrap();
             map.insert("conn-b".to_string(), out_b.clone());
         }
 
@@ -755,10 +855,10 @@ mod tests {
         use crate::infrastructure::broker::{OutboundEnvelope, ENVELOPE_VERSION};
         use crate::interface::protocol::{ServerMessage, VERSION};
 
-        let outboxes: Mutex<HashMap<String, Arc<Outbox>>> = Mutex::new(HashMap::new());
+        let outboxes: super::OutboxShards = (0..super::OUTBOX_SHARDS).map(|_| Mutex::new(HashMap::new())).collect();
         let out_a = Arc::new(Outbox::default());
         {
-            let mut map = outboxes.lock().unwrap();
+            let mut map = outboxes[super::shard_index("conn-a", super::OUTBOX_SHARDS)].lock().unwrap();
             map.insert("conn-a".to_string(), out_a.clone());
         }
 
