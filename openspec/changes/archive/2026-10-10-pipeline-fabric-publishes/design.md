@@ -25,6 +25,39 @@ numbers are a floor; the relative gap is the point. `redis-rs` #1312 documents
 the same root cause: `PUBLISH` waits for a server reply, unlike a fire-and-forget
 send.
 
+## Gate result (tasks 1.1/1.2 — measured; 1.3 still open)
+
+Task 1.1 required new instrumentation that did not exist before this gate: the
+shard loop (`publish_batch`/`publish_units` in `logic_handler.rs`) now times
+itself with `broker::record_publish_wait_ns`/`record_publish_process_ns`,
+exposed as `fabric_metrics.outbound_publish_wait_ns` /
+`outbound_publish_process_ns` on the logic tier's `/healthz` (summed across all
+16 outbound shards on the node).
+
+Measured on the current tree (HEAD, pipelined-publish path already live),
+release, M2 Max, one logic + one transport, loopback,
+`server/examples/load_gen.rs --games 3000 --pace-ms 60`:
+
+```
+fabric_publish_shard_time wait_us_total=10015973.4 process_us_total=82386.9 wait_vs_process_ratio=121.57
+```
+
+- Summed across every outbound shard over the whole run, the shards spent
+  ~10.0 seconds of wall time awaiting Redis publish replies and ~82 ms
+  building batches/payloads — the publish round trip is **~122x** the
+  processing cost.
+- **Verdict (task 1.2): GO** — the publish round trip is overwhelmingly the
+  dominant cost in the shard loop, confirming the spike's premise on the real
+  server path (not just the standalone benchmark in the table above).
+- **Task 1.3 (measured)**: reproduced on the real server path —
+  `Broker::publish_outbound_batch` (awaited, one reply per publish) vs
+  `Broker::publish_outbound_pipelined` (k=64) carrying the real `OutboundBatch`
+  envelope (~8.6 KB for a 33-connection mid-game move), against local Redis:
+  `server/tests/fabric_publish_bench.rs` reports awaited **55.4 us/publish** vs
+  pipelined **4.9 us/publish** (**~11x**). The smaller ratio than the toy-payload
+  spike (which used ~100 B) is the larger real envelope; the direction and the
+  elimination of the per-message round trip are confirmed on the real path.
+
 ## Goals / Non-Goals
 
 **Goals:**

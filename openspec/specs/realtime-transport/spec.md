@@ -113,3 +113,101 @@ stale state.
 #### Scenario: A client is not silently ignored while the logic resubscribes
 - **WHEN** a client sends a frame while the logic tier is still resubscribing after a broker restart
 - **THEN** the frame is delivered once the logic resubscribes, or the client receives a clear disconnect — never a silent drop
+
+### Requirement: Coalesced Outbound Fan-Out
+When several server messages are destined for connections served by the same
+transport node and are produced together, the logic tier MUST deliver them to that
+node in a single bounded fabric message rather than one fabric message per
+connection. Per-connection message order and the client-visible messages MUST be
+unchanged.
+
+#### Scenario: Two seats on one node cost one fabric message
+- **WHEN** a room action produces a message for each of two connections served by the same transport node
+- **THEN** the logic tier sends one fabric message to that node carrying both, not two fabric messages
+
+#### Scenario: The client still receives the same messages
+- **WHEN** a client plays a move
+- **THEN** it receives exactly the `Update` it receives today, with the same fields and order
+
+#### Scenario: A connection's messages keep their order
+- **WHEN** several messages for one connection are coalesced with messages for another connection on the same node
+- **THEN** each connection still receives its own messages in their original order
+
+### Requirement: No Redundant Re-serialization Across the Bridge
+A client frame MUST cross the transport<->logic boundary without being parsed and
+then re-serialized only to be parsed again. A frame the transport has already
+decoded MUST be forwarded in a form the logic can consume with a single decode,
+and the client-visible result MUST be unchanged.
+
+#### Scenario: A move crosses the bridge once
+- **WHEN** a client sends a move
+- **THEN** the move is encoded once on the transport side and decoded once on the logic side
+
+#### Scenario: Behavior is unchanged
+- **WHEN** any client frame is forwarded under this rule
+- **THEN** the logic applies exactly the same message it applies today
+
+### Requirement: Bounded Realtime Egress Cost
+The transport tier MUST bound its per-move egress cost - the flushes, write time,
+and bytes it spends delivering server messages to a client - so that the per-node
+ceiling is not fixed by the flush cost of each frame. It MUST keep every
+client-visible frame, its fields, and its per-connection order unchanged.
+
+#### Scenario: A connection's ready frames share one flush
+- **WHEN** several server frames are ready for one connection at once
+- **THEN** the transport writes them with one flush instead of one flush per frame, without changing the frames or their order
+
+#### Scenario: The client still receives the same frames
+- **WHEN** a client plays a move
+- **THEN** it receives exactly the same frames, with the same fields and order, as before
+
+#### Scenario: Egress cost is measured, not assumed
+- **WHEN** the egress path is optimized
+- **THEN** the change is backed by a measurement of flushes, write time, and bytes per move on the reference hardware, and the per-node ceiling at move-ack p95 = 100 ms is re-reported
+
+### Requirement: Pipelined Fabric Publish
+The transport<->logic bridge MUST NOT pay a full Redis round trip per fabric
+message on the hot path. The publisher MUST keep multiple fabric publishes in
+flight (pipelined) on a connection, in the order the messages were produced, so
+per-room and per-connection order is preserved. It MUST bound the in-flight
+work and apply backpressure past that bound rather than dropping messages while
+the fabric is healthy, and it MUST NOT change any client-visible message.
+
+#### Scenario: Multiple publishes share one round trip
+- **WHEN** a shard has several outbound messages ready to publish
+- **THEN** it sends them in a single pipelined round trip instead of awaiting one reply per message
+
+#### Scenario: Order is preserved under pipelining
+- **WHEN** several messages for one room are published in a pipeline
+- **THEN** each connection receives its own messages in their original order
+
+#### Scenario: Backpressure instead of loss
+- **WHEN** a shard reaches its in-flight cap
+- **THEN** it applies backpressure (the producer waits) and no message is dropped while the fabric is healthy
+
+#### Scenario: The client still receives the same messages
+- **WHEN** a client plays a move
+- **THEN** it receives exactly the same server messages, with the same fields and order, as before
+
+### Requirement: Room Locality for the Hot Path
+The system SHOULD keep a room's connections on a single transport node and SHOULD
+serve a colocated room's move/update path in-process, so a room's per-move cost
+does not include a cross-node fabric hop. It MUST keep every client-visible
+frame, its fields, and its per-connection order unchanged, and MUST keep the
+fabric path for cross-node rooms and reconnects.
+
+#### Scenario: A room's seats share a node
+- **WHEN** a second player joins an existing room
+- **THEN** their connection is placed on the transport node serving the room's first seat
+
+#### Scenario: A colocated move stays local
+- **WHEN** a move is played in a room whose connections are all on one node
+- **THEN** the update is produced and enqueued to those connections without a cross-node fabric hop
+
+#### Scenario: The client still receives the same frames
+- **WHEN** a client plays a move
+- **THEN** it receives exactly the same frames, with the same fields and order, as before
+
+#### Scenario: Cross-node rooms still work
+- **WHEN** a room's connections cannot be colocated (reconnect, or placement fails)
+- **THEN** the move/update path uses the fabric exactly as before

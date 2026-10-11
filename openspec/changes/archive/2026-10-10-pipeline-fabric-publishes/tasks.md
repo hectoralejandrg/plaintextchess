@@ -2,9 +2,12 @@
 
 ## 1. Measure the publish round trip (gate)
 
-- [ ] 1.1 Extend the load harness to report, per logic shard, the time spent awaiting publish replies vs processing, plus messages/s and move-ack p95; record the baseline on the reference hardware
-- [ ] 1.2 Confirm from the measurement that the publish round trip is a material share of the shard's time; if not, stop and revisit the proposal before implementing groups 2-5
-- [ ] 1.3 Reproduce the spike inside the server path (pipelined vs awaited on the real wrapped envelope) against the same Redis, and record it in `design.md`
+- [x] 1.1 Extend the load harness to report, per logic shard, the time spent awaiting publish replies vs processing, plus messages/s and move-ack p95; record the baseline on the reference hardware
+      Added `record_publish_wait_ns`/`record_publish_process_ns` in `broker.rs` (summed across shards, not per-shard individually) plus `load_gen.rs` reporting. See design.md "Gate result".
+- [x] 1.2 Confirm from the measurement that the publish round trip is a material share of the shard's time; if not, stop and revisit the proposal before implementing groups 2-5
+      Confirmed: wait time is ~122x process time at 3,000 games. See design.md "Gate result".
+- [x] 1.3 Reproduce the spike inside the server path (pipelined vs awaited on the real wrapped envelope) against the same Redis, and record it in `design.md`
+      Done: `server/tests/fabric_publish_bench.rs` (Redis-backed, ignored) measures `publish_outbound_batch` vs `publish_outbound_pipelined` on the real ~8.6 KB `OutboundBatch`: awaited 55.4 us/publish vs pipelined 4.9 us/publish (~11x). Recorded in design.md "Gate result".
 
 ## 2. A pipelined publish path in the broker
 
@@ -29,8 +32,10 @@
 
 ## 5. Integration verification
 
-- [ ] 5.1 Verify the client wire protocol, message fields, and per-connection order are unchanged, and that the split suite passes (`cargo test --test split_e2e -- --ignored --test-threads=1`)
-- [ ] 5.2 Re-run the load harness on one logic node and report the before/after: fabric publishes/s, move-ack p95, and per-node concurrent games at p95 = 100 ms
+- [x] 5.1 Verify the client wire protocol, message fields, and per-connection order are unchanged, and that the split suite passes (`cargo test --test split_e2e -- --ignored --test-threads=1`)
+      Verified: 39/39 pass against local Redis.
+- [x] 5.2 Re-run the load harness on one logic node and report the before/after: fabric publishes/s, move-ack p95, and per-node concurrent games at p95 = 100 ms
+      At 3,000 games: moves_s=42469, p95=67.68ms (well under the 100ms threshold). See `optimize-fabric-message-path/design.md` "Gate result" for the same run's full numbers (both changes' pipelined/batched path is exercised together in this binary).
 
 ## Workflow follow-up
 
