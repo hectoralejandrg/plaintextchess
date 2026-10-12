@@ -9,6 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Instant};
 
 use crate::application::ports::{EngineSession, RoomServices};
+use crate::application::tournament_actor::TournamentMsg;
+use crate::domain::tournament::points_for;
 use crate::domain::clock::Clocks;
 use crate::domain::account::Identity;
 use crate::domain::game_record::FinishedGame;
@@ -406,6 +408,60 @@ impl Room {
         self.grace = [None, None];
     }
 
+    /// The terminal-result funnel every game-ending path calls through
+    /// (add-tournaments phase 1): a tournament game (`self.services.tournament
+    /// = Some`) updates the tournament's standings instead of the Glicko-2
+    /// rating; every other room takes the unchanged `apply_terminal_ratings`
+    /// path. This is the single branch point, so tournament games are opt-in
+    /// at room-creation time and nothing else in this file needs to know
+    /// about tournaments.
+    async fn apply_terminal_result(&self, winner_idx: usize) {
+        if self.services.tournament.is_some() {
+            self.apply_tournament_standing(winner_idx).await;
+        } else {
+            self.apply_terminal_ratings(winner_idx).await;
+        }
+    }
+
+    /// Tournament counterpart to `apply_terminal_ratings`: points instead of
+    /// Glicko-2 (win=2, draw=1, loss=0, doubled to stay integer), sent to the
+    /// tournament's mailbox so it can update standings and free both seats
+    /// back into the waiting pool. The rating store is never touched.
+    async fn apply_tournament_standing(&self, winner_idx: usize) {
+        let (Some(white), Some(black)) = (self.seats[WHITE].as_ref(), self.seats[BLACK].as_ref())
+        else {
+            return;
+        };
+        let Some(hooks) = &self.services.tournament else {
+            return;
+        };
+        let drawn = matches!(self.status, Status::Drawn);
+        let (winner_points, loser_points) = points_for(true, drawn);
+        let (white_points, black_points) = if winner_idx == WHITE {
+            (winner_points, loser_points)
+        } else {
+            (loser_points, winner_points)
+        };
+        let _ = hooks.mailbox.send(TournamentMsg::GameFinished {
+            white: white.player_id.clone(),
+            black: black.player_id.clone(),
+            white_points,
+            black_points,
+        });
+        if let Err(err) = hooks
+            .recorder
+            .record_tournament_game(
+                &hooks.tournament_id,
+                &uuid::Uuid::new_v4().to_string(),
+                &white.player_id,
+                &black.player_id,
+            )
+            .await
+        {
+            tracing::error!(error = %err, tournament_id = %hooks.tournament_id, "failed to persist tournament game attribution");
+        }
+    }
+
     /// The terminal-rating funnel (spec "Server Persistence", design D3):
     /// capture both pre-game states, apply the in-memory result, build the
     /// `FinishedGame`, and commit it through the recorder. A commit
@@ -682,7 +738,7 @@ impl Room {
         self.status = status;
         if self.status.is_terminal() {
             self.stop_clocks();
-            self.apply_terminal_ratings(idx).await;
+            self.apply_terminal_result(idx).await;
             self.cancel_all_graces(); // the game is over: nothing left to time out
         }
         self.send_update_both(Some(uci));
@@ -708,7 +764,7 @@ impl Room {
         // Freeze at the moment the result is known, before the (possibly slow)
         // durable commit, so the clocks reflect the real end of the game.
         self.stop_clocks();
-        self.apply_terminal_ratings(winner).await;
+        self.apply_terminal_result(winner).await;
         self.send_update_both(None);
     }
 
@@ -727,7 +783,7 @@ impl Room {
             };
             self.cancel_all_graces();
             self.stop_clocks();
-            self.apply_terminal_ratings(winner).await;
+            self.apply_terminal_result(winner).await;
             self.remove_seat(idx);
             self.send_update_both(None);
             return;
@@ -787,7 +843,7 @@ impl Room {
             }
         };
         self.stop_clocks();
-        self.apply_terminal_ratings(winner).await;
+        self.apply_terminal_result(winner).await;
         self.cancel_all_graces(); // the game is over: nothing left to time out
         self.send_update_both(None);
     }
@@ -840,7 +896,7 @@ impl Room {
             };
             self.cancel_all_graces();
             self.stop_clocks();
-            self.apply_terminal_ratings(winner).await;
+            self.apply_terminal_result(winner).await;
             self.send_update(winner, None); // terminal update (forfeited, new ratings)
             self.remove_seat(idx); // the absent player can no longer re-attach
             self.services.registry.remove_room(&self.code); // the room is gone from the registry
@@ -1321,6 +1377,7 @@ mod tests {
                 auth: Arc::new(crate::infrastructure::auth::PlayerAuthStore::new()),
                 random_colors: false,
                 incremental_updates,
+                tournament: None,
             };
 
             let (tx, rx) = mpsc::unbounded_channel();

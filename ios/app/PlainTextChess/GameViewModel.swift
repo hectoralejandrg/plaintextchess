@@ -724,6 +724,38 @@ final class GameViewModel: ObservableObject {
         return true
     }
 
+    /// Join an Arena tournament's waiting pool (add-tournaments phase 1).
+    /// Once the server pairs this connection, `tournament_pairing` arrives
+    /// and the connection manager treats it exactly like `room_ready` — the
+    /// rest of the online game flow (snapshots, moves, terminal state) is
+    /// unchanged from a casual game, so nothing else here needs to know this
+    /// game started from a tournament.
+    @discardableResult
+    func startOnlineTournament(tournamentID: String, serverURLString: String?) -> Bool {
+        guard canStartNewGame else { return false }
+        guard let url = Self.onlineServerURL(serverURLString) else {
+            onlineJoinError = "No online server configured."
+            return false
+        }
+        teardownOnlineSession()
+        resetForOnlineGame()
+        makeOnlineConnection(url: url)
+        online?.startJoiningTournament(tournamentID: tournamentID)
+        return true
+    }
+
+    /// Cancel waiting in a tournament's pool (add-tournaments phase 1): the
+    /// setup sheet's "Cancel" action while `onlinePhase` is
+    /// `.waitingForTournament`.
+    func cancelTournamentWait() {
+        guard case .waitingForTournament(let tournamentID) = onlinePhase else {
+            teardownOnlineSession()
+            return
+        }
+        online?.leaveTournament(tournamentID: tournamentID)
+        teardownOnlineSession()
+    }
+
     /// The setup sheet is opening: reset the online-join handshake flags so a
     /// stale "ready" from a previous attempt cannot auto-dismiss this sheet
     /// (add-online-multiplayer D4). The join error is kept on purpose: it is
@@ -927,7 +959,7 @@ final class GameViewModel: ObservableObject {
     private func ensureAuthConnection(serverURLString: String?) -> Bool {
         if let manager = online {
             switch manager.phase {
-            case .connecting, .waiting, .inGame, .reconnecting:
+            case .connecting, .waiting, .waitingForTournament, .inGame, .reconnecting:
                 // A live connection already carries the auth callbacks
                 // (`makeOnlineConnection` wires them).
                 return true

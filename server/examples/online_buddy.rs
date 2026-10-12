@@ -193,6 +193,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 println!("buddy: {account_id} is now displayed as {display_name}");
             }
+            // Tournament messages (add-tournaments): a guest buddy never joins a
+            // tournament, so there is nothing to do with them here.
+            ServerMessage::TournamentJoined { .. }
+            | ServerMessage::TournamentPairing { .. }
+            | ServerMessage::TournamentStandings { .. }
+            | ServerMessage::TournamentEnded { .. }
+            | ServerMessage::TournamentList { .. } => {}
         }
     }
     println!("buddy: done");

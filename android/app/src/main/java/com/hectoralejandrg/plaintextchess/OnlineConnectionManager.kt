@@ -23,6 +23,9 @@ sealed class OnlinePhase {
     object Connecting : OnlinePhase()
     /** We hold a seat in a room that is waiting for the opponent. */
     data class Waiting(val code: String) : OnlinePhase()
+    /** Registered in a tournament's waiting pool, not paired yet
+     * (add-tournaments phase 1). */
+    data class WaitingForTournament(val tournamentId: String) : OnlinePhase()
     object InGame : OnlinePhase()
     /** The socket dropped mid-game; re-attaching to the same seat. */
     object Reconnecting : OnlinePhase()
@@ -73,6 +76,7 @@ class OnlineConnectionManager(
         object None : PendingAction()
         data class Create(val timeControl: String?) : PendingAction()
         data class Join(val code: String) : PendingAction()
+        data class JoinTournament(val tournamentId: String) : PendingAction()
     }
 
     private val client = OkHttpClient.Builder().build()
@@ -96,6 +100,26 @@ class OnlineConnectionManager(
     /** Connect and join an existing room by code. */
     fun startJoining(code: String) {
         beginAttempt(OnlinePhase.Connecting, PendingAction.Join(code), reconnect = false, code = code)
+    }
+
+    /** Connect and register in a tournament's waiting pool
+     * (add-tournaments phase 1). No reconnect-while-waiting support this
+     * phase: if the socket drops before pairing, the caller just retries —
+     * once paired, the resulting room uses the existing reconnect machinery
+     * like any other game. */
+    fun startJoiningTournament(tournamentId: String) {
+        beginAttempt(
+            OnlinePhase.WaitingForTournament(tournamentId),
+            PendingAction.JoinTournament(tournamentId),
+            reconnect = false,
+        )
+    }
+
+    /** Leave the tournament's waiting pool and close the connection
+     * (mirrors cancelling a room-create wait). */
+    fun leaveTournament(tournamentId: String) {
+        send(OnlineCodec.encodeLeaveTournament(tournamentId))
+        teardown()
     }
 
     /** Re-attach to an in-progress room after a drop or an app relaunch: the
@@ -209,6 +233,8 @@ class OnlineConnectionManager(
             is PendingAction.Create ->
                 send(OnlineCodec.encodeCreateRoom(deviceID, action.timeControl))
             is PendingAction.Join -> send(OnlineCodec.encodeJoinRoom(deviceID, action.code))
+            is PendingAction.JoinTournament ->
+                send(OnlineCodec.encodeJoinTournament(deviceID, action.tournamentId))
             is PendingAction.None -> Unit
         }
     }
@@ -281,9 +307,36 @@ class OnlineConnectionManager(
                         activeGame = true
                         setPhase(OnlinePhase.InGame)
                     }
-                    is PendingAction.None -> Unit
+                    // Unreachable: a tournament join is answered with
+                    // `tournament_pairing`, never `room_ready`. Required for
+                    // exhaustiveness only.
+                    is PendingAction.JoinTournament, is PendingAction.None -> Unit
                 }
                 onSnapshot?.invoke(message.state)
+            }
+            is ServerMessage.TournamentJoined -> {
+                // Already in `WaitingForTournament` since `startJoiningTournament`
+                // set it; nothing else to do until pairing arrives.
+            }
+            is ServerMessage.TournamentPairing -> {
+                // Handled exactly like `RoomReady` (add-tournaments phase 1):
+                // a tournament game is a casual game from this point on, so it
+                // reuses the same snapshot/in-game machinery with zero new code.
+                roomCode = message.roomCode
+                yourColor = message.yourColor
+                reconnecting = false
+                failureReason = null
+                retryJob?.cancel()
+                retryJob = null
+                retryDeadlineMs = null
+                activeGame = true
+                setPhase(OnlinePhase.InGame)
+                onSnapshot?.invoke(message.state)
+            }
+            is ServerMessage.TournamentStandings, is ServerMessage.TournamentEnded -> {
+                // No UI consumes these yet (add-tournaments phase 1: only
+                // join/pairing are wired client-side) — decoded so the frame
+                // doesn't drop the connection, nothing else to do.
             }
             is ServerMessage.State -> {
                 reconnecting = false

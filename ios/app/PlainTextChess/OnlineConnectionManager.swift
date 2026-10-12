@@ -9,6 +9,9 @@ enum OnlinePhase: Equatable {
     case connecting
     /// We hold a seat in a room that is waiting for the opponent.
     case waiting(code: String)
+    /// We are in a tournament's waiting pool, not yet paired into a room
+    /// (add-tournaments phase 1).
+    case waitingForTournament(tournamentID: String)
     case inGame
     /// The socket dropped mid-game; re-attaching to the same seat.
     case reconnecting
@@ -75,6 +78,7 @@ final class OnlineConnectionManager: ObservableObject {
         case none
         case create(String?)
         case join(String)
+        case joinTournament(String)
     }
 
     init(url: URL, deviceID: String) {
@@ -101,6 +105,22 @@ final class OnlineConnectionManager: ObservableObject {
     /// Connect and join an existing room by code.
     func startJoining(code: String) {
         beginAttempt(phase: .connecting, action: .join(code), reconnect: false, code: code)
+    }
+
+    /// Connect and join an Arena tournament's waiting pool (add-tournaments
+    /// phase 1). No room exists yet: the server pairs us when another
+    /// waiting player is available and delivers `tournament_pairing`.
+    func startJoiningTournament(tournamentID: String) {
+        beginAttempt(phase: .waitingForTournament(tournamentID: tournamentID),
+                     action: .joinTournament(tournamentID),
+                     reconnect: false)
+    }
+
+    /// Leave the tournament's waiting pool and close the connection. Does
+    /// not affect a game already in progress (that uses `leave()`).
+    func leaveTournament(tournamentID: String) {
+        send(.leaveTournament(tournamentID: tournamentID))
+        teardown()
     }
 
     /// Re-attach to an in-progress room after a drop or an app relaunch:
@@ -227,6 +247,8 @@ final class OnlineConnectionManager: ObservableObject {
             send(.createRoom(playerID: deviceID, timeControl: timeControl))
         case .join(let code):
             send(.joinRoom(playerID: deviceID, roomCode: code))
+        case .joinTournament(let tournamentID):
+            send(.joinTournament(playerID: deviceID, tournamentID: tournamentID))
         case .none:
             break
         }
@@ -305,7 +327,10 @@ final class OnlineConnectionManager: ObservableObject {
             case .join:
                 activeGame = true
                 setPhase(.inGame)
-            case .none:
+            case .joinTournament, .none:
+                // `room_ready` never arrives for a tournament join (that
+                // gets `tournament_pairing` instead) — unreachable, kept
+                // only for switch exhaustiveness.
                 break
             }
             onSnapshot?(state)
@@ -361,6 +386,33 @@ final class OnlineConnectionManager: ObservableObject {
                 awaitingAuthResult = false
                 onAuthResult?(true, nil)
             }
+
+        case .tournamentJoined:
+            // The phase already reflects this (`.waitingForTournament`, set
+            // by `startJoiningTournament` before the server could reply);
+            // nothing else to update.
+            break
+
+        case .tournamentPairing(_, let roomCode, let color, let state):
+            // Treated exactly like `roomReady` for a joiner: a real room now
+            // exists, so from here on this connection behaves identically to
+            // a casual online game (the view model's existing snapshot/update
+            // handling needs no tournament-specific code).
+            self.roomCode = roomCode
+            yourColor = color
+            reconnecting = false
+            failureReason = nil
+            retryWorkItem?.cancel()
+            retryWorkItem = nil
+            retryDeadline = nil
+            activeGame = true
+            setPhase(.inGame)
+            onSnapshot?(state)
+
+        case .tournamentStandings, .tournamentEnded:
+            // Decode-only for now: no server code path sends either yet, and
+            // there is no leaderboard UI to feed (add-tournaments phase 1).
+            break
         }
     }
 

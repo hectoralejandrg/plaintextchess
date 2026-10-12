@@ -726,6 +726,32 @@ class GameViewModel(private val context: Context) {
         return true
     }
 
+    /** Connect and register in a tournament's waiting pool
+     * (add-tournaments phase 1): once the server pairs this connection, the
+     * resulting game is a normal online game — `applyOnlineSnapshot` /
+     * `applyOnlineUpdate` need no changes, since `TournamentPairing` is
+     * handled by [OnlineConnectionManager] exactly like `RoomReady`. */
+    fun startOnlineTournament(tournamentId: String): Boolean {
+        if (!canStartNewGame) return false
+        viewPly = null
+        val url = resolvedServerURL() ?: run {
+            onlineJoinError = "No online server configured."
+            return false
+        }
+        teardownOnlineSession()
+        resetForOnlineGame()
+        makeOnlineConnection(url)
+        online?.startJoiningTournament(tournamentId)
+        return true
+    }
+
+    /** Leave the tournament's waiting pool (the tournament-join flow was
+     * cancelled before pairing). */
+    fun cancelTournamentWait(tournamentId: String) {
+        online?.leaveTournament(tournamentId)
+        teardownOnlineSession()
+    }
+
     /** The setup sheet is opening: reset the online-join handshake flags so a
      * stale "ready" from a previous attempt cannot auto-dismiss this sheet
      * (add-online-multiplayer D4). The join error is kept on purpose: it is
@@ -933,9 +959,12 @@ class GameViewModel(private val context: Context) {
             OnlineErrorCode.ROOM_NOT_FOUND,
             OnlineErrorCode.ROOM_FULL,
             OnlineErrorCode.INVALID_ROOM_CODE,
-            OnlineErrorCode.ALREADY_IN_ROOM ->
+            OnlineErrorCode.ALREADY_IN_ROOM,
+            OnlineErrorCode.TOURNAMENT_NOT_FOUND,
+            OnlineErrorCode.ALREADY_IN_TOURNAMENT,
+            OnlineErrorCode.TOURNAMENT_NOT_RUNNING ->
                 // The sheet (if open) shows this; it stays open so the player
-                // can fix the code or create a room instead.
+                // can fix the code/id or try a different mode instead.
                 onlineJoinError = message
 
             OnlineErrorCode.NOT_YOUR_TURN,

@@ -8,3 +8,4 @@ pub mod game_record;
 pub mod rating;
 pub mod room;
 pub mod time_control;
+pub mod tournament;

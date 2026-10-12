@@ -7,6 +7,7 @@
 use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 
+use chess_server::domain::time_control::TimeControl;
 use chess_server::infrastructure::config::Config;
 use chess_server::infrastructure::server::App;
 use chess_server::infrastructure::ws;
@@ -40,6 +41,25 @@ async fn main() {
         }
     };
     let app = Arc::new(app);
+
+    // Dev/manual-testing convenience (add-tournaments phase 1): there is no
+    // admin wire message to create a tournament yet (deliberately out of
+    // scope), so for trying the feature by hand, `DEV_CREATE_TOURNAMENT_SECS`
+    // creates one Arena tournament at startup and logs its id.
+    if let Ok(raw) = std::env::var("DEV_CREATE_TOURNAMENT_SECS") {
+        match raw.parse::<i64>() {
+            Ok(secs) if secs > 0 => {
+                let starts_at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_millis() as i64;
+                let tournament_id =
+                    app.create_tournament(TimeControl::DEFAULT, starts_at_ms, secs * 1000);
+                tracing::info!(tournament_id = %tournament_id, duration_secs = secs, "DEV: created a test Arena tournament");
+            }
+            _ => tracing::error!(raw = %raw, "DEV_CREATE_TOURNAMENT_SECS must be a positive integer; skipping"),
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await

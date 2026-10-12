@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
-use crate::application::ports::{GameRecorder, RecorderError};
+use crate::application::ports::{GameRecorder, RecorderError, TournamentRecorder};
 use crate::domain::game_record::FinishedGame;
 
 /// The embedded versioned migrations (design D5): compiled from
@@ -23,6 +23,45 @@ impl GameRecorder for NoopGameRecorder {
     fn record_finished_game<'a>(
         &'a self,
         _game: &'a FinishedGame,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// Records nothing and always succeeds (add-tournaments phase 1): used when
+/// persistence is disabled, same role as `NoopGameRecorder`.
+#[derive(Default)]
+pub struct NoopTournamentRecorder;
+
+impl TournamentRecorder for NoopTournamentRecorder {
+    fn record_tournament_created<'a>(
+        &'a self,
+        _tournament_id: &'a str,
+        _time_control: &'a str,
+        _starts_at_ms: i64,
+        _duration_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn record_standing_update<'a>(
+        &'a self,
+        _tournament_id: &'a str,
+        _player_id: &'a str,
+        _points: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn record_tournament_game<'a>(
+        &'a self,
+        _tournament_id: &'a str,
+        _game_id: &'a str,
+        _white_device: &'a str,
+        _black_device: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
     {
         Box::pin(async move { Ok(()) })
@@ -173,6 +212,102 @@ impl GameRecorder for SqliteGameRecorder {
                 .expect("system clock")
                 .as_millis() as i64;
             self.commit(game, ended_at_ms).await
+        })
+    }
+}
+
+/// The durable side of an Arena tournament's standings (add-tournaments
+/// phase 1): one idempotent upsert per finished tournament game, mirroring
+/// `SqliteGameRecorder`'s shape and pool.
+pub struct SqliteTournamentRecorder {
+    pool: SqlitePool,
+}
+
+impl SqliteTournamentRecorder {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+impl TournamentRecorder for SqliteTournamentRecorder {
+    fn record_tournament_created<'a>(
+        &'a self,
+        tournament_id: &'a str,
+        time_control: &'a str,
+        starts_at_ms: i64,
+        duration_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            sqlx::query(
+                r#"INSERT INTO tournaments (tournament_id, time_control, starts_at_ms, duration_ms, status)
+                   VALUES (?, ?, ?, ?, 'scheduled')
+                   ON CONFLICT (tournament_id) DO NOTHING"#,
+            )
+            .bind(tournament_id)
+            .bind(time_control)
+            .bind(starts_at_ms)
+            .bind(duration_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_standing_update<'a>(
+        &'a self,
+        tournament_id: &'a str,
+        player_id: &'a str,
+        points: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            sqlx::query(
+                r#"INSERT INTO tournament_standings (tournament_id, device_id, points, games_played)
+                   VALUES (?, ?, ?, 1)
+                   ON CONFLICT (tournament_id, device_id) DO UPDATE SET
+                       points = tournament_standings.points + excluded.points,
+                       games_played = tournament_standings.games_played + 1"#,
+            )
+            .bind(tournament_id)
+            .bind(player_id)
+            .bind(i64::from(points))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_tournament_game<'a>(
+        &'a self,
+        tournament_id: &'a str,
+        game_id: &'a str,
+        white_device: &'a str,
+        black_device: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // `tournament_games.game_id` has no matching row in `games`
+            // (tournament games are never committed to `GameRecorder`, by
+            // design: points replace rating, not alongside it), so the
+            // foreign key is informational only here, same as elsewhere in
+            // this schema (SQLite does not enforce it unless
+            // `PRAGMA foreign_keys` is on, which this pool does not set).
+            sqlx::query(
+                r#"INSERT OR IGNORE INTO tournament_games
+                       (game_id, tournament_id, white_device, black_device)
+                   VALUES (?, ?, ?, ?)"#,
+            )
+            .bind(game_id)
+            .bind(tournament_id)
+            .bind(white_device)
+            .bind(black_device)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
         })
     }
 }

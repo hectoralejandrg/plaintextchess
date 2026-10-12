@@ -185,6 +185,71 @@ final class OnlineProtocolTests: XCTestCase {
         XCTAssertEqual(state.blackTimeMs, 900_000)
     }
 
+    // MARK: - Tournaments (add-tournaments phase 1)
+
+    func testJoinTournamentEncoding() throws {
+        let json = try OnlineCodec.encodeClient(.joinTournament(playerID: "device-a", tournamentID: "t1"))
+        let object = try jsonObject(json)
+        XCTAssertEqual(object["type"] as? String, "join_tournament")
+        XCTAssertEqual(object["v"] as? Int, 1)
+        XCTAssertEqual(object["player_id"] as? String, "device-a")
+        XCTAssertEqual(object["tournament_id"] as? String, "t1")
+    }
+
+    func testLeaveTournamentEncoding() throws {
+        let json = try OnlineCodec.encodeClient(.leaveTournament(tournamentID: "t1"))
+        let object = try jsonObject(json)
+        XCTAssertEqual(object["type"] as? String, "leave_tournament")
+        XCTAssertEqual(object["tournament_id"] as? String, "t1")
+    }
+
+    func testTournamentJoinedDecoding() throws {
+        let json = """
+        {"v":1,"type":"tournament_joined","tournament_id":"t1"}
+        """
+        guard case .tournamentJoined(let tournamentID) = try OnlineCodec.decodeServer(json) else {
+            return XCTFail("expected tournamentJoined")
+        }
+        XCTAssertEqual(tournamentID, "t1")
+    }
+
+    func testTournamentPairingDecoding() throws {
+        let json = """
+        {"v":1,"type":"tournament_pairing","tournament_id":"t1","room_code":"AB23CD","your_color":"white","state":\(startingState)}
+        """
+        guard case .tournamentPairing(let tournamentID, let roomCode, let color, let state) =
+            try OnlineCodec.decodeServer(json)
+        else {
+            return XCTFail("expected tournamentPairing")
+        }
+        XCTAssertEqual(tournamentID, "t1")
+        XCTAssertEqual(roomCode, "AB23CD")
+        XCTAssertEqual(color, .white)
+        XCTAssertEqual(state.boardFen, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR")
+    }
+
+    func testTournamentStandingsDecoding() throws {
+        let json = """
+        {"v":1,"type":"tournament_standings","tournament_id":"t1","entries":[{"player_id":"device-a","points":4,"games_played":2}]}
+        """
+        guard case .tournamentStandings(let tournamentID, let entries) = try OnlineCodec.decodeServer(json) else {
+            return XCTFail("expected tournamentStandings")
+        }
+        XCTAssertEqual(tournamentID, "t1")
+        XCTAssertEqual(entries, [OnlineStandingEntry(playerID: "device-a", points: 4, gamesPlayed: 2)])
+    }
+
+    func testTournamentEndedDecoding() throws {
+        let json = """
+        {"v":1,"type":"tournament_ended","tournament_id":"t1","final_standings":[{"player_id":"device-a","points":6,"games_played":3}]}
+        """
+        guard case .tournamentEnded(let tournamentID, let finalStandings) = try OnlineCodec.decodeServer(json) else {
+            return XCTFail("expected tournamentEnded")
+        }
+        XCTAssertEqual(tournamentID, "t1")
+        XCTAssertEqual(finalStandings, [OnlineStandingEntry(playerID: "device-a", points: 6, gamesPlayed: 3)])
+    }
+
     func testStateDecoding() throws {
         let json = """
         {"v":1,"type":"state","state":\(startingState)}

@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::application::tournament_actor::TournamentHooks;
 use crate::domain::account::{Account, Identity, Profile, Session};
 use crate::domain::game_record::FinishedGame;
 
@@ -72,6 +73,39 @@ pub trait GameRecorder: Send + Sync {
     fn record_finished_game<'a>(
         &'a self,
         game: &'a FinishedGame,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+}
+
+/// Durable recording of tournament standings (add-tournaments phase 1): one
+/// idempotent upsert per finished tournament game, mirroring `GameRecorder`'s
+/// shape. The `NoopTournamentRecorder` keeps in-memory runs and tests
+/// behavior-identical.
+pub trait TournamentRecorder: Send + Sync {
+    /// Record a newly created tournament's row, so the standings/game rows
+    /// that reference it by id satisfy the schema's foreign keys.
+    fn record_tournament_created<'a>(
+        &'a self,
+        tournament_id: &'a str,
+        time_control: &'a str,
+        starts_at_ms: i64,
+        duration_ms: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Add `points`/1 game to `player_id`'s standing in `tournament_id`.
+    fn record_standing_update<'a>(
+        &'a self,
+        tournament_id: &'a str,
+        player_id: &'a str,
+        points: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Attribute a finished game to its tournament.
+    fn record_tournament_game<'a>(
+        &'a self,
+        tournament_id: &'a str,
+        game_id: &'a str,
+        white_device: &'a str,
+        black_device: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
 }
 
@@ -252,4 +286,10 @@ pub struct RoomServices {
     /// "Server Game Authority"); `false` sends full `state` snapshots
     /// (deterministic socket tests).
     pub incremental_updates: bool,
+    /// `None` for an ordinary casual room (the only case before
+    /// add-tournaments). `Some` marks this room as one Arena pairing: its
+    /// terminal result updates the tournament's standings instead of the
+    /// Glicko-2 rating (add-tournaments phase 1, decision: tournament points
+    /// are kept separate from the regular rating).
+    pub tournament: Option<TournamentHooks>,
 }

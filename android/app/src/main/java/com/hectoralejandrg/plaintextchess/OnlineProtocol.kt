@@ -218,13 +218,20 @@ enum class OnlineErrorCode(val code: String, val displayMessage: String) {
     INVALID_DISPLAY_NAME(
         "invalid_display_name",
         "A display name must be 1 to 32 characters with no control characters",
-    );
+    ),
+    /** Tournament errors (add-tournaments phase 1): join-time only, same
+     * "definitive" treatment as a bad room code. */
+    TOURNAMENT_NOT_FOUND("tournament_not_found", "No tournament has that id"),
+    ALREADY_IN_TOURNAMENT("already_in_tournament", "This player is already in a tournament"),
+    TOURNAMENT_NOT_RUNNING("tournament_not_running", "This tournament is not currently running");
 
     companion object {
         /** Codes that end the join attempt instead of surfacing in-game:
          * the room is gone or unavailable, so retrying cannot help. */
-        val DEFINITIVE_JOIN: Set<OnlineErrorCode> =
-            setOf(ROOM_NOT_FOUND, ROOM_FULL, INVALID_ROOM_CODE, ALREADY_IN_ROOM)
+        val DEFINITIVE_JOIN: Set<OnlineErrorCode> = setOf(
+            ROOM_NOT_FOUND, ROOM_FULL, INVALID_ROOM_CODE, ALREADY_IN_ROOM,
+            TOURNAMENT_NOT_FOUND, ALREADY_IN_TOURNAMENT, TOURNAMENT_NOT_RUNNING,
+        )
 
         fun fromCode(code: String): OnlineErrorCode? =
             entries.firstOrNull { it.code == code }
@@ -242,6 +249,25 @@ sealed class OnlineProtocolError(override val message: String) : Exception(messa
     data class InvalidColor(val raw: String) : OnlineProtocolError("Invalid color: $raw")
 }
 
+/** One player's row in a tournament leaderboard (add-tournaments phase 1).
+ * `points` is doubled (win=2, draw=1, loss=0) on the wire, same as the
+ * server's domain model — nothing client-side sums or displays these yet
+ * (no leaderboard UI this phase), decoded only so the frame doesn't crash
+ * the connection if the server ever sends one. */
+data class OnlineStandingEntry(
+    val playerId: String,
+    val points: Int,
+    val gamesPlayed: Int,
+) {
+    companion object {
+        fun decode(json: JSONObject): OnlineStandingEntry = OnlineStandingEntry(
+            playerId = json.getString("player_id"),
+            points = json.getInt("points"),
+            gamesPlayed = json.getInt("games_played"),
+        )
+    }
+}
+
 /** Server messages: versioned JSON with a `type` tag. */
 sealed class ServerMessage {
     /** The seat is ready: room code, our color, and the initial snapshot. */
@@ -249,6 +275,35 @@ sealed class ServerMessage {
         val roomCode: String,
         val yourColor: OnlineColor,
         val state: OnlineState,
+    ) : ServerMessage()
+
+    /** Registered in a tournament's waiting pool (add-tournaments phase 1). */
+    data class TournamentJoined(val tournamentId: String) : ServerMessage()
+
+    /** Paired into a new tournament game: a room was created and this seat
+     * installed, same payload shape as [RoomReady] but arriving without a
+     * client-sent create/join (add-tournaments phase 1). Handled identically
+     * to [RoomReady] by the connection manager — a tournament game is a
+     * casual game from this point on. */
+    data class TournamentPairing(
+        val tournamentId: String,
+        val roomCode: String,
+        val yourColor: OnlineColor,
+        val state: OnlineState,
+    ) : ServerMessage()
+
+    /** A tournament's current leaderboard. Decoded only — no UI consumes it
+     * yet (add-tournaments phase 1: only join/pairing are wired client-side). */
+    data class TournamentStandings(
+        val tournamentId: String,
+        val entries: List<OnlineStandingEntry>,
+    ) : ServerMessage()
+
+    /** The tournament's window closed. Decoded only, same reason as
+     * [TournamentStandings]. */
+    data class TournamentEnded(
+        val tournamentId: String,
+        val finalStandings: List<OnlineStandingEntry>,
     ) : ServerMessage()
 
     /** Full state snapshot after any accepted action and on re-attach. */
@@ -290,6 +345,25 @@ sealed class ServerMessage {
                         yourColor = OnlineColor.fromWire(root.getString("your_color")),
                         state = OnlineState.decode(root.getJSONObject("state")),
                     )
+                    "tournament_joined" -> TournamentJoined(root.getString("tournament_id"))
+                    "tournament_pairing" -> TournamentPairing(
+                        tournamentId = root.getString("tournament_id"),
+                        roomCode = root.getString("room_code"),
+                        yourColor = OnlineColor.fromWire(root.getString("your_color")),
+                        state = OnlineState.decode(root.getJSONObject("state")),
+                    )
+                    "tournament_standings" -> TournamentStandings(
+                        tournamentId = root.getString("tournament_id"),
+                        entries = root.getJSONArray("entries").let { array ->
+                            (0 until array.length()).map { OnlineStandingEntry.decode(array.getJSONObject(it)) }
+                        },
+                    )
+                    "tournament_ended" -> TournamentEnded(
+                        tournamentId = root.getString("tournament_id"),
+                        finalStandings = root.getJSONArray("final_standings").let { array ->
+                            (0 until array.length()).map { OnlineStandingEntry.decode(array.getJSONObject(it)) }
+                        },
+                    )
                     "state" -> State(OnlineState.decode(root.getJSONObject("state")))
                     "update" -> Update(OnlineUpdate.decode(root))
                     "error" -> Error(root.getString("code"), root.getString("message"))
@@ -323,6 +397,20 @@ object OnlineCodec {
         base("join_room")
             .put("player_id", playerId)
             .put("room_code", roomCode)
+            .toString()
+
+    /** `{"v":1,"type":"join_tournament","player_id":...,"tournament_id":...}`
+     * (add-tournaments phase 1). */
+    fun encodeJoinTournament(playerId: String, tournamentId: String): String =
+        base("join_tournament")
+            .put("player_id", playerId)
+            .put("tournament_id", tournamentId)
+            .toString()
+
+    /** `{"v":1,"type":"leave_tournament","tournament_id":...}`. */
+    fun encodeLeaveTournament(tournamentId: String): String =
+        base("leave_tournament")
+            .put("tournament_id", tournamentId)
             .toString()
 
     /** `{"v":1,"type":"move","uci":...}` */

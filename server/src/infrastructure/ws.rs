@@ -20,7 +20,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
 use futures_util::StreamExt;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 
 use crate::application::ports::{
     Accounts, AuthRecorder, RecorderError, SessionLookup, Sessions,
@@ -79,6 +79,12 @@ async fn handle_socket(socket: WebSocket, app: Arc<App>) {
     // Set once the room has seated this connection, which is the only thing
     // that can produce a `room_ready` or a state snapshot on the way out.
     let mut seated = false;
+    // Set while this connection is waiting in a tournament's pool
+    // (add-tournaments phase 1): `(tournament_id, player_id)`, so `Leave` and
+    // the pairing arm below know which tournament without the client having
+    // to resend its own identity.
+    let mut tournament_wait: Option<mpsc::UnboundedReceiver<Conn>> = None;
+    let mut pending_tournament: Option<(String, String)> = None;
 
     loop {
         tokio::select! {
@@ -102,10 +108,46 @@ async fn handle_socket(socket: WebSocket, app: Arc<App>) {
                 // room: the room is gone, so end this session too.
                 None => break,
             },
+            // A tournament actor paired this (idle, waiting) connection into
+            // a new room (add-tournaments phase 1): no client frame triggers
+            // this arm, the server initiated the room itself. Restate the
+            // room's own `Connect` reply as `tournament_pairing` so the
+            // client doesn't have to infer a bare `room_ready` came from a
+            // pairing, then install the `Conn` exactly as `CreateRoom`/
+            // `JoinRoom` do.
+            paired = next_paired(&mut tournament_wait) => match paired {
+                Some(mut new_conn) => {
+                    let tournament_id = pending_tournament.take().map(|(id, _)| id).unwrap_or_default();
+                    if let Some(ServerMessage::RoomReady { room_code, your_color, state, .. }) =
+                        new_conn.out_rx.recv().await
+                    {
+                        seated = true;
+                        outbox.push(Outbound::Text(ServerMessage::TournamentPairing {
+                            v: VERSION,
+                            tournament_id,
+                            room_code,
+                            your_color,
+                            state,
+                        }));
+                    }
+                    conn = Some(new_conn);
+                }
+                // The tournament actor dropped the sender without ever
+                // pairing us (e.g. the tournament ended while we waited):
+                // stop polling this channel instead of spinning on `None`.
+                None => tournament_wait = None,
+            },
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => {
                     alive.store(true, Ordering::SeqCst);
-                    if !handle_text(&outbox, text.as_str(), &mut conn, &app).await {
+                    if !handle_text(
+                        &outbox,
+                        text.as_str(),
+                        &mut conn,
+                        &mut tournament_wait,
+                        &mut pending_tournament,
+                        &app,
+                    ).await {
                         break;
                     }
                 }
@@ -149,12 +191,24 @@ async fn next_outbound(conn: &mut Option<Conn>) -> Option<ServerMessage> {
     }
 }
 
+/// Add-tournaments phase 1: waits for the tournament actor to pair this
+/// connection into a room, or never resolves while not waiting on any
+/// tournament (mirrors `next_outbound`'s "no channel yet" shape).
+async fn next_paired(rx: &mut Option<mpsc::UnboundedReceiver<Conn>>) -> Option<Conn> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Handle one client text frame. Returns `false` when the connection must
 /// end (protocol failure).
 async fn handle_text(
     outbox: &Outbox,
     text: &str,
     conn: &mut Option<Conn>,
+    tournament_wait: &mut Option<mpsc::UnboundedReceiver<Conn>>,
+    pending_tournament: &mut Option<(String, String)>,
     app: &Arc<App>,
 ) -> bool {
     let message = match decode_incoming(text) {
@@ -313,6 +367,43 @@ async fn handle_text(
         | ClientMessage::Logout { .. }
         | ClientMessage::SetProfile { .. } => {
             // Already answered above; unreachable.
+        }
+        ClientMessage::JoinTournament {
+            player_id,
+            tournament_id,
+            token,
+            ..
+        } => {
+            if conn.is_some() || tournament_wait.is_some() {
+                outbox.push(Outbound::Text(ServerMessage::error(ErrorCode::AlreadyInTournament)));
+            } else {
+                let identity = app.resolve_identity(&player_id, token.as_deref());
+                app.link_identity(&identity);
+                let (paired_tx, paired_rx) = mpsc::unbounded_channel();
+                match app.join_tournament(identity, &tournament_id, paired_tx) {
+                    Ok(()) => {
+                        *tournament_wait = Some(paired_rx);
+                        *pending_tournament = Some((tournament_id.clone(), player_id));
+                        outbox.push(Outbound::Text(ServerMessage::TournamentJoined {
+                            v: VERSION,
+                            tournament_id,
+                        }));
+                    }
+                    Err(err) => outbox.push(Outbound::Text(err)),
+                }
+            }
+        }
+        ClientMessage::LeaveTournament { tournament_id, .. } => {
+            *tournament_wait = None;
+            if let Some((_, player_id)) = pending_tournament.take() {
+                app.leave_tournament(&player_id, &tournament_id);
+            }
+        }
+        ClientMessage::ListTournaments { .. } => {
+            outbox.push(Outbound::Text(ServerMessage::TournamentList {
+                v: VERSION,
+                tournaments: app.list_tournaments(),
+            }));
         }
     }
     true

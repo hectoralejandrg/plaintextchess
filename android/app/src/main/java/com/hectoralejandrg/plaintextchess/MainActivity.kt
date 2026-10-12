@@ -191,6 +191,9 @@ fun GameScreen(vm: GameViewModel = GameViewModel(LocalContext.current)) {
                 onCopy = { copyToClipboard(context, waiting.code) },
             )
         }
+        (vm.onlinePhase as? OnlinePhase.WaitingForTournament)?.let { waiting ->
+            TournamentWaitingBanner(onCancel = { vm.cancelTournamentWait(waiting.tournamentId) })
+        }
         if (showNewGameSheet) {
             NewGameSetupSheet(
                 vm = vm,
@@ -207,6 +210,12 @@ fun GameScreen(vm: GameViewModel = GameViewModel(LocalContext.current)) {
                         // above) or shows the join error inside the sheet.
                         showNewGameSheet = false
                     }
+                },
+                onJoinTournament = { tournamentId ->
+                    // Stays open until paired (the waiting banner above takes
+                    // over) or a join error shows inside the sheet, same
+                    // pattern as joining a room by code.
+                    vm.startOnlineTournament(tournamentId)
                 },
             )
         }
@@ -252,11 +261,13 @@ private fun NewGameSetupSheet(
     onDismiss: () -> Unit,
     onConfirm: (GameMode) -> Unit,
     onOnline: (create: Boolean, code: String?, timeControl: String?) -> Unit,
+    onJoinTournament: (tournamentId: String) -> Unit,
 ) {
     var isCpu by remember { mutableStateOf(false) }
     var isOnline by remember { mutableStateOf(false) }
     var difficulty by remember { mutableStateOf(CpuDifficulty.MEDIUM) }
     var roomCode by remember { mutableStateOf("") }
+    var tournamentId by remember { mutableStateOf("") }
     var timeControl by remember { mutableStateOf(OnlineTimeControl.default) }
     var isAuth by remember { mutableStateOf(false) }
     var authChoice by remember { mutableStateOf<AuthChoice?>(null) }
@@ -356,13 +367,6 @@ private fun NewGameSetupSheet(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                vm.onlineJoinError?.let { error ->
-                    Text(
-                        text = error,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = { onOnline(true, null, timeControl.label) },
@@ -373,6 +377,34 @@ private fun NewGameSetupSheet(
                         enabled = roomCode.isNotEmpty(),
                         modifier = Modifier.weight(1f),
                     ) { Text("Join room") }
+                }
+                // Arena tournament (add-tournaments phase 1): no lobby yet, so
+                // the tournament id is pasted in the same way a room code is.
+                Text(
+                    "Tournament",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = tournamentId,
+                    onValueChange = { tournamentId = it },
+                    label = { Text("Tournament ID") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(
+                    onClick = { onJoinTournament(tournamentId) },
+                    enabled = tournamentId.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Join tournament") }
+                // Shared by room-join and tournament-join: both report
+                // failures through the same `onlineJoinError` field.
+                vm.onlineJoinError?.let { error ->
+                    Text(
+                        text = error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
             }
             if (!isOnline && !isAuth) {
@@ -498,6 +530,32 @@ private fun WaitingBanner(code: String, onCopy: () -> Unit) {
             )
         }
         TextButton(onClick = onCopy) { Text("Copy") }
+    }
+}
+
+/** Waiting-for-pairing banner for an Arena tournament (add-tournaments
+ * phase 1): mirrors [WaitingBanner]'s style, but there is no code to share —
+ * only a cancel action, since the server pairs this seat on its own. */
+@Composable
+private fun TournamentWaitingBanner(onCancel: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .padding(vertical = 10.dp)
+            .background(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(10.dp),
+            )
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            "Waiting for a tournament opponent…",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        TextButton(onClick = onCancel) { Text("Cancel") }
     }
 }
 
@@ -915,6 +973,7 @@ fun HomeScreen(
     var isOnline by remember { mutableStateOf(false) }
     var difficulty by remember { mutableStateOf(CpuDifficulty.MEDIUM) }
     var roomCode by remember { mutableStateOf("") }
+    var tournamentId by remember { mutableStateOf("") }
     var timeControl by remember { mutableStateOf(OnlineTimeControl.default) }
     var authDisplayName by remember { mutableStateOf("") }
     val context = LocalContext.current
@@ -1037,6 +1096,30 @@ fun HomeScreen(
                     }
                     Text("Waiting for the opponent to join…", style = MaterialTheme.typography.bodySmall)
                     TextButton(onClick = { vm.cancelOnlineWaiting() }) { Text("Cancel") }
+                }
+            }
+            // Arena tournament (add-tournaments phase 1): no lobby yet, so the
+            // tournament id is pasted in the same way a room code is above.
+            Text("Tournament", style = MaterialTheme.typography.labelMedium)
+            OutlinedTextField(
+                value = tournamentId,
+                onValueChange = { tournamentId = it },
+                label = { Text("Tournament ID") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Button(
+                onClick = { vm.startOnlineTournament(tournamentId) },
+                enabled = tournamentId.isNotEmpty(),
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Join tournament") }
+            (vm.onlinePhase as? OnlinePhase.WaitingForTournament)?.let { waiting ->
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text("Waiting for an opponent in the tournament…", style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = { vm.cancelTournamentWait(waiting.tournamentId) }) { Text("Cancel") }
                 }
             }
             vm.onlineJoinError?.let { error ->

@@ -12,22 +12,29 @@ use tokio::sync::mpsc;
 
 use crate::application::ports::{
     Accounts, AuthRecorder, ChessEngine, GameRecorder, PlayerAuth, ProfileStore, Ratings,
-    RoomRegistry, RoomServices, SessionLookup, Sessions, TimeSource,
+    RoomRegistry, RoomServices, SessionLookup, Sessions, TimeSource, TournamentRecorder,
 };
 use crate::infrastructure::broker::Broker;
 use crate::application::room_actor::{run_room, RoomMsg};
+use crate::application::tournament_actor::{
+    run_tournament, TournamentHandle, TournamentHooks, TournamentMsg,
+};
 use crate::domain::account::Identity;
 use crate::domain::rating::RatingState;
 use crate::domain::room::{CODE_ALPHABET, CODE_LEN, is_valid_code};
 use crate::domain::time_control::TimeControl;
+use crate::domain::tournament::{Tournament, TournamentStatus};
 use crate::infrastructure::auth::{NoopAuthRecorder, PlayerAuthStore};
 use crate::infrastructure::auth_recorder::SqliteAuthRecorder;
 use crate::infrastructure::config::Config;
 use crate::infrastructure::engine::CoreEngine;
 use crate::infrastructure::password::{hash_token, now_ms, PasswordHasher};
 use crate::infrastructure::ratings::RatingStore;
-use crate::infrastructure::recorder::{MIGRATIONS, NoopGameRecorder, SqliteGameRecorder};
-use crate::interface::protocol::{ErrorCode, ServerMessage, VERSION};
+use crate::infrastructure::recorder::{
+    MIGRATIONS, NoopGameRecorder, NoopTournamentRecorder, SqliteGameRecorder,
+    SqliteTournamentRecorder,
+};
+use crate::interface::protocol::{ErrorCode, ServerMessage, TournamentSummary, VERSION};
 use crate::domain::account::UsernameError;
 
 /// The credential primitives the WebSocket auth handlers need, derived from
@@ -110,6 +117,11 @@ pub struct App {
     /// Optional broker for split-mode room ownership (Phase 3).
     /// Present when running as TIER=logic; None for TIER=all.
     broker: Option<Arc<Broker>>,
+    /// Active Arena tournaments, by id (add-tournaments phase 1). A
+    /// tournament's own task owns its live state; this map only routes
+    /// `JoinTournament`/`ListTournaments` to the right mailbox.
+    tournaments: Mutex<HashMap<String, TournamentHandle>>,
+    tournament_recorder: Arc<dyn TournamentRecorder>,
 }
 
 impl RoomRegistry for App {
@@ -172,6 +184,8 @@ impl App {
             auth: Arc::new(PlayerAuthStore::new()),
             auth_recorder: Arc::new(NoopAuthRecorder),
             broker: None,
+            tournaments: Mutex::new(HashMap::new()),
+            tournament_recorder: Arc::new(NoopTournamentRecorder),
         }
     }
 
@@ -232,6 +246,8 @@ impl App {
 
         let time: Arc<dyn TimeSource> = Arc::new(SystemTimeSource::new());
         let recorder: Arc<dyn GameRecorder> = Arc::new(SqliteGameRecorder::new(pool.clone()));
+        let tournament_recorder: Arc<dyn TournamentRecorder> =
+            Arc::new(SqliteTournamentRecorder::new(pool.clone()));
 
         // Authentication loads after the ratings and before anything can
         // accept a connection (task 9.1). The order matters in one place only:
@@ -288,6 +304,8 @@ impl App {
             auth,
             auth_recorder: Arc::new(SqliteAuthRecorder::new(pool)),
             broker: None,
+            tournaments: Mutex::new(HashMap::new()),
+            tournament_recorder,
         })
     }
 
@@ -440,7 +458,7 @@ impl App {
     /// The ports the room actor needs (design D1): this app owns the
     /// registry, and it shares the ratings, the engine, and the time source
     /// with the room it spawns.
-    fn services(&self, this: &Arc<Self>) -> RoomServices {
+    fn services(&self, this: &Arc<Self>, tournament: Option<TournamentHooks>) -> RoomServices {
         RoomServices {
             registry: Arc::clone(this) as Arc<dyn RoomRegistry>,
             ratings: Arc::clone(&self.ratings) as Arc<dyn Ratings>,
@@ -451,6 +469,7 @@ impl App {
             auth: Arc::clone(&self.auth) as Arc<dyn PlayerAuth>,
             random_colors: self.config.random_colors,
             incremental_updates: self.config.incremental_updates,
+            tournament,
         }
     }
 
@@ -473,6 +492,29 @@ impl App {
         player: impl Into<Identity>,
         time_control: TimeControl,
     ) -> Result<Conn, ServerMessage> {
+        self.create_room_internal(player, time_control, None)
+    }
+
+    /// Create a room for an Arena pairing (add-tournaments phase 1): same
+    /// path as `create_room_with_time_control`, except the spawned room's
+    /// `RoomServices.tournament` is `Some`, so its terminal result updates
+    /// the tournament's standings instead of the Glicko-2 rating. Called by
+    /// the tournament actor, never by a client message directly.
+    pub fn create_tournament_room(
+        self: &Arc<Self>,
+        player: impl Into<Identity>,
+        time_control: TimeControl,
+        hooks: TournamentHooks,
+    ) -> Result<Conn, ServerMessage> {
+        self.create_room_internal(player, time_control, Some(hooks))
+    }
+
+    fn create_room_internal(
+        self: &Arc<Self>,
+        player: impl Into<Identity>,
+        time_control: TimeControl,
+        tournament: Option<TournamentHooks>,
+    ) -> Result<Conn, ServerMessage> {
         let identity = player.into();
         self.check_room_limit(&identity, None)?;
         let code = self.unique_code();
@@ -481,7 +523,7 @@ impl App {
 
         let app = Arc::clone(self);
         let actor_code = code.clone();
-        let services = self.services(&app);
+        let services = self.services(&app, tournament);
         tokio::spawn(async move {
             run_room(mailbox_rx, services, actor_code, time_control).await;
         });
@@ -547,6 +589,103 @@ impl App {
             mailbox,
             out_rx,
         })
+    }
+
+    /// Create and start a new Arena tournament (add-tournaments phase 1):
+    /// spawns its actor task and registers its handle so `JoinTournament`/
+    /// `ListTournaments` can reach it. Manually triggered — there is no
+    /// recurring scheduler yet (explicit non-goal of this phase).
+    pub fn create_tournament(
+        self: &Arc<Self>,
+        time_control: TimeControl,
+        starts_at_ms: i64,
+        duration_ms: i64,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let tournament = Tournament {
+            id: id.clone(),
+            time_control,
+            starts_at_ms,
+            duration_ms,
+            status: TournamentStatus::Scheduled,
+        };
+        let status = Arc::new(Mutex::new(TournamentStatus::Scheduled));
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.tournaments.lock().unwrap().insert(
+            id.clone(),
+            TournamentHandle {
+                mailbox: tx.clone(),
+                status: Arc::clone(&status),
+                time_control,
+                starts_at_ms,
+                duration_ms,
+            },
+        );
+        let app = Arc::clone(self);
+        let recorder = Arc::clone(&self.tournament_recorder);
+        tokio::spawn(async move {
+            run_tournament(tx, rx, app, tournament, status, recorder).await;
+        });
+        id
+    }
+
+    /// Join a tournament's waiting pool (add-tournaments phase 1): `paired_tx`
+    /// is the channel the caller (the WebSocket handler) reads a `Conn` from
+    /// once the tournament actor pairs this player into a game.
+    pub fn join_tournament(
+        &self,
+        player: impl Into<Identity>,
+        tournament_id: &str,
+        paired_tx: mpsc::UnboundedSender<Conn>,
+    ) -> Result<(), ServerMessage> {
+        let identity = player.into();
+        let mailbox = {
+            let tournaments = self.tournaments.lock().unwrap();
+            tournaments
+                .get(tournament_id)
+                .map(|handle| handle.mailbox.clone())
+                .ok_or_else(|| ServerMessage::error(ErrorCode::TournamentNotFound))?
+        };
+        mailbox
+            .send(TournamentMsg::Join { identity, paired_tx })
+            .map_err(|_| ServerMessage::error(ErrorCode::TournamentNotFound))
+    }
+
+    /// Leave a tournament's waiting pool. Does not affect a game already in
+    /// progress (leaving that uses `RoomMsg::Leave`, same as a casual room).
+    pub fn leave_tournament(&self, player_id: &str, tournament_id: &str) {
+        let mailbox = self
+            .tournaments
+            .lock()
+            .unwrap()
+            .get(tournament_id)
+            .map(|handle| handle.mailbox.clone());
+        if let Some(mailbox) = mailbox {
+            let _ = mailbox.send(TournamentMsg::Leave {
+                player_id: player_id.to_string(),
+            });
+        }
+    }
+
+    /// The tournaments the server currently knows about (no lobby UI yet;
+    /// this is the discovery API for testing, add-tournaments phase 1).
+    pub fn list_tournaments(&self) -> Vec<TournamentSummary> {
+        self.tournaments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, handle)| TournamentSummary {
+                tournament_id: id.clone(),
+                status: match *handle.status.lock().unwrap() {
+                    TournamentStatus::Scheduled => "scheduled".to_string(),
+                    TournamentStatus::Running => "running".to_string(),
+                    TournamentStatus::Finished => "finished".to_string(),
+                },
+                time_control: handle.time_control.label().to_string(),
+                starts_at_ms: handle.starts_at_ms,
+                duration_ms: handle.duration_ms,
+            })
+            .collect()
     }
 
     /// The one-room-per-player rule (spec "Server Room Management"), checked

@@ -71,6 +71,81 @@ class OnlineProtocolTest {
         }
     }
 
+    // MARK: - Tournament wire forms (add-tournaments phase 1)
+
+    @Test
+    fun clientJoinTournamentWireForm() {
+        val json = JSONObject(OnlineCodec.encodeJoinTournament("p1", "t1"))
+        assertEquals("join_tournament", json.getString("type"))
+        assertEquals(1, json.getInt("v"))
+        assertEquals("p1", json.getString("player_id"))
+        assertEquals("t1", json.getString("tournament_id"))
+    }
+
+    @Test
+    fun clientLeaveTournamentWireForm() {
+        val json = JSONObject(OnlineCodec.encodeLeaveTournament("t1"))
+        assertEquals("leave_tournament", json.getString("type"))
+        assertEquals("t1", json.getString("tournament_id"))
+    }
+
+    @Test
+    fun serverTournamentJoinedDecodes() {
+        val json = """{"v":1,"type":"tournament_joined","tournament_id":"t1"}"""
+        val message = ServerMessage.decode(json) as ServerMessage.TournamentJoined
+        assertEquals("t1", message.tournamentId)
+    }
+
+    @Test
+    fun serverTournamentPairingDecodesLikeRoomReady() {
+        val json = JSONObject(
+            """
+            {"v":1,"type":"tournament_pairing","tournament_id":"t1","room_code":"AB23CD","your_color":"white","state":${stateJson().toString()}}
+            """
+        ).toString()
+        val pairing = ServerMessage.decode(json) as ServerMessage.TournamentPairing
+        assertEquals("t1", pairing.tournamentId)
+        assertEquals("AB23CD", pairing.roomCode)
+        assertEquals(OnlineColor.White, pairing.yourColor)
+        assertStateDecoded(pairing.state)
+    }
+
+    @Test
+    fun serverTournamentStandingsDecodes() {
+        val json = """
+            {"v":1,"type":"tournament_standings","tournament_id":"t1",
+             "entries":[{"player_id":"device-a","points":4,"games_played":2}]}
+        """
+        val standings = ServerMessage.decode(json) as ServerMessage.TournamentStandings
+        assertEquals("t1", standings.tournamentId)
+        assertEquals(1, standings.entries.size)
+        assertEquals("device-a", standings.entries[0].playerId)
+        assertEquals(4, standings.entries[0].points)
+        assertEquals(2, standings.entries[0].gamesPlayed)
+    }
+
+    @Test
+    fun serverTournamentEndedDecodes() {
+        val json = """
+            {"v":1,"type":"tournament_ended","tournament_id":"t1",
+             "final_standings":[{"player_id":"device-a","points":6,"games_played":3}]}
+        """
+        val ended = ServerMessage.decode(json) as ServerMessage.TournamentEnded
+        assertEquals(6, ended.finalStandings[0].points)
+    }
+
+    @Test
+    fun tournamentErrorCodesAreStable() {
+        for (code in listOf(
+            OnlineErrorCode.TOURNAMENT_NOT_FOUND,
+            OnlineErrorCode.ALREADY_IN_TOURNAMENT,
+            OnlineErrorCode.TOURNAMENT_NOT_RUNNING,
+        )) {
+            assertEquals(code, OnlineErrorCode.fromCode(code.code))
+            assertTrue(code in OnlineErrorCode.DEFINITIVE_JOIN)
+        }
+    }
+
     @Test
     fun clientResignAndLeaveWireForms() {
         for (pair in listOf(OnlineCodec.encodeResign() to "resign", OnlineCodec.encodeLeave() to "leave")) {

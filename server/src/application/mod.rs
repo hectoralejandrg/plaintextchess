@@ -6,3 +6,4 @@
 
 pub mod ports;
 pub mod room_actor;
+pub mod tournament_actor;

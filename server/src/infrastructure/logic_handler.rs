@@ -459,7 +459,10 @@ fn route_kind(message: &ClientMessage, seated_room: Option<&str>) -> Route {
         | ClientMessage::Register { .. }
         | ClientMessage::Login { .. }
         | ClientMessage::Logout { .. }
-        | ClientMessage::SetProfile { .. } => Route::Control,
+        | ClientMessage::SetProfile { .. }
+        | ClientMessage::JoinTournament { .. }
+        | ClientMessage::LeaveTournament { .. }
+        | ClientMessage::ListTournaments { .. } => Route::Control,
         ClientMessage::JoinRoom { .. } => Route::Room,
         ClientMessage::Move { .. } | ClientMessage::Resign { .. } | ClientMessage::Leave { .. } => {
             if seated_room.is_some() {
@@ -1271,6 +1274,15 @@ impl LogicState {
             | ClientMessage::Login { .. }
             | ClientMessage::Logout { .. }
             | ClientMessage::SetProfile { .. } => self.handle_auth(logic_conn, message).await,
+            // Arena tournaments (add-tournaments phase 1) are monolith-only
+            // (`TIER=all`, see `ws.rs`): the split tier has no tournament
+            // registry to route these to. Explicit non-goal of this phase,
+            // not an oversight — reject cleanly instead of panicking.
+            ClientMessage::JoinTournament { .. }
+            | ClientMessage::LeaveTournament { .. }
+            | ClientMessage::ListTournaments { .. } => {
+                self.send_error(logic_conn, ErrorCode::TournamentNotFound).await;
+            }
         }
     }
 

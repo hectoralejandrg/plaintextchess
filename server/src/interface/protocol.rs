@@ -104,6 +104,12 @@ pub enum ErrorCode {
     /// The display name is outside 1 to 32 trimmed characters or contains a
     /// control character (spec "Profile Display Name").
     InvalidDisplayName,
+    /// No tournament is registered under that id (add-tournaments phase 1).
+    TournamentNotFound,
+    /// This player is already waiting in or playing a tournament game.
+    AlreadyInTournament,
+    /// The tournament exists but its window hasn't started or has ended.
+    TournamentNotRunning,
 }
 
 impl ErrorCode {
@@ -124,6 +130,9 @@ impl ErrorCode {
             ErrorCode::SessionExpired => "session_expired",
             ErrorCode::InvalidRequest => "invalid_request",
             ErrorCode::InvalidDisplayName => "invalid_display_name",
+            ErrorCode::TournamentNotFound => "tournament_not_found",
+            ErrorCode::AlreadyInTournament => "already_in_tournament",
+            ErrorCode::TournamentNotRunning => "tournament_not_running",
         }
     }
 
@@ -152,6 +161,9 @@ impl ErrorCode {
             ErrorCode::InvalidDisplayName => {
                 "A display name must be 1 to 32 characters with no control characters"
             }
+            ErrorCode::TournamentNotFound => "No tournament has that id",
+            ErrorCode::AlreadyInTournament => "This player is already in a tournament",
+            ErrorCode::TournamentNotRunning => "This tournament is not currently running",
         }
     }
 
@@ -242,6 +254,28 @@ pub enum ClientMessage {
         /// authenticated-only.
         token: String,
     },
+    /// Join an Arena tournament's waiting pool (add-tournaments phase 1): the
+    /// server pairs this connection with another waiting player and delivers
+    /// `tournament_pairing` when a game starts.
+    JoinTournament {
+        v: u32,
+        player_id: String,
+        tournament_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// Leave the tournament's waiting pool. Does not forfeit a game already
+    /// in progress (leaving an in-progress game uses `leave`, same as a
+    /// casual room).
+    LeaveTournament {
+        v: u32,
+        tournament_id: String,
+    },
+    /// List tournaments the server knows about (add-tournaments phase 1: no
+    /// lobby UI yet, this is the discovery API for testing).
+    ListTournaments {
+        v: u32,
+    },
 }
 
 impl ClientMessage {
@@ -255,7 +289,10 @@ impl ClientMessage {
             | ClientMessage::Register { v, .. }
             | ClientMessage::Login { v, .. }
             | ClientMessage::Logout { v, .. }
-            | ClientMessage::SetProfile { v, .. } => *v,
+            | ClientMessage::SetProfile { v, .. }
+            | ClientMessage::JoinTournament { v, .. }
+            | ClientMessage::LeaveTournament { v, .. }
+            | ClientMessage::ListTournaments { v, .. } => *v,
         }
     }
 }
@@ -325,6 +362,59 @@ pub enum ServerMessage {
         account_id: String,
         display_name: String,
     },
+    /// Registered in a tournament's waiting pool (add-tournaments phase 1).
+    TournamentJoined {
+        v: u32,
+        tournament_id: String,
+    },
+    /// This connection was paired into a new tournament game: a room was
+    /// created and this seat installed, the same as `room_ready` but without
+    /// a client-sent `create_room`/`join_room`.
+    TournamentPairing {
+        v: u32,
+        tournament_id: String,
+        room_code: String,
+        your_color: Color,
+        state: State,
+    },
+    /// A tournament's current leaderboard, in descending point order.
+    TournamentStandings {
+        v: u32,
+        tournament_id: String,
+        entries: Vec<StandingEntry>,
+    },
+    /// The tournament's window closed; `final_standings` is the last
+    /// leaderboard snapshot.
+    TournamentEnded {
+        v: u32,
+        tournament_id: String,
+        final_standings: Vec<StandingEntry>,
+    },
+    /// The tournaments the server currently knows about (no lobby UI yet;
+    /// this is the discovery API for testing, add-tournaments phase 1).
+    TournamentList {
+        v: u32,
+        tournaments: Vec<TournamentSummary>,
+    },
+}
+
+/// One player's row in a tournament leaderboard. `points` is doubled (win=2,
+/// draw=1, loss=0) to stay integer on the wire, same as the domain model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StandingEntry {
+    pub player_id: String,
+    pub points: u32,
+    pub games_played: u32,
+}
+
+/// A tournament's static info, for `tournament_list` (add-tournaments phase 1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TournamentSummary {
+    pub tournament_id: String,
+    pub status: String,
+    pub time_control: String,
+    pub starts_at_ms: i64,
+    pub duration_ms: i64,
 }
 
 impl ServerMessage {
@@ -349,6 +439,7 @@ pub enum DecodeError {
 const KNOWN_TYPES: &[&str] = &[
     "create_room", "join_room", "move", "resign", "leave",
     "register", "login", "logout", "set_profile",
+    "join_tournament", "leave_tournament", "list_tournaments",
 ];
 
 /// Decode one incoming text frame. Business rules (turn, legality, room
@@ -708,6 +799,33 @@ mod tests {
         assert_eq!(value["room_code"], "AB23CD");
         assert!(value.get("token").is_none());
 
+        // Tournament messages (add-tournaments phase 1): `type` tag + `v` +
+        // fields, inline, same rule as every other client message.
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::JoinTournament {
+                v: VERSION,
+                player_id: "p1".into(),
+                tournament_id: "t1".into(),
+                token: None,
+            })
+            .unwrap();
+        assert_eq!(value["type"], "join_tournament");
+        assert_eq!(value["tournament_id"], "t1");
+        assert!(value.get("token").is_none());
+
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::LeaveTournament {
+                v: VERSION,
+                tournament_id: "t1".into(),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "leave_tournament");
+        assert_eq!(value["tournament_id"], "t1");
+
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::ListTournaments { v: VERSION }).unwrap();
+        assert_eq!(value["type"], "list_tournaments");
+
         // Authentication messages: `type` tag + `v` + fields, inline.
         let value: serde_json::Value =
             serde_json::to_value(&ClientMessage::Register {
@@ -946,6 +1064,81 @@ mod tests {
         assert_eq!(value["type"], "profile_updated");
         assert_eq!(value["account_id"], "account-1");
         assert_eq!(value["display_name"], "Ana T.");
+
+        // Tournament messages (add-tournaments phase 1).
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::TournamentJoined {
+            v: VERSION,
+            tournament_id: "t1".into(),
+        })
+        .unwrap();
+        assert_eq!(value["type"], "tournament_joined");
+        assert_eq!(value["tournament_id"], "t1");
+
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::TournamentPairing {
+            v: VERSION,
+            tournament_id: "t1".into(),
+            room_code: "AB23CD".into(),
+            your_color: Color::White,
+            state: State {
+                board_fen: "x".into(),
+                move_list: vec![],
+                side_to_move: "w".into(),
+                status: Status::Playing,
+                your_color: Color::White,
+                white_rating: 1500.0,
+                black_rating: 1500.0,
+                opponent_online: true,
+                time_control: "5+0".into(),
+                white_time_ms: 300_000,
+                black_time_ms: 300_000,
+            },
+        })
+        .unwrap();
+        assert_eq!(value["type"], "tournament_pairing");
+        assert_eq!(value["room_code"], "AB23CD");
+        assert_eq!(value["your_color"], "white");
+        assert_eq!(value["state"]["time_control"], "5+0");
+
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::TournamentStandings {
+            v: VERSION,
+            tournament_id: "t1".into(),
+            entries: vec![StandingEntry {
+                player_id: "device-a".into(),
+                points: 4,
+                games_played: 2,
+            }],
+        })
+        .unwrap();
+        assert_eq!(value["type"], "tournament_standings");
+        assert_eq!(value["entries"][0]["player_id"], "device-a");
+        assert_eq!(value["entries"][0]["points"], 4);
+
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::TournamentEnded {
+            v: VERSION,
+            tournament_id: "t1".into(),
+            final_standings: vec![StandingEntry {
+                player_id: "device-a".into(),
+                points: 6,
+                games_played: 3,
+            }],
+        })
+        .unwrap();
+        assert_eq!(value["type"], "tournament_ended");
+        assert_eq!(value["final_standings"][0]["points"], 6);
+
+        let value: serde_json::Value = serde_json::to_value(&ServerMessage::TournamentList {
+            v: VERSION,
+            tournaments: vec![TournamentSummary {
+                tournament_id: "t1".into(),
+                status: "running".into(),
+                time_control: "5+0".into(),
+                starts_at_ms: 1_700_000_000_000,
+                duration_ms: 3_600_000,
+            }],
+        })
+        .unwrap();
+        assert_eq!(value["type"], "tournament_list");
+        assert_eq!(value["tournaments"][0]["status"], "running");
     }
 
     #[test]
@@ -966,6 +1159,9 @@ mod tests {
             ErrorCode::SessionExpired,
             ErrorCode::InvalidRequest,
             ErrorCode::InvalidDisplayName,
+            ErrorCode::TournamentNotFound,
+            ErrorCode::AlreadyInTournament,
+            ErrorCode::TournamentNotRunning,
         ] {
             let message = ServerMessage::error(code);
             let json = serde_json::to_string(&message).unwrap();

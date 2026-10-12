@@ -297,6 +297,10 @@ enum OnlineClientMessage: Codable, Equatable {
     case setProfile(token: String, displayName: String)
     case resign
     case leave
+    /// Join an Arena tournament's waiting pool (add-tournaments phase 1).
+    case joinTournament(playerID: String, tournamentID: String)
+    /// Leave the tournament's waiting pool (not an in-progress game).
+    case leaveTournament(tournamentID: String)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -310,6 +314,7 @@ enum OnlineClientMessage: Codable, Equatable {
         case displayName = "display_name"
         case deviceID = "device_id"
         case uci
+        case tournamentID = "tournament_id"
     }
 
     init(from decoder: Decoder) throws {
@@ -352,6 +357,13 @@ enum OnlineClientMessage: Codable, Equatable {
             let token = try container.decode(String.self, forKey: .token)
             let displayName = try container.decode(String.self, forKey: .displayName)
             self = .setProfile(token: token, displayName: displayName)
+        case "join_tournament":
+            let playerID = try container.decode(String.self, forKey: .playerID)
+            let tournamentID = try container.decode(String.self, forKey: .tournamentID)
+            self = .joinTournament(playerID: playerID, tournamentID: tournamentID)
+        case "leave_tournament":
+            let tournamentID = try container.decode(String.self, forKey: .tournamentID)
+            self = .leaveTournament(tournamentID: tournamentID)
         default:
             throw OnlineProtocolError.unknownMessageType(type)
         }
@@ -399,6 +411,13 @@ enum OnlineClientMessage: Codable, Equatable {
             try container.encode("set_profile", forKey: .type)
             try container.encode(token, forKey: .token)
             try container.encode(displayName, forKey: .displayName)
+        case .joinTournament(let playerID, let tournamentID):
+            try container.encode("join_tournament", forKey: .type)
+            try container.encode(playerID, forKey: .playerID)
+            try container.encode(tournamentID, forKey: .tournamentID)
+        case .leaveTournament(let tournamentID):
+            try container.encode("leave_tournament", forKey: .type)
+            try container.encode(tournamentID, forKey: .tournamentID)
         }
     }
 }
@@ -429,6 +448,20 @@ struct OnlineUpdate: Codable, Equatable {
     }
 }
 
+/// One player's row in a tournament leaderboard. `points` is doubled on the
+/// wire (win=2, draw=1, loss=0), same as the server's domain model.
+struct OnlineStandingEntry: Codable, Equatable {
+    let playerID: String
+    let points: Int
+    let gamesPlayed: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case playerID = "player_id"
+        case points
+        case gamesPlayed = "games_played"
+    }
+}
+
 /// Server messages: versioned JSON with a `type` tag.
 enum OnlineServerMessage: Codable, Equatable {
     /// The seat is ready: room code, our color, and the initial snapshot.
@@ -442,6 +475,18 @@ enum OnlineServerMessage: Codable, Equatable {
     case session(token: String)
     case profileUpdated
     case sessionOk
+    /// Registered in a tournament's waiting pool (add-tournaments phase 1).
+    case tournamentJoined(tournamentID: String)
+    /// Paired into a new tournament game: a room was created and this seat
+    /// installed, same as `roomReady` but not in response to a client
+    /// `create_room`/`join_room`.
+    case tournamentPairing(tournamentID: String, roomCode: String, yourColor: OnlineColor, state: OnlineState)
+    /// A tournament's current leaderboard. Decode-only: nothing on the
+    /// server emits this yet (no code path calls it), kept so a future
+    /// server build sending it does not crash an older client.
+    case tournamentStandings(tournamentID: String, entries: [OnlineStandingEntry])
+    /// The tournament's window closed. Decode-only, same reason as above.
+    case tournamentEnded(tournamentID: String, finalStandings: [OnlineStandingEntry])
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -452,6 +497,9 @@ enum OnlineServerMessage: Codable, Equatable {
         case code
         case message
         case token
+        case tournamentID = "tournament_id"
+        case entries
+        case finalStandings = "final_standings"
     }
 
     init(from decoder: Decoder) throws {
@@ -483,6 +531,28 @@ enum OnlineServerMessage: Codable, Equatable {
             self = .profileUpdated
         case "session_ok":
             self = .sessionOk
+        case "tournament_joined":
+            let tournamentID = try container.decode(String.self, forKey: .tournamentID)
+            self = .tournamentJoined(tournamentID: tournamentID)
+        case "tournament_pairing":
+            let tournamentID = try container.decode(String.self, forKey: .tournamentID)
+            let roomCode = try container.decode(String.self, forKey: .roomCode)
+            let yourColor = try container.decode(OnlineColor.self, forKey: .yourColor)
+            let state = try container.decode(OnlineState.self, forKey: .state)
+            self = .tournamentPairing(tournamentID: tournamentID, roomCode: roomCode, yourColor: yourColor, state: state)
+        case "tournament_standings":
+            let tournamentID = try container.decode(String.self, forKey: .tournamentID)
+            let entries = try container.decode([OnlineStandingEntry].self, forKey: .entries)
+            self = .tournamentStandings(tournamentID: tournamentID, entries: entries)
+        case "tournament_ended":
+            let tournamentID = try container.decode(String.self, forKey: .tournamentID)
+            let finalStandings = try container.decode([OnlineStandingEntry].self, forKey: .finalStandings)
+            self = .tournamentEnded(tournamentID: tournamentID, finalStandings: finalStandings)
+        // "tournament_list" is deliberately not decoded (add-tournaments
+        // phase 1): no server code path sends it yet, and there is no lobby
+        // UI to show it to. Falls through to unknownMessageType like any
+        // other message this build doesn't know, same as the server closing
+        // on a type a client doesn't recognize.
         default:
             throw OnlineProtocolError.unknownMessageType(type)
         }
@@ -514,6 +584,23 @@ enum OnlineServerMessage: Codable, Equatable {
             try container.encode("profile_updated", forKey: .type)
         case .sessionOk:
             try container.encode("session_ok", forKey: .type)
+        case .tournamentJoined(let tournamentID):
+            try container.encode("tournament_joined", forKey: .type)
+            try container.encode(tournamentID, forKey: .tournamentID)
+        case .tournamentPairing(let tournamentID, let roomCode, let yourColor, let state):
+            try container.encode("tournament_pairing", forKey: .type)
+            try container.encode(tournamentID, forKey: .tournamentID)
+            try container.encode(roomCode, forKey: .roomCode)
+            try container.encode(yourColor, forKey: .yourColor)
+            try container.encode(state, forKey: .state)
+        case .tournamentStandings(let tournamentID, let entries):
+            try container.encode("tournament_standings", forKey: .type)
+            try container.encode(tournamentID, forKey: .tournamentID)
+            try container.encode(entries, forKey: .entries)
+        case .tournamentEnded(let tournamentID, let finalStandings):
+            try container.encode("tournament_ended", forKey: .type)
+            try container.encode(tournamentID, forKey: .tournamentID)
+            try container.encode(finalStandings, forKey: .finalStandings)
         }
     }
 }

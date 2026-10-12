@@ -748,6 +748,9 @@ struct HomeView: View {
     @State private var roomCode = ""
     @State private var timeControl: OnlineTimeControl = .default
     @State private var authDisplayNameInput = ""
+    /// Arena tournament id to join (add-tournaments phase 1): no lobby yet,
+    /// so this is pasted in, same as a room code.
+    @State private var tournamentID = ""
 
     var body: some View {
         ScrollView {
@@ -860,6 +863,34 @@ struct HomeView: View {
                     }
                     if let joinErr = vm.onlineJoinError {
                         Text(joinErr).font(.footnote).foregroundColor(.red)
+                    }
+
+                    // Arena tournament (add-tournaments phase 1): no lobby
+                    // yet, so the tournament id is pasted in, same as a room
+                    // code; once paired, this becomes an ordinary online game.
+                    Text("Tournament")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    TextField("Tournament ID", text: $tournamentID)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    Button(action: {
+                        let id = tournamentID.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !id.isEmpty {
+                            _ = vm.startOnlineTournament(tournamentID: id, serverURLString: effectiveOnlineURL)
+                        }
+                    }) {
+                        Text("Join tournament").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(tournamentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    if case .waitingForTournament = vm.onlinePhase {
+                        VStack(spacing: 6) {
+                            Text("Waiting for an opponent in the tournament…").font(.footnote)
+                            Button("Cancel") { vm.cancelTournamentWait() }
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                 } else {
                     Button(action: {
