@@ -18,6 +18,7 @@ use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::serve::ListenerExt;
 use chess_server::infrastructure::broker::{generate_node_id, Broker};
 use chess_server::infrastructure::config::{Config, Tier};
 use chess_server::infrastructure::logic_handler::LogicState;
@@ -103,10 +104,20 @@ async fn init_app(config: &Config) -> Arc<App> {
     }
 }
 
+/// Nagle's algorithm can add tens of milliseconds of latency to the small,
+/// frequent messages a chess move produces; every WebSocket-serving listener
+/// disables it on accept.
+fn warn_on_nodelay_failure(stream: &mut tokio::net::TcpStream) {
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::warn!(%err, "failed to set TCP_NODELAY on incoming connection");
+    }
+}
+
 async fn run_monolith(config: Config, app: Arc<App>) {
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await
-        .expect("bind listener");
+        .expect("bind listener")
+        .tap_io(warn_on_nodelay_failure);
     tracing::info!(
         bind = %config.bind,
         port = config.port,
@@ -154,7 +165,8 @@ async fn run_transport(config: Config) {
 
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await
-        .expect("bind listener");
+        .expect("bind listener")
+        .tap_io(warn_on_nodelay_failure);
     tracing::info!(
         bind = %config.bind,
         port = config.port,
@@ -205,7 +217,8 @@ async fn run_logic(config: Config, mut app: Arc<App>) {
     let health_state = Arc::clone(&logic_state);
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await
-        .expect("bind listener");
+        .expect("bind listener")
+        .tap_io(warn_on_nodelay_failure);
     tracing::info!(
         bind = %config.bind,
         port = config.port,
@@ -301,7 +314,8 @@ async fn run_combined(config: Config, mut app: Arc<App>) {
 
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await
-        .expect("bind listener");
+        .expect("bind listener")
+        .tap_io(warn_on_nodelay_failure);
     tracing::info!(
         bind = %config.bind,
         port = config.port,
