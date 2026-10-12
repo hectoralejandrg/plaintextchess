@@ -70,6 +70,28 @@ are unchanged. The FFI and mobile clients are untouched.
   measurements used the 1-shard default, so the scaling claim is unproven until
   the N-shard A/B is run.
 
+## Measurement result (QA round 6)
+
+QA round 6 measured `1 node / 1 shard` vs `3 nodes / 1 shard` vs `3 nodes / 3
+shards` on a single host (weak scaling, 2000 games/node, pace 25 ms; see
+`docs/support/qa-performance-findings.md`):
+
+- `1/1` ~43.6k moves/s; `3/1` ~55.2k (1.27x); `3/3` ~47.1k (1.08x).
+- `3 shards` came out **0.85x vs 1 shard**, inside a ±33% replica spread.
+- With 3 shards, shard 0 held **all** the control keys (`ptc.logic_node.*`,
+  `ptc.node.*`) and shards 2-3 held none - the **control plane stays on one
+  instance**.
+
+Reading:
+- **Data-path sharding alone did not lift throughput in this run**, consistent
+  with the fabric never being the binding cost (Redis ~0.3 core; the per-move
+  socket write dominates).
+- **Caveat:** every node ran on **one host**, so the host (~50-58k moves/s) is the
+  shared cap; a **cross-host** run is required to conclude on horizontal scaling
+  (task 2.3).
+- The **control-plane centralization** (one control shard) is a real limitation to
+  address if fabric scaling continues.
+
 ## Open Questions
 
 - How many shards are needed to lift the ceiling, and where does it saturate?

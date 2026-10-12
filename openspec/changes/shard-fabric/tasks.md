@@ -9,8 +9,11 @@
 
 ## 2. Measure the shard payoff (gate) — in progress
 
-- [ ] 2.1 Run the load harness at 1 shard vs N shards on the same host (same games/pace), reporting move-ack p95 and per-node concurrent games at p95 = 100 ms; record the baseline
-- [ ] 2.2 Confirm from the measurement whether sharding lifts the ceiling/scaling; if not, stop and revisit (the socket-write floor may still bind)
+- [x] 2.1 Run the load harness at 1 shard vs N shards on the same host (same games/pace), reporting move-ack p95 and per-node concurrent games at p95 = 100 ms; record the baseline.
+      Done (QA round 6; see `docs/support/qa-performance-findings.md`): 1 node/1 shard ~43.6k moves/s; 3 nodes/1 shard ~55.2k (1.27x); 3 nodes/3 shards ~47.1k (1.08x). 3 shards were 0.85x vs 1, within a ±33% replica spread.
+- [x] 2.2 Confirm from the measurement whether sharding lifts the ceiling/scaling; if not, stop and revisit (the socket-write floor may still bind).
+      Result: **no measurable gain**, and the control keyspace (node leases/registry) remains entirely on shard 0. Revisit triggered (2.3).
+- [ ] 2.3 Re-measure across SEPARATE HOSTS. The round-6 matrix co-locates every node on one host, so the host itself (~50-58k moves/s) is the shared cap and horizontal scaling cannot be demonstrated. Put logic/transport on distinct hosts and repeat before concluding on sharding.
 
 ## 3. Integration verification
 
