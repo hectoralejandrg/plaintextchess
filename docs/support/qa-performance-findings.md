@@ -87,3 +87,33 @@ the verdicts, and the open findings. Companion to `qa-client-e2e-findings.md`
 3. Investigate R6-D (seating) as a separate, cheaper win.
 4. Treat R6-C as a simplification opportunity: the adaptive backoff may be dead
    code if the ConnectionManager always recovers first.
+
+---
+
+## Monolith registry-lock profile (2026-10-13) — not split-tier
+
+Profiles the *monolith's* (`TIER=all`) setup ceiling, adjacent to R6-D.
+
+- **Question** (`shard-room-registry-locks`): are the three process-global
+  `Mutex` registries (`rooms` / `players` / `account_rooms`) the cause of the
+  setup failures measured at ~10k concurrent room creations (baseline 35.8 %
+  on a 2 vCPU / 2GB container)?
+- **Method**: temporary wait+hold nanosecond counters on every `.lock()` in
+  `check_room_limit`/`unique_code`/`create_room_internal`'s insert/
+  `track_identity`, exposed at `/healthz` as `registry_lock_ns`. The 2-vCPU
+  mechanism (one worker thread per core) was reproduced with
+  `TOKIO_WORKER_THREADS=2` on the M2 Max host — *not* a 2-CPU cgroup, so this
+  is a mechanism-faithful, not resource-identical, repro. `load_gen.rs
+  --games 10000 --pace-ms 8000 --ramp-ms 1000`; `DATABASE_URL=sqlite:/tmp/...`.
+- **Result**: 10,000 games → 7,531 ok / **2,469 failed (24.7 %)** — a real
+  breaking point. Total lock-wait over the entire run: **8.82 ms**
+  (`rooms` 2.32, `players` 6.50, `account_rooms` 0 — the guest-only load never
+  exercises the account map). That is **<=0.03 %** of the >=30 s window in
+  which the failed games timed out (~0.1 µs per acquisition: uncontended).
+  Meanwhile `GET /healthz` was unreachable (`curl` failed) during the burst,
+  and the move phase ran at only ~940 moves/s with ack p95 = 493 ms.
+- **Verdict**: **refuted.** The registry mutexes are not the bottleneck;
+  sharding them would not move the failure rate. The evidence points at
+  event-loop / scheduler starvation in the accept/setup path under raw task +
+  connection count (same family as R6-D). The instrumentation was reverted and
+  `shard-room-registry-locks` is closed with this negative result.
