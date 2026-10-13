@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::application::ports::{
-    Accounts, AuthRecorder, ChessEngine, GameRecorder, PlayerAuth, ProfileStore, Ratings,
-    RoomRegistry, RoomServices, SessionLookup, Sessions, TimeSource, TournamentRecorder,
+    Accounts, AuthRecorder, ChessEngine, GameRecorder, PlayerAuth, ProfileStore, RatingMirror,
+    Ratings, RoomRegistry, RoomServices, SessionLookup, Sessions, TimeSource, TournamentRecorder,
 };
 use crate::infrastructure::broker::Broker;
 use crate::application::room_actor::{run_room, RoomMsg};
@@ -31,7 +31,7 @@ use crate::infrastructure::engine::CoreEngine;
 use crate::infrastructure::password::{hash_token, now_ms, PasswordHasher};
 use crate::infrastructure::ratings::RatingStore;
 use crate::infrastructure::recorder::{
-    MIGRATIONS, NoopGameRecorder, NoopTournamentRecorder, SqliteGameRecorder,
+    MIGRATIONS, NoopGameRecorder, NoopRatingMirror, NoopTournamentRecorder, SqliteGameRecorder,
     SqliteTournamentRecorder,
 };
 use crate::interface::protocol::{ErrorCode, ServerMessage, TournamentSummary, VERSION};
@@ -466,6 +466,10 @@ impl App {
             time: Arc::clone(&self.time),
             reconnect_grace: self.config.reconnect_grace,
             recorder: Arc::clone(&self.recorder),
+            rating_mirror: match &self.broker {
+                Some(broker) => Arc::clone(broker) as Arc<dyn RatingMirror>,
+                None => Arc::new(NoopRatingMirror),
+            },
             auth: Arc::clone(&self.auth) as Arc<dyn PlayerAuth>,
             random_colors: self.config.random_colors,
             incremental_updates: self.config.incremental_updates,

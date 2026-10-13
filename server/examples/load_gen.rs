@@ -142,6 +142,8 @@ async fn setup(idx: usize, port: u16, setup_timeout: Duration) -> Option<(Ws, Ws
 
 async fn play_game(
     idx: usize,
+    games: usize,
+    ramp_ms: u64,
     port: u16,
     pace: Duration,
     setup_timeout: Duration,
@@ -149,6 +151,13 @@ async fn play_game(
     barrier: Arc<Barrier>,
     mut ready: watch::Receiver<bool>,
 ) -> Game {
+    // Spread the setups instead of stampeding them: every game sleeps a slice
+    // of ramp_ms proportional to its index, so game 0 starts immediately and
+    // the last one starts at ~ramp_ms.
+    if ramp_ms > 0 {
+        let stagger = ramp_ms * idx as u64 / games.max(1) as u64;
+        tokio::time::sleep(Duration::from_millis(stagger)).await;
+    }
     let seated = setup(idx, port, setup_timeout).await;
 
     // Rendezvous: every game arrives here (even after a setup failure, so the
@@ -218,6 +227,9 @@ fn channel_depth(v: &Value, key: &str) -> u64 {
 async fn main() {
     let mut games: usize = 200;
     let mut pace_ms: u64 = 60;
+    // Stagger for the connection/room-creation burst: 0 keeps today's behaviour
+    // (every game starts at once), N spreads the setups over N milliseconds.
+    let mut ramp_ms: u64 = 0;
     let mut port: u16 = 37222;
     let mut logic_port: u16 = 37111;
     // TIER=combined serves transport_metrics/fabric_metrics/channel_depth all
@@ -233,6 +245,7 @@ async fn main() {
         match args[i].as_str() {
             "--games" => { games = args[i + 1].parse().unwrap_or(games); i += 2; }
             "--pace-ms" => { pace_ms = args[i + 1].parse().unwrap_or(pace_ms); i += 2; }
+            "--ramp-ms" => { ramp_ms = args[i + 1].parse().unwrap_or(ramp_ms); i += 2; }
             "--port" => { port = args[i + 1].parse().unwrap_or(port); i += 2; }
             "--logic-port" => { logic_port = args[i + 1].parse().unwrap_or(logic_port); i += 2; }
             "--combined" => { combined = true; i += 1; }
@@ -251,6 +264,8 @@ async fn main() {
     for idx in 0..games {
         handles.push(tokio::spawn(play_game(
             idx,
+            games,
+            ramp_ms,
             port,
             pace,
             setup_timeout,

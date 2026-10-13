@@ -6,11 +6,12 @@
 use std::sync::RwLock;
 
 use redis::{
-    aio::{ConnectionManager, MultiplexedConnection}, AsyncCommands, Client as RedisClient,
-    ExistenceCheck, SetExpiry, SetOptions,
+    aio::{ConnectionManager, ConnectionManagerConfig, MultiplexedConnection}, AsyncCommands,
+    Client as RedisClient, ExistenceCheck, SetExpiry, SetOptions,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::application::ports::{RatingMirror, RatingState, RecorderError};
 use crate::infrastructure::password::{hash_token, now_ms};
 use crate::infrastructure::transport::shard_index;
 use crate::interface::protocol::{ClientMessage, ServerMessage};
@@ -494,16 +495,95 @@ pub mod session {
     }
 }
 
+/// Cross-node rating mirror (split-realtime multi-logic-node follow-up):
+/// fixes a correctness gap, not a performance one — each logic node keeps
+/// its own SQLite file (design D7 of `split-realtime-architecture`), so
+/// without this a player whose games land on different nodes would show a
+/// different rating per node. The mirror is a plain Redis hash (not JSON)
+/// so the last-write-wins guard below never needs to parse a payload.
+/// SQLite remains each node's durable history; Redis is the cross-node
+/// source of freshness (same split as `session` above).
+pub mod rating {
+    use super::*;
+    use redis::AsyncCommands;
+    use redis::Script;
+
+    /// Prefix for mirrored rating keys.
+    const PREFIX: &str = "ptc.rating.";
+
+    /// Overwrite only if the incoming `updated_at_ms` is newer than what's
+    /// stored, so a slow node's stale write can never clobber a fresher one
+    /// already mirrored by a faster node.
+    const STORE_SCRIPT: &str = r#"
+        local current = redis.call("HGET", KEYS[1], "updated_at_ms")
+        if (not current) or tonumber(ARGV[4]) > tonumber(current) then
+            redis.call("HSET", KEYS[1], "rating", ARGV[1], "rating_deviation", ARGV[2], "volatility", ARGV[3], "updated_at_ms", ARGV[4])
+            return 1
+        else
+            return 0
+        end
+    "#;
+
+    /// Mirror a device's rating, guarded by `updated_at_ms`. No TTL: unlike
+    /// a session, a rating never expires.
+    pub async fn store(
+        conn: &mut ConnectionManager,
+        device_id: &str,
+        state: RatingState,
+        updated_at_ms: i64,
+    ) -> redis::RedisResult<()> {
+        let key = format!("{}{}", PREFIX, device_id);
+        let script = Script::new(STORE_SCRIPT);
+        let _: i32 = script
+            .key(key)
+            .arg(state.rating)
+            .arg(state.rating_deviation)
+            .arg(state.volatility)
+            .arg(updated_at_ms)
+            .invoke_async(conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Load the mirrored rating, if any logic node has ever recorded one for
+    /// this device.
+    pub async fn load(
+        conn: &mut ConnectionManager,
+        device_id: &str,
+    ) -> redis::RedisResult<Option<RatingState>> {
+        let key = format!("{}{}", PREFIX, device_id);
+        let fields: std::collections::HashMap<String, String> = conn.hgetall(key).await?;
+        if fields.is_empty() {
+            return Ok(None);
+        }
+        let parse = |name: &str| fields.get(name).and_then(|v| v.parse::<f64>().ok()).unwrap_or_default();
+        Ok(Some(RatingState {
+            rating: parse("rating"),
+            rating_deviation: parse("rating_deviation"),
+            volatility: parse("volatility"),
+        }))
+    }
+}
+
 /// Logic node membership: each logic node registers with a lease.
 pub mod membership {
     use super::*;
     use redis::AsyncCommands;
+    use redis::Script;
 
     /// Prefix for logic node membership keys.
     const PREFIX: &str = "ptc.logic_node.";
 
     /// TTL for logic node lease.
     pub const TTL_SECS: u64 = 30;
+
+    /// `EXISTS` + `SET EX` as one atomic round trip (QA finding: the
+    /// previous two-command version had a TOCTOU window — see `renew`).
+    const RENEW_SCRIPT: &str = r#"
+        local existed = redis.call("EXISTS", KEYS[1])
+        redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+        return existed
+    "#;
 
     /// Register this logic node with a lease.
     pub async fn register(
@@ -521,17 +601,26 @@ pub mod membership {
 
     /// Renew the lease for this logic node, self-healing if the key was lost
     /// (e.g. a broker restart). Returns whether the key already existed
-    /// (BUG-R1-F2: `EXPIRE` on a missing key is a silent no-op).
+    /// (BUG-R1-F2: `EXPIRE` on a missing key is a silent no-op). `EXISTS` and
+    /// `SET EX` run as a single Lua script (not two round trips): the
+    /// previous two-command version could read `EXISTS` right as a renewal
+    /// from a concurrent caller (or this same loop's next tick, under
+    /// scheduling delay) raced the `SET EX`, misreporting a live key as
+    /// lapsed (QA finding, confirmed as a real false-positive source after a
+    /// full Redis restart — one per node per outage, not a repeating flap).
     pub async fn renew(conn: &mut ConnectionManager, node_id: &str) -> redis::RedisResult<bool> {
         let key = format!("{}{}", PREFIX, node_id);
-        let existed: bool = conn.exists(&key).await?;
         let value = serde_json::json!({
             "renewed_at": now_ms(),
         });
-        let _: () = conn
-            .set_ex(key, serde_json::to_string(&value).unwrap(), TTL_SECS)
+        let script = Script::new(RENEW_SCRIPT);
+        let existed: i32 = script
+            .key(key)
+            .arg(serde_json::to_string(&value).unwrap())
+            .arg(TTL_SECS)
+            .invoke_async(conn)
             .await?;
-        Ok(existed)
+        Ok(existed == 1)
     }
 
     /// Check if a logic node is alive.
@@ -559,12 +648,21 @@ pub mod membership {
 pub mod liveness {
     use super::*;
     use redis::AsyncCommands;
+    use redis::Script;
 
     /// Prefix for transport node liveness keys. Matches `channels::node_heartbeat`.
     const PREFIX: &str = "ptc.node.";
 
     /// TTL for transport node lease (seconds).
     pub const TTL_SECS: u64 = 30;
+
+    /// `EXISTS` + `SET EX` as one atomic round trip (same TOCTOU fix as
+    /// `membership::RENEW_SCRIPT` — see that module for the full rationale).
+    const RENEW_SCRIPT: &str = r#"
+        local existed = redis.call("EXISTS", KEYS[1])
+        redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+        return existed
+    "#;
 
     /// Register this transport node with a lease.
     pub async fn register(
@@ -581,17 +679,23 @@ pub mod liveness {
     /// Renew the lease for this transport node. Returns whether the key already
     /// existed: `false` means the lease had lapsed while this node was alive (a
     /// pause longer than the TTL, or lost keys), so the caller must treat its
-    /// connections as void (design D11). Uses SET EX, which self-heals the key.
+    /// connections as void (design D11). `EXISTS` and `SET EX` run as a single
+    /// Lua script (self-heals the key either way), not two round trips — the
+    /// previous version had a TOCTOU window that could misreport a live key as
+    /// lapsed (QA finding).
     pub async fn renew(conn: &mut ConnectionManager, node_id: &str) -> redis::RedisResult<bool> {
         let key = format!("{}{}", PREFIX, node_id);
-        let existed: bool = conn.exists(&key).await?;
         let value = serde_json::json!({
             "renewed_at": now_ms(),
         });
-        let _: () = conn
-            .set_ex(key, serde_json::to_string(&value).unwrap(), TTL_SECS)
+        let script = Script::new(RENEW_SCRIPT);
+        let existed: i32 = script
+            .key(key)
+            .arg(serde_json::to_string(&value).unwrap())
+            .arg(TTL_SECS)
+            .invoke_async(conn)
             .await?;
-        Ok(existed)
+        Ok(existed == 1)
     }
 
     /// Check if a transport node's lease is alive.
@@ -632,6 +736,12 @@ pub struct Broker {
     node_id: String,
 }
 
+/// Bound on how long a control-shard command waits for Redis before failing
+/// (QA finding: `redis-rs`'s own default is unbounded). Well above normal
+/// command latency, far below "stalls the room actor until Redis comes
+/// back" — a caller treats the timeout exactly like any other Redis error.
+const COMMAND_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl Broker {
     /// Connect to every Redis shard and build each one's shared command
     /// connection. Fails if any shard is unreachable, which is how "refuse to
@@ -648,8 +758,18 @@ impl Broker {
         for url in redis_urls {
             let client = RedisClient::open(url.as_str())?;
             // The manager auto-reconnects and is used for everything except the
-            // hot publish path (see `publish_connection`).
-            let manager = client.get_connection_manager().await?;
+            // hot publish path (see `publish_connection`). `redis-rs` defaults
+            // `response_timeout` to `Duration::MAX` (QA finding: a Redis
+            // outage mid-command would otherwise stall the caller
+            // indefinitely — e.g. the room actor awaiting `RatingMirror` before
+            // it can deliver a terminal result to either player). Bounding it
+            // here covers every control-shard operation at once (ownership,
+            // registry, leases, sessions, rating), not just the new one.
+            let manager = ConnectionManager::new_with_config(
+                client.clone(),
+                ConnectionManagerConfig::new().set_response_timeout(COMMAND_RESPONSE_TIMEOUT),
+            )
+            .await?;
             shards.push(ShardConn {
                 client,
                 manager,
@@ -693,6 +813,27 @@ impl Broker {
         let conn = self.shards[shard].client.get_multiplexed_async_connection().await?;
         *self.shards[shard].publish_conn.write().unwrap() = Some(conn.clone());
         Ok(conn)
+    }
+
+    /// Probe one shard's inbound publish connection health (QA finding: this
+    /// connection deliberately carries no per-command timeout — design D1 of
+    /// `reduce-fabric-contention` — so it cannot detect a stalled, not just a
+    /// dead, Redis on its own). The caller wraps this in a bounded timeout on
+    /// an interval, not per inbound message, to avoid reintroducing the
+    /// per-command timer cost that design eliminated.
+    pub async fn ping_publish_shard(&self, shard: usize) -> redis::RedisResult<()> {
+        let mut conn = self.publish_connection(shard).await?;
+        let result = redis::cmd("PING").query_async(&mut conn).await;
+        if result.is_err() {
+            // QA finding: without this, a failed probe kept retrying the
+            // same broken cached connection forever — recovery only
+            // happened once a real client publish hit `publish_with_retry`'s
+            // own reconnect-on-error path. Drop the cache here too, so the
+            // next probe tick reconnects on its own (same pattern as
+            // `publish_with_retry`'s error arm below).
+            *self.shards[shard].publish_conn.write().unwrap() = None;
+        }
+        result
     }
 
     /// Publish `payload` on `channel` via `shard`, retrying a transient
@@ -929,10 +1070,40 @@ impl Broker {
         registry::unregister(&mut conn, connection_id).await
     }
 
-    /// Claim room ownership (Phase 3).
+    /// Claim room ownership (Phase 3). Retries a bounded number of times
+    /// (same shape as `publish_with_retry`: `PUBLISH_ATTEMPTS`/
+    /// `PUBLISH_RETRY_DELAY`) on a control-shard error — QA finding: a
+    /// burst of concurrent `CreateRoom`s across several logic nodes can
+    /// make a single claim exceed `COMMAND_RESPONSE_TIMEOUT` from queueing
+    /// alone, not a real Redis outage; left unretried, the ownership key
+    /// silently never gets written and the second player's `JoinRoom`
+    /// later misroutes.
+    ///
+    /// The retry has a subtlety a plain loop would get wrong: `SET NX` can
+    /// succeed on the server before the client's timeout fires locally, so
+    /// a retry can see the key already set — by this same claim, under
+    /// this same node id. That must count as success, not "someone else
+    /// already owns it": after exhausting retries on errors, check who the
+    /// owner actually is before reporting failure.
     pub async fn claim_room(&self, room_code: &str) -> redis::RedisResult<bool> {
+        let mut last_err = None;
+        for attempt in 0..PUBLISH_ATTEMPTS {
+            let mut conn = self.conn();
+            match ownership::claim(&mut conn, room_code, &self.node_id).await {
+                Ok(claimed) => return Ok(claimed),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < PUBLISH_ATTEMPTS {
+                        tokio::time::sleep(PUBLISH_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
         let mut conn = self.conn();
-        ownership::claim(&mut conn, room_code, &self.node_id).await
+        match ownership::get_owner(&mut conn, room_code).await {
+            Ok(Some(owner)) if owner == self.node_id => Ok(true),
+            _ => Err(last_err.expect("at least one claim attempt ran")),
+        }
     }
 
     /// Release room ownership (Phase 3).
@@ -941,10 +1112,25 @@ impl Broker {
         ownership::release(&mut conn, room_code, &self.node_id).await
     }
 
-    /// Get room owner (Phase 3).
+    /// Get room owner (Phase 3). Retries a bounded number of times on a
+    /// control-shard error (same QA finding as `claim_room` above) — a
+    /// plain read is idempotent, so a retry here has no ambiguity to
+    /// resolve.
     pub async fn get_room_owner(&self, room_code: &str) -> redis::RedisResult<Option<String>> {
-        let mut conn = self.conn();
-        ownership::get_owner(&mut conn, room_code).await
+        let mut last_err = None;
+        for attempt in 0..PUBLISH_ATTEMPTS {
+            let mut conn = self.conn();
+            match ownership::get_owner(&mut conn, room_code).await {
+                Ok(owner) => return Ok(owner),
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt + 1 < PUBLISH_ATTEMPTS {
+                        tokio::time::sleep(PUBLISH_RETRY_DELAY).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.expect("at least one get_owner attempt ran"))
     }
 
     /// Renew room ownership lease (Phase 3).
@@ -1068,6 +1254,37 @@ impl Broker {
     pub async fn node_lease_alive(&self, node_id: &str) -> redis::RedisResult<bool> {
         let mut conn = self.conn();
         liveness::is_alive(&mut conn, node_id).await
+    }
+}
+
+/// The room actor's cross-node rating port, backed by the `rating` module
+/// above. A mirror/lookup failure is surfaced as a `RecorderError` (a plain
+/// string), same contract as `GameRecorder`/`TournamentRecorder`.
+impl RatingMirror for Broker {
+    fn mirror<'a>(
+        &'a self,
+        device_id: &'a str,
+        state: RatingState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut conn = self.conn();
+            rating::store(&mut conn, device_id, state, now_ms())
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        device_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<RatingState>, RecorderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut conn = self.conn();
+            rating::load(&mut conn, device_id).await.map_err(|e| e.to_string())
+        })
     }
 }
 

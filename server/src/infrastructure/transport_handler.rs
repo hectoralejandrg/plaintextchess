@@ -52,13 +52,55 @@ const INBOUND_PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// in `broker::liveness::TTL_SECS`.
 const NODE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Backoff bounds for a failed lease renewal (QA finding `GAP-QA-R5-A`,
+/// found on the symmetric `logic_handler.rs` loop and applied here too for
+/// the same reason: a fixed 10s interval means a renewal failing right
+/// after Redis goes down waits the full 10s for its next chance, even if
+/// Redis is back a second later). Same shape as `logic_handler.rs`'s
+/// `reconnect_backoff`, kept local rather than shared across modules for a
+/// 3-line formula.
+const LEASE_RETRY_MIN: Duration = Duration::from_millis(200);
+const LEASE_RETRY_MAX: Duration = Duration::from_secs(2);
+
+fn lease_retry_backoff(failures: u32) -> Duration {
+    (LEASE_RETRY_MIN * (1u32 << failures.min(4))).min(LEASE_RETRY_MAX)
+}
+
 /// How often the transport checks the logic nodes it holds connections on, so a
 /// lost owner closes its players with a clear signal (design D13 / GAP-P3-D).
 const LOGIC_WATCH_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Consecutive `logic_node_alive` misses required before a logic node is
+/// declared lost (QA finding: this used to act on a single miss, which a
+/// transient Redis hiccup under load could trigger falsely). Mirrors
+/// `NODE_MISS_THRESHOLD` in `logic_handler.rs`, the symmetric watch in the
+/// other direction.
+const LOGIC_NODE_MISS_THRESHOLD: u32 = 2;
+
 /// Upper bound for best-effort broker calls during connection cleanup: a dead
 /// broker must not hold a closing socket open.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often each shard's inbound publish connection is probed for health
+/// (QA finding — see `TransportState::publish_healthy`'s field doc).
+///
+/// QA re-test finding: a message sent in the window between a stall
+/// starting and the next probe tick still rides the old, now-stuck
+/// connection, since the publish path deliberately carries no per-command
+/// timeout (the cost that would reintroduce is exactly what
+/// `reduce-fabric-contention` eliminated, and the transport cannot tell a
+/// `CreateRoom` from a `Move` before publishing — it forwards the raw,
+/// undecoded frame). That residual window cannot be closed without paying
+/// that cost; it can only be shrunk. 500ms/1.5s (down from 2s/3s) cuts the
+/// worst case from ~5s to ~2s. A message that still lands in that smaller
+/// window hangs until Redis actually responds again or the OS-level
+/// connection errors — not forever, except under a synthetic `SIGSTOP`-
+/// style stall that never produces either signal (accepted trade-off,
+/// `fix-multi-node-rating-consistency` design D3).
+const PUBLISH_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+/// Bound on a single health probe: well above normal `PING` latency, far
+/// below "indefinite".
+const PUBLISH_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Number of shards for the connection affinity map. Matches the logic side
 /// for consistency and avoids hot spots.
@@ -91,8 +133,25 @@ pub struct TransportState {
     /// one shard - a connection whose room lives on a working shard should
     /// not be refused just because another shard is down).
     shard_healthy: Vec<AtomicBool>,
+    /// Per-Redis-shard INBOUND publish health, driven by a periodic bounded
+    /// probe (`spawn_publish_health_check`), not by `shard_healthy` above
+    /// (that one only reflects the outbound subscription, a different
+    /// connection with a different failure mode). QA finding: a stalled
+    /// (not dead) Redis could hang any new inbound frame — including
+    /// `CreateRoom` — indefinitely, since the hot publish connection
+    /// deliberately carries no per-command timeout (design D1 of
+    /// `reduce-fabric-contention`). Checked before attempting a publish so
+    /// a known-unhealthy shard fails fast instead of hanging.
+    publish_healthy: Vec<AtomicBool>,
     /// Background task that renews the node liveness lease.
     liveness_task: Mutex<Option<JoinHandle<()>>>,
+    /// Every other background task this state spawns (`spawn_dispatcher`'s
+    /// per-shard readers, `spawn_logic_watch`, `spawn_publish_health_check`)
+    /// — tracked so test harnesses can stop them all on `Drop` instead of
+    /// leaking them into the next test (QA finding, same class of bug as
+    /// `LogicState::background_tasks`). A real process never calls
+    /// `abort_background_tasks`; it exits as a whole instead.
+    background_tasks: Mutex<tokio::task::JoinSet<()>>,
     /// Phase 3: connection_id -> logic_node_id affinity. A connection's
     /// non-room-scoped frames (Move/Resign/Leave/Disconnect) are routed to the
     /// logic node that seats it, so several logic instances do not mis-route.
@@ -119,16 +178,74 @@ impl TransportState {
             outboxes.push(Mutex::new(HashMap::new()));
         }
         let shard_healthy = (0..broker.n_shards()).map(|_| AtomicBool::new(true)).collect();
+        let publish_healthy = (0..broker.n_shards()).map(|_| AtomicBool::new(true)).collect();
         Self {
             broker,
             node_id,
             outboxes,
             shard_healthy,
+            publish_healthy,
             liveness_task: Mutex::new(None),
+            background_tasks: Mutex::new(tokio::task::JoinSet::new()),
             conn_logic,
             placement_rr: std::sync::atomic::AtomicUsize::new(0),
             local_logic: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Stop every background task this state spawned other than the liveness
+    /// renewal loop (`stop_liveness` handles that one separately, since one
+    /// test deliberately stops only liveness to simulate a lapsed lease).
+    /// Test-only in practice; a real process exits as a whole instead.
+    pub fn abort_background_tasks(&self) {
+        self.background_tasks.lock().unwrap().abort_all();
+    }
+
+    /// Whether a shard's inbound publish connection is known healthy (QA
+    /// finding — see `publish_healthy`'s field doc).
+    fn publish_shard_healthy(&self, shard: usize) -> bool {
+        self.publish_healthy[shard].load(Ordering::SeqCst)
+    }
+
+    fn mark_publish_unhealthy(&self, shard: usize) {
+        self.publish_healthy[shard].store(false, Ordering::SeqCst);
+    }
+
+    fn mark_publish_healthy(&self, shard: usize) {
+        self.publish_healthy[shard].store(true, Ordering::SeqCst);
+    }
+
+    /// Periodically probe each shard's inbound publish connection with a
+    /// short, bounded-timeout `PING`, so a stalled (not dead) Redis is
+    /// detected without putting a per-command timeout on the hot publish
+    /// path itself (design D3 of `fix-multi-node-rating-consistency`: the
+    /// per-message timer cost that would reintroduce is exactly what
+    /// `reduce-fabric-contention` eliminated). A single failed probe marks
+    /// the shard unhealthy immediately; a single success clears it — the
+    /// probe interval itself is the debounce, not an additional counter.
+    pub fn spawn_publish_health_check(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        let n_shards = state.broker.n_shards();
+        self.background_tasks.lock().unwrap().spawn(async move {
+            let mut interval = tokio::time::interval(PUBLISH_HEALTH_CHECK_INTERVAL);
+            loop {
+                interval.tick().await;
+                for shard in 0..n_shards {
+                    let healthy = tokio::time::timeout(
+                        PUBLISH_HEALTH_PROBE_TIMEOUT,
+                        state.broker.ping_publish_shard(shard),
+                    )
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                    if healthy {
+                        state.mark_publish_healthy(shard);
+                    } else {
+                        tracing::warn!(shard, "inbound publish shard unhealthy (probe failed or timed out)");
+                        state.mark_publish_unhealthy(shard);
+                    }
+                }
+            }
+        });
     }
 
     /// Get the node identifier.
@@ -165,12 +282,13 @@ impl TransportState {
         let state = Arc::clone(self);
         let task_state = Arc::clone(&state);
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(NODE_LEASE_RENEW_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut failures: u32 = 0;
             loop {
-                interval.tick().await;
-                match task_state.broker.renew_node_lease().await {
-                    Ok(true) => {}
+                let delay = match task_state.broker.renew_node_lease().await {
+                    Ok(true) => {
+                        failures = 0;
+                        NODE_LEASE_RENEW_INTERVAL
+                    }
                     Ok(false) => {
                         // The lease lapsed while this node was alive (a pause
                         // longer than the TTL, or keys lost). The authoritative
@@ -181,11 +299,16 @@ impl TransportState {
                             "node lease had lapsed while alive; closing clients to force reconnect"
                         );
                         task_state.on_lease_lost();
+                        failures += 1;
+                        lease_retry_backoff(failures)
                     }
                     Err(e) => {
                         tracing::warn!(node_id = %task_state.node_id, error = %e, "failed to renew node lease");
+                        failures += 1;
+                        lease_retry_backoff(failures)
                     }
-                }
+                };
+                tokio::time::sleep(delay).await;
             }
         });
         *state.liveness_task.lock().unwrap() = Some(handle);
@@ -206,8 +329,15 @@ impl TransportState {
     /// "clear terminal outcome" branch, not continuity.
     pub fn spawn_logic_watch(self: &Arc<Self>) {
         let state = Arc::clone(self);
-        tokio::spawn(async move {
+        self.background_tasks.lock().unwrap().spawn(async move {
             let mut interval = tokio::time::interval(LOGIC_WATCH_INTERVAL);
+            // Debounced, matching the logic tier's own watch of transport
+            // nodes (`NODE_MISS_THRESHOLD`, `logic_handler.rs`) — a single
+            // `EXISTS` miss can be a transient Redis hiccup under load, not
+            // proof the logic node is actually gone (QA finding: this side
+            // used to act on one miss with no debounce at all, closing
+            // connections on a false positive under test-suite contention).
+            let mut misses: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
             loop {
                 interval.tick().await;
                 let nodes: Vec<String> = {
@@ -224,8 +354,16 @@ impl TransportState {
                 };
                 for node in nodes {
                     match state.broker.logic_node_alive(&node).await {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            misses.remove(&node);
+                        }
                         Ok(false) => {
+                            let m = misses.entry(node.clone()).or_insert(0);
+                            *m += 1;
+                            if *m < LOGIC_NODE_MISS_THRESHOLD {
+                                continue;
+                            }
+                            misses.remove(&node);
                             let ids: Vec<String> = {
                                 let mut ids = Vec::new();
                                 for shard in &state.conn_logic {
@@ -321,7 +459,7 @@ impl TransportState {
         }
         for (shard, pubsub) in initial_pubsubs.into_iter().enumerate() {
             let state = Arc::clone(self);
-            tokio::spawn(async move {
+            self.background_tasks.lock().unwrap().spawn(async move {
                 let mut pubsub = pubsub;
                 loop {
                     {
@@ -572,6 +710,16 @@ async fn handle_transport_text(
         ClientMessage::JoinRoom { room_code, .. } => Some(room_code.clone()),
         _ => None,
     };
+
+    // QA finding: fail fast on a shard already known unhealthy (a stalled
+    // Redis) instead of attempting a publish that would hang indefinitely —
+    // the publish connection deliberately has no per-command timeout.
+    let shard = state.broker.shard_for(connection_id);
+    if !state.publish_shard_healthy(shard) {
+        tracing::warn!(shard, "inbound publish shard unhealthy; failing the frame instead of hanging");
+        outbox.push(Outbound::BrokerUnavailable);
+        return false;
+    }
 
     // Specific target first: a join goes to the room's recorded owner, any other
     // frame to the node that already serves this connection. The full node list

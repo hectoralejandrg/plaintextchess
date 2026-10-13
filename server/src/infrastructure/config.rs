@@ -63,13 +63,33 @@ pub const MIN_SESSION_TTL_SECS: u64 = 60;
 /// preserves the current serial behavior; unset uses 1. Increasing K allows
 /// independent rooms to be processed concurrently while preserving per-room
 /// ordering via `hash(room_code) % K`.
+///
+/// QA finding (investigated, NOT acted on by raising this default — see
+/// `openspec/changes/tune-logic-lane-defaults`): a single lane means
+/// every room/control message for a `TIER=logic`/`combined` process
+/// serializes through one worker, and under a burst of thousands of
+/// concurrent `CreateRoom`s this measurably causes setup failures (~37% at
+/// 1 lane in a reproduction of the QA scenario). Raising it is NOT a free
+/// win, though: more local lanes also means more concurrent requests
+/// hitting the shared control-shard Redis connection at once, and a rushed
+/// single-run comparison (8 lanes) that looked better than this default
+/// did NOT hold up under a cleaner retest (16 lanes measured *worse*, and
+/// a third attempt was too contaminated by repeated local load-testing to
+/// trust at all). The right lane count is a real open question that needs
+/// a clean, dedicated measurement (fresh hosts, several replicas, proper
+/// drain time between runs) — not a quick call from one noisy benchmark.
+/// Left at the conservative, known-safe value until that measurement
+/// exists.
 pub const DEFAULT_LOGIC_LANES: usize = 1;
 /// Minimum allowed inbound lanes (must be >= 1 to preserve ordering guarantees).
 pub const MIN_LOGIC_LANES: usize = 1;
 
 /// Default number of control-plane lanes (design D2). Control-plane messages
 /// (create/join/leave/resign/auth) are routed here, keyed by connection_id,
-/// so argon2 auth and Redis round trips do not stall move lanes.
+/// so argon2 auth and Redis round trips do not stall move lanes. Same
+/// rationale and the same deferred decision as `DEFAULT_LOGIC_LANES` above
+/// — this is in fact the lane the QA reproduction actually bottlenecked on
+/// (`CreateRoom`/`JoinRoom` are control-plane messages).
 pub const DEFAULT_LOGIC_CONTROL_LANES: usize = 1;
 /// Minimum allowed control lanes (must be >= 1).
 pub const MIN_LOGIC_CONTROL_LANES: usize = 1;

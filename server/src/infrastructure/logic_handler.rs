@@ -29,9 +29,23 @@ use crate::infrastructure::transport_handler::TransportState;
 use crate::interface::protocol::{ClientMessage, ErrorCode, ServerMessage, VERSION, decode_incoming};
 
 /// Backoff bounds and failure budget for broker reconnection (design D10).
+/// QA finding: the old budget (10 failures, ~17s total) gave up and
+/// self-unregistered (`unregister_logic_node`) well before a realistic
+/// Redis restart/outage completed, so a node would delete its own
+/// membership key and crash-exit mid-outage, relying entirely on an
+/// external supervisor to come back as a brand-new node id.
+///
+/// A first pass raised this to 150 (~5 minutes), but a QA re-test that
+/// literally followed this file's own "wait at least 5 minutes" guidance
+/// found the node dying at exactly that boundary — a budget that *just*
+/// meets a target survives *less than* it, not the target itself. 600
+/// failures at this backoff shape budgets roughly 20 minutes (4 ramp-up
+/// retries + ~596 steady 2s retries), comfortably past both the 30s lease
+/// TTL (`membership::TTL_SECS`/`liveness::TTL_SECS`) and the real incident
+/// that motivated this work (~11 minutes), with actual margin this time.
 const RECONNECT_MIN: Duration = Duration::from_millis(200);
 const RECONNECT_MAX: Duration = Duration::from_secs(2);
-const MAX_SUBSCRIBE_FAILURES: u32 = 10;
+const MAX_SUBSCRIBE_FAILURES: u32 = 600;
 
 /// Transport node liveness watcher constants (design D11).
 pub const NODE_WATCH_INTERVAL: Duration = Duration::from_secs(5);
@@ -558,6 +572,15 @@ pub struct LogicState {
     /// real `TIER=logic` process, which always publishes to the fabric
     /// (colocate-room-hot-path design D3).
     local_transport: std::sync::OnceLock<Arc<TransportState>>,
+    /// `run()`'s long-lived background tasks (lane workers, lease renewal,
+    /// room-ownership keep-alive, transport-liveness watcher), tracked so
+    /// `abort_background_tasks` can stop all of them. In a real process
+    /// these run for the process's lifetime and are never aborted; test
+    /// harnesses that construct and tear down many `LogicState`s in one
+    /// binary need this (QA finding: untracked `tokio::spawn`s outlived
+    /// their test and kept rewriting shared test Redis keys for their TTL
+    /// window into the next test).
+    background_tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl LogicState {
@@ -604,7 +627,17 @@ impl LogicState {
             control_lane_metrics,
             move_metrics: Arc::new(LaneMetrics::default()),
             local_transport: std::sync::OnceLock::new(),
+            background_tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
+    }
+
+    /// Stop every background task `run()` spawned (lane workers, lease
+    /// renewal, room-ownership keep-alive, transport-liveness watcher).
+    /// Production processes exit as a whole and never call this; test
+    /// harnesses that tear down a `LogicState` mid-binary must, so the next
+    /// test's shared Redis keys/ports are not touched by a zombie task.
+    pub fn abort_background_tasks(&self) {
+        self.background_tasks.lock().unwrap().abort_all();
     }
 
     /// Get the node ID.
@@ -769,7 +802,7 @@ impl LogicState {
             let state = Arc::clone(&self);
             let metrics = Arc::clone(&self.room_lane_metrics[lane_id]);
             let move_metrics = Arc::clone(&self.move_metrics);
-            tokio::spawn(async move {
+            self.background_tasks.lock().unwrap().spawn(async move {
                 info!(node_id = %state.node_id, lane_id, "room lane worker started");
                 while let Some(item) = lane_receiver.recv().await {
                     let is_move = is_move_payload(&item.envelope.payload);
@@ -792,7 +825,7 @@ impl LogicState {
             let mut lane_receiver = control_lane_receivers.remove(0);
             let state = Arc::clone(&self);
             let metrics = Arc::clone(&self.control_lane_metrics[lane_id]);
-            tokio::spawn(async move {
+            self.background_tasks.lock().unwrap().spawn(async move {
                 info!(node_id = %state.node_id, lane_id, "control lane worker started");
                 while let Some(item) = lane_receiver.recv().await {
                     state.handle_inbound(item.envelope).await;
@@ -808,14 +841,28 @@ impl LogicState {
         }
 
         // Keep the node lease renewed (Phase 3 owns the re-resolve behaviour;
-        // the lease is harmless in Phase 1).
+        // the lease is harmless in Phase 1). QA finding: a fixed 10s
+        // interval meant a renewal failing right after Redis went down
+        // waited the full 10s for its next chance, even if Redis came back
+        // a second later — measured as a 10-18s end-to-end recovery time
+        // after a full Redis restart, dominating far more than the publish-
+        // health probe (<250ms) or the control-shard timeout. Backing off
+        // on failure (reusing `reconnect_backoff`, same shape as the
+        // subscribe-retry loop below) bounds that to ~2s instead.
         let lease_state = Arc::clone(&self);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+        self.background_tasks.lock().unwrap().spawn(async move {
+            let mut failures: u32 = 0;
             loop {
-                interval.tick().await;
-                if let Err(e) = lease_state.broker.renew_logic_node_lease().await {
-                    warn!(error = %e, "failed to renew logic node lease");
+                match lease_state.broker.renew_logic_node_lease().await {
+                    Ok(_) => {
+                        failures = 0;
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to renew logic node lease");
+                        failures += 1;
+                        tokio::time::sleep(reconnect_backoff(failures)).await;
+                    }
                 }
             }
         });
@@ -825,7 +872,7 @@ impl LogicState {
         // keyspace). A lost key must never leave an active room ownerless
         // (BUG-P3-1).
         let rooms_state = Arc::clone(&self);
-        tokio::spawn(async move {
+        self.background_tasks.lock().unwrap().spawn(async move {
             let mut interval = tokio::time::interval(ROOM_LEASE_RENEW_INTERVAL);
             loop {
                 interval.tick().await;
@@ -838,7 +885,7 @@ impl LogicState {
         // If a node's lease expires (it crashed without publishing disconnects),
         // synthesize Disconnect for all its connections so their seats enter grace.
         let watch_state = Arc::clone(&self);
-        tokio::spawn(async move {
+        self.background_tasks.lock().unwrap().spawn(async move {
             let mut interval = tokio::time::interval(NODE_WATCH_INTERVAL);
             let mut misses: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
             loop {

@@ -508,6 +508,23 @@ impl Room {
             .rating_state(&black.player_id)
             .unwrap_or(black_before);
 
+        // Cross-node freshness (split-realtime multi-logic-node follow-up):
+        // a no-op for the monolith/single-node case, a real Redis mirror
+        // once more than one logic node is in play. Both mirrors run
+        // concurrently (QA finding: awaiting them one after the other would
+        // double the worst-case delay before either player sees the result
+        // if Redis is unreachable — bounded by `COMMAND_RESPONSE_TIMEOUT`
+        // either way, but no reason to pay it twice).
+        let (white_mirrored, black_mirrored) = tokio::join!(
+            self.services.rating_mirror.mirror(&white.player_id, white_state),
+            self.services.rating_mirror.mirror(&black.player_id, black_state),
+        );
+        for (device_id, result) in [(&white.player_id, white_mirrored), (&black.player_id, black_mirrored)] {
+            if let Err(err) = result {
+                tracing::error!(error = %err, device_id, "failed to mirror rating to Redis");
+            }
+        }
+
         let (status_wire, winner_wire) = terminal_status_fields(&self.status);
         let record = FinishedGame {
             game_id: uuid::Uuid::new_v4().to_string(),
@@ -567,6 +584,25 @@ impl Room {
         self.services.registry.remove_room(&self.code);
     }
 
+    /// Pull a fresher rating from the cross-node mirror before a new seat is
+    /// populated, so the rating shown in this room's `RoomReady`/`State`
+    /// snapshots (and used as the pre-game baseline, `apply_terminal_ratings`)
+    /// reflects this device's latest game even if it was owned by a
+    /// different logic node (split-realtime multi-logic-node follow-up).
+    /// A no-op for the monolith/single-node case (`NoopRatingMirror`).
+    /// Redis is always trusted over the local session when it has an entry:
+    /// the only way the local value could be fresher is if its own mirror
+    /// write failed, which is rarer than the staleness bug this exists to fix.
+    async fn refresh_rating_from_mirror(&self, player_id: &str) {
+        match self.services.rating_mirror.lookup(player_id).await {
+            Ok(Some(state)) => self.services.ratings.seed(player_id, state),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::error!(error = %err, player_id, "failed to look up mirrored rating");
+            }
+        }
+    }
+
     async fn handle_connect(
         &mut self,
         identity: Identity,
@@ -581,6 +617,7 @@ impl Room {
             // chosen at random (spec "Server Room Management") and reported in
             // the ready snapshot.
             let seat = creator_seat(self.services.random_colors);
+            self.refresh_rating_from_mirror(&player_id).await;
             self.seats[seat] = Some(Seat {
                 player_id,
                 account_id,
@@ -658,6 +695,7 @@ impl Room {
 
         // New player: the game starts and both clocks start at base, with
         // White to move regardless of which seat each player holds.
+        self.refresh_rating_from_mirror(&player_id).await;
         self.seats[seat] = Some(Seat {
             player_id,
             account_id,
@@ -1032,11 +1070,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use crate::application::ports::{
-        ChessEngine, EngineError, GameRecorder, Ratings, RecorderError, RoomRegistry,
+        ChessEngine, EngineError, GameRecorder, RatingMirror, Ratings, RecorderError, RoomRegistry,
         RatingSession, TimeSource,
     };
     use crate::domain::rating::RatingState;
@@ -1244,6 +1284,32 @@ mod tests {
         fn rating_state(&self, player_id: &str) -> Option<RatingState> {
             self.states.lock().unwrap().get(player_id).copied()
         }
+
+        fn seed(&self, player_id: &str, state: RatingState) {
+            self.states.lock().unwrap().insert(player_id.to_string(), state);
+        }
+    }
+
+    /// Mirrors nothing, matching `NoopRatingMirror` (infrastructure) without
+    /// pulling that crate's module into application-layer tests.
+    #[derive(Default)]
+    struct FakeRatingMirror;
+
+    impl RatingMirror for FakeRatingMirror {
+        fn mirror<'a>(
+            &'a self,
+            _device_id: &'a str,
+            _state: RatingState,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn lookup<'a>(
+            &'a self,
+            _device_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<RatingState>, RecorderError>> + Send + 'a>> {
+            Box::pin(async move { Ok(None) })
+        }
     }
 
     /// A controllable clock; the actor's grace window uses real time.
@@ -1374,6 +1440,7 @@ mod tests {
                 time: Arc::clone(&time) as Arc<dyn TimeSource>,
                 reconnect_grace: Duration::from_millis(300),
                 recorder: Arc::clone(&recorder) as Arc<dyn GameRecorder>,
+                rating_mirror: Arc::new(FakeRatingMirror),
                 auth: Arc::new(crate::infrastructure::auth::PlayerAuthStore::new()),
                 random_colors: false,
                 incremental_updates,

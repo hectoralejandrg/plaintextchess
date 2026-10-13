@@ -162,6 +162,8 @@ async fn run_transport(config: Config) {
     }
     // Close connections whose logic owner is lost, with a clear signal (GAP-P3-D).
     state.spawn_logic_watch();
+    // Detect a stalled (not just dead) inbound publish shard (QA finding).
+    state.spawn_publish_health_check();
 
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await
@@ -311,6 +313,8 @@ async fn run_combined(config: Config, mut app: Arc<App>) {
     // since this process is its own logic owner, but keeps combined mode
     // behaviorally identical to transport for a cross-node room's seat.
     transport_state.spawn_logic_watch();
+    // Detect a stalled (not just dead) inbound publish shard (QA finding).
+    transport_state.spawn_publish_health_check();
 
     let listener = tokio::net::TcpListener::bind((config.bind, config.port))
         .await

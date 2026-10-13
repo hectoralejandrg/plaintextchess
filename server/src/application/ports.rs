@@ -59,6 +59,34 @@ pub trait Ratings: Send + Sync {
     fn apply_result(&self, winner: &str, loser: &str, score: f64);
     /// The device's full Glicko-2 state, if the store knows it.
     fn rating_state(&self, player_id: &str) -> Option<RatingState>;
+    /// Replace a device's in-memory session with a persisted/mirrored state
+    /// (startup load, or a fresher cross-node value from `RatingMirror`).
+    fn seed(&self, player_id: &str, state: RatingState);
+}
+
+/// Cross-node rating freshness (split-realtime multi-logic-node follow-up):
+/// each logic node keeps its own local SQLite file (design D7 of
+/// `split-realtime-architecture`), so without this a player whose games get
+/// placed on different nodes would show a different rating per node.
+/// `NoopRatingMirror` (infrastructure) keeps the monolith and
+/// single-logic-node split deployments behavior-identical: no mirroring, no
+/// cross-node reads.
+pub trait RatingMirror: Send + Sync {
+    /// Mirror a just-updated rating so every logic node can see it. A
+    /// mirror failure is logged and swallowed by the caller, same blast
+    /// radius as a `GameRecorder` commit failure (design D7).
+    fn mirror<'a>(
+        &'a self,
+        device_id: &'a str,
+        state: RatingState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// The freshest known rating for a device, if any logic node has ever
+    /// mirrored one.
+    fn lookup<'a>(
+        &'a self,
+        device_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RatingState>, RecorderError>> + Send + 'a>>;
 }
 
 /// A one-line reason a finished-game commit failed (spec "Server
@@ -278,6 +306,9 @@ pub struct RoomServices {
     pub time: Arc<dyn TimeSource>,
     pub reconnect_grace: Duration,
     pub recorder: Arc<dyn GameRecorder>,
+    /// Cross-node rating freshness (`NoopRatingMirror` for the monolith and
+    /// single-logic-node deployments).
+    pub rating_mirror: Arc<dyn RatingMirror>,
     pub auth: SharedAuth,
     /// Whether the room creator's color is chosen at random (spec "Server Room
     /// Management"); `false` pins the creator to White (deterministic tests).

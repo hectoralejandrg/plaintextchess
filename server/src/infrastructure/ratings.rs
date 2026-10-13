@@ -92,6 +92,10 @@ impl Ratings for RatingStore {
     fn rating_state(&self, player_id: &str) -> Option<RatingState> {
         RatingStore::rating_state(self, player_id)
     }
+
+    fn seed(&self, player_id: &str, state: RatingState) {
+        RatingStore::seed(self, player_id, state)
+    }
 }
 
 #[cfg(test)]

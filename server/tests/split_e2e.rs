@@ -10,8 +10,14 @@
 //! The Phase 1 inbound channel is a single well-known channel, so these tests
 //! take a process-wide lock and serialize among themselves; run them with
 //! `--test-threads=1` (the `make test-split` target does).
+//!
+//! All `PORT_*` constants below live in 18765-18873 (QA finding
+//! `GAP-QA-R6-E`): don't manually run a `ws-server`/test server on a port in
+//! that range while this suite is running, or a bind collision will fail a
+//! test for a reason unrelated to the product.
 
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -66,10 +72,14 @@ const PORT_NO_LOGIC: u16 = 18819;
 const PORT_OWNERSHIP: u16 = 18821;
 const PORT_OFFLINE: u16 = 18823;
 const PORT_STALE: u16 = 18825;
-const PORT_RECLAIM: u16 = 18827;
-const PORT_OWNERLOSS_1: u16 = 18829;
-const PORT_OWNERLOSS_2: u16 = 18831;
-const PORT_LOST_MEMBERSHIP: u16 = 18833;
+// QA finding: these four used to literally duplicate PORT_ABANDON_1/2 and
+// PORT_CROSSLOGIC_1/2 below, causing intermittent TcpListener::bind races
+// between unrelated tests (whichever ran first hadn't necessarily released
+// the port before the next one bound it).
+const PORT_RECLAIM: u16 = 18867;
+const PORT_OWNERLOSS_1: u16 = 18869;
+const PORT_OWNERLOSS_2: u16 = 18871;
+const PORT_LOST_MEMBERSHIP: u16 = 18873;
 const PORT_ABANDON_1: u16 = 18827;
 const PORT_ABANDON_2: u16 = 18829;
 const PORT_CROSSLOGIC_1: u16 = 18831;
@@ -92,6 +102,7 @@ const PORT_COMBINED_SKIPS: u16 = 18857;
 const PORT_COMBINED_ORDER: u16 = 18859;
 const PORT_COMBINED_FALLBACK: u16 = 18861;
 const PORT_COMBINED_FALLBACK_EXTRA: u16 = 18863;
+const PORT_RATING_MIRROR: u16 = 18865;
 
 /// The Redis the split tests connect to: `REDIS_URL` when set (the design's
 /// gate), otherwise the local default.
@@ -122,6 +133,12 @@ struct TransportNode {
 struct Harness {
     transports: Vec<TransportNode>,
     _logic: JoinHandle<()>,
+    /// Kept so `Drop` can stop `LogicState::run()`'s internal background
+    /// tasks (QA finding: aborting `_logic` alone only interrupts its
+    /// reader-fan-out await; the lane workers, lease renewal, room-ownership
+    /// keep-alive, and liveness watcher it spawns internally keep running
+    /// and rewriting the shared test Redis for their TTL window otherwise).
+    logic: Arc<LogicState>,
     db_dir: PathBuf,
     /// The configured reconnect grace (design D11 timing invariant).
     grace: Duration,
@@ -131,8 +148,11 @@ impl Drop for Harness {
     fn drop(&mut self) {
         for t in &self.transports {
             t.serve.abort();
+            t.state.stop_liveness();
+            t.state.abort_background_tasks();
         }
         self._logic.abort();
+        self.logic.abort_background_tasks();
         let _ = std::fs::remove_dir_all(&self.db_dir);
     }
 }
@@ -201,8 +221,9 @@ async fn start_split_tuned(ports: &[u16], grace: Duration, room_lanes: usize) ->
         room_lanes,
     ));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let logic_for_run = Arc::clone(&logic);
     let logic_handle = tokio::spawn(async move {
-        let _ = logic.run(Some(ready_tx)).await;
+        let _ = logic_for_run.run(Some(ready_tx)).await;
     });
 
     // Yield and sleep to give the logic node's task a chance to run and subscribe
@@ -239,6 +260,7 @@ async fn start_split_tuned(ports: &[u16], grace: Duration, room_lanes: usize) ->
         state.spawn_dispatcher().await.expect("spawn dispatcher");
         state.spawn_liveness().await.expect("spawn liveness");
         state.spawn_logic_watch();
+        state.spawn_publish_health_check();
 
         let listener = TcpListener::bind((TEST_BIND, port)).await.expect("bind transport");
         let router = axum::Router::new()
@@ -266,6 +288,7 @@ async fn start_split_tuned(ports: &[u16], grace: Duration, room_lanes: usize) ->
     Harness {
         transports,
         _logic: logic_handle,
+        logic,
         db_dir,
         grace,
     }
@@ -279,6 +302,11 @@ struct CombinedHarness {
     extra_port: Option<u16>,
     node_id: String,
     _logic_task: JoinHandle<()>,
+    /// See `Harness::logic` — stops `LogicState::run()`'s internal
+    /// background tasks on `Drop`, not just the outer `run()` task.
+    logic: Arc<LogicState>,
+    transport: Arc<TransportState>,
+    extra_transport: Option<Arc<TransportState>>,
     _combined_serve: JoinHandle<()>,
     _extra_serve: Option<JoinHandle<()>>,
     db_dir: PathBuf,
@@ -287,6 +315,13 @@ struct CombinedHarness {
 impl Drop for CombinedHarness {
     fn drop(&mut self) {
         self._logic_task.abort();
+        self.logic.abort_background_tasks();
+        self.transport.stop_liveness();
+        self.transport.abort_background_tasks();
+        if let Some(t) = &self.extra_transport {
+            t.stop_liveness();
+            t.abort_background_tasks();
+        }
         self._combined_serve.abort();
         if let Some(h) = &self._extra_serve {
             h.abort();
@@ -326,6 +361,7 @@ async fn start_combined(port: u16, extra_port: Option<u16>) -> CombinedHarness {
     transport_state.spawn_dispatcher().await.expect("spawn dispatcher");
     transport_state.spawn_liveness().await.expect("spawn liveness");
     transport_state.spawn_logic_watch();
+    transport_state.spawn_publish_health_check();
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let logic_for_task = Arc::clone(&logic_state);
@@ -344,7 +380,7 @@ async fn start_combined(port: u16, extra_port: Option<u16>) -> CombinedHarness {
         axum::serve(listener, router).await.expect("serve combined");
     });
 
-    let extra_serve = if let Some(extra_port) = extra_port {
+    let (extra_serve, extra_transport) = if let Some(extra_port) = extra_port {
         let extra_node = generate_node_id("transport");
         let extra_broker = Arc::new(
             Broker::connect(&[redis_url.clone()], extra_node.clone())
@@ -355,17 +391,19 @@ async fn start_combined(port: u16, extra_port: Option<u16>) -> CombinedHarness {
         extra_state.spawn_dispatcher().await.expect("spawn extra dispatcher");
         extra_state.spawn_liveness().await.expect("spawn extra liveness");
         extra_state.spawn_logic_watch();
+        extra_state.spawn_publish_health_check();
         let extra_listener = TcpListener::bind((TEST_BIND, extra_port))
             .await
             .expect("bind extra transport");
         let extra_router = axum::Router::new()
             .route("/ws", axum::routing::get(transport_handler::ws_upgrade))
-            .with_state(extra_state);
-        Some(tokio::spawn(async move {
+            .with_state(extra_state.clone());
+        let serve = tokio::spawn(async move {
             axum::serve(extra_listener, extra_router).await.expect("serve extra transport");
-        }))
+        });
+        (Some(serve), Some(extra_state))
     } else {
-        None
+        (None, None)
     };
 
     // Let every node subscribe before the first client arrives.
@@ -376,6 +414,9 @@ async fn start_combined(port: u16, extra_port: Option<u16>) -> CombinedHarness {
         extra_port,
         node_id,
         _logic_task: logic_task,
+        logic: logic_state,
+        transport: transport_state,
+        extra_transport,
         _combined_serve: combined_serve,
         _extra_serve: extra_serve,
         db_dir,
@@ -502,6 +543,29 @@ async fn wait_for_logic_membership(port: u16, present: bool) -> bool {
             if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
                 let keys: redis::RedisResult<Vec<String>> = redis::cmd("KEYS")
                     .arg("ptc.logic_node.*")
+                    .query_async(&mut conn)
+                    .await;
+                if let Ok(keys) = keys {
+                    if (!keys.is_empty()) == present {
+                        return true;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
+}
+
+/// Wait (bounded) until a transport node's liveness lease (`ptc.node.*`) is
+/// present or absent, on a custom-port Redis (same shape as
+/// `wait_for_logic_membership`, for `survives_a_full_outage_past_the_lease_ttl`).
+async fn wait_for_node_membership(port: u16, present: bool) -> bool {
+    for _ in 0..100 {
+        if let Ok(client) = redis::Client::open(format!("redis://127.0.0.1:{port}")) {
+            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
+                let keys: redis::RedisResult<Vec<String>> = redis::cmd("KEYS")
+                    .arg("ptc.node.*")
                     .query_async(&mut conn)
                     .await;
                 if let Ok(keys) = keys {
@@ -1924,6 +1988,7 @@ async fn transport_closes_a_client_when_no_logic_is_subscribed() {
     state.spawn_dispatcher().await.expect("dispatcher");
     state.spawn_liveness().await.expect("liveness");
     state.spawn_logic_watch();
+    state.spawn_publish_health_check();
     let listener = TcpListener::bind((TEST_BIND, PORT_NO_LOGIC))
         .await
         .expect("bind");
@@ -2675,6 +2740,9 @@ async fn abandoned_connection_can_rejoin() {
 struct MultiLogicHarness {
     transports: Vec<TransportNode>,
     logics: Vec<JoinHandle<()>>,
+    /// See `Harness::logic` — stops each `LogicState::run()`'s internal
+    /// background tasks on `Drop`, not just the outer `run()` task.
+    logic_states: Vec<Arc<LogicState>>,
     logic_node_ids: Vec<String>,
     db_dirs: Vec<PathBuf>,
 }
@@ -2683,9 +2751,14 @@ impl Drop for MultiLogicHarness {
     fn drop(&mut self) {
         for t in &self.transports {
             t.serve.abort();
+            t.state.stop_liveness();
+            t.state.abort_background_tasks();
         }
         for l in &self.logics {
             l.abort();
+        }
+        for l in &self.logic_states {
+            l.abort_background_tasks();
         }
         for d in &self.db_dirs {
             let _ = std::fs::remove_dir_all(d);
@@ -2729,6 +2802,7 @@ async fn start_split_multi_logic(logic_count: usize, ports: &[u16]) -> MultiLogi
 
     // M logic instances, each with its own App and database.
     let mut logics = Vec::new();
+    let mut logic_states = Vec::new();
     let mut logic_node_ids = Vec::new();
     let mut db_dirs = Vec::new();
     for _ in 0..logic_count {
@@ -2752,14 +2826,16 @@ async fn start_split_multi_logic(logic_count: usize, ports: &[u16]) -> MultiLogi
         let app = Arc::new(app);
 
         let logic = Arc::new(LogicState::new(app, broker, node_id.clone(), 1, 1));
+        let logic_for_run = Arc::clone(&logic);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            let _ = logic.run(Some(ready_tx)).await;
+            let _ = logic_for_run.run(Some(ready_tx)).await;
         });
         // Wait until this instance has subscribed to its inbound
         // channel before starting the next, so membership is stable.
         ready_rx.await.expect("logic node ready signal");
         logics.push(handle);
+        logic_states.push(logic);
         logic_node_ids.push(node_id);
         db_dirs.push(db_dir);
     }
@@ -2777,6 +2853,7 @@ async fn start_split_multi_logic(logic_count: usize, ports: &[u16]) -> MultiLogi
         state.spawn_dispatcher().await.expect("spawn dispatcher");
         state.spawn_liveness().await.expect("spawn liveness");
         state.spawn_logic_watch();
+        state.spawn_publish_health_check();
 
         let listener = TcpListener::bind((TEST_BIND, port)).await.expect("bind transport");
         let router = axum::Router::new()
@@ -2804,6 +2881,7 @@ async fn start_split_multi_logic(logic_count: usize, ports: &[u16]) -> MultiLogi
     MultiLogicHarness {
         transports,
         logics,
+        logic_states,
         logic_node_ids,
         db_dirs,
     }
@@ -3189,6 +3267,128 @@ async fn logic_survives_a_broker_restart() {
     let _ = std::fs::remove_dir_all(&db_dir);
 }
 
+/// QA finding (`fix-multi-node-rating-consistency` D4): a prolonged full
+/// Redis outage — long enough for lease keys to actually expire (not just a
+/// pubsub-only disruption, which `logic_survives_a_broker_restart` and
+/// `split_mode_broker_loss_surfaces_and_recovers` already cover) — must not
+/// cause a transport node to repeatedly declare its own lease "lapsed while
+/// alive" more than once (the old two-command `EXISTS`+`SET EX` had a TOCTOU
+/// window for this), nor cause a logic node to give up and self-unregister
+/// before the outage ends (the old `MAX_SUBSCRIBE_FAILURES` budget was only
+/// ~17s). Runs real `ws-server` subprocesses (logic AND transport, unlike
+/// the existing broker-restart test) against a real, separately spawned
+/// `redis-server`, with the outage held past `liveness::TTL_SECS`/
+/// `membership::TTL_SECS` (30s).
+#[tokio::test]
+#[ignore]
+async fn survives_a_full_outage_past_the_lease_ttl() {
+    let _guard = e2e_guard();
+    let redis_port: u16 = 16401;
+    let logic_port: u16 = 18901;
+    let transport_port: u16 = 18902;
+
+    let db_dir = std::env::temp_dir().join(format!("ptc-outage-ttl-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&db_dir).expect("temp dir");
+    let transport_log = db_dir.join("transport.log");
+
+    let spawn_redis = || {
+        std::process::Command::new("redis-server")
+            .arg("--port")
+            .arg(redis_port.to_string())
+            .arg("--save")
+            .arg("")
+            .arg("--appendonly")
+            .arg("no")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn redis-server (required for this test)")
+    };
+
+    let mut redis = spawn_redis();
+    wait_for_redis(redis_port).await;
+
+    let mut logic = std::process::Command::new(env!("CARGO_BIN_EXE_ws-server"))
+        .env("TIER", "logic")
+        .env("REDIS_URL", format!("redis://127.0.0.1:{redis_port}"))
+        .env("DATABASE_URL", format!("sqlite:{}/outage.db", db_dir.display()))
+        .env("BIND", "127.0.0.1")
+        .env("PORT", logic_port.to_string())
+        .env("RECONNECT_GRACE_SECS", "90")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn ws-server (logic)");
+
+    let transport_log_file = std::fs::File::create(&transport_log).expect("create transport log");
+    let mut transport = std::process::Command::new(env!("CARGO_BIN_EXE_ws-server"))
+        .env("TIER", "transport")
+        .env("REDIS_URL", format!("redis://127.0.0.1:{redis_port}"))
+        .env("BIND", "127.0.0.1")
+        .env("PORT", transport_port.to_string())
+        .env("RECONNECT_GRACE_SECS", "90")
+        .env("RUST_LOG", "warn")
+        .stdout(std::process::Stdio::null())
+        .stderr(transport_log_file)
+        .spawn()
+        .expect("spawn ws-server (transport)");
+
+    assert!(
+        wait_for_logic_membership(redis_port, true).await,
+        "the logic node must register membership"
+    );
+    assert!(
+        wait_for_node_membership(redis_port, true).await,
+        "the transport node must register its liveness lease"
+    );
+
+    // A real outage, held past both lease TTLs (30s) so the keys actually
+    // expire in Redis, not just get missed by a client-side check.
+    let _ = redis.kill();
+    let _ = redis.wait();
+    tokio::time::sleep(Duration::from_secs(35)).await;
+
+    assert!(
+        logic.try_wait().expect("try_wait").is_none(),
+        "the logic tier must survive a 35s outage under the new retry budget, not exit early (QA finding: the old ~17s budget would have self-unregistered and exited here)"
+    );
+    assert!(
+        transport.try_wait().expect("try_wait").is_none(),
+        "the transport tier must survive a 35s outage, not exit"
+    );
+
+    // Bring the broker back: both tiers must reconnect and re-register.
+    redis = spawn_redis();
+    wait_for_redis(redis_port).await;
+    assert!(
+        wait_for_logic_membership(redis_port, true).await,
+        "the logic node must re-register after the broker returns"
+    );
+    assert!(
+        wait_for_node_membership(redis_port, true).await,
+        "the transport node must re-register its lease after the broker returns"
+    );
+
+    // Give the transport's 10s renewal loop a couple of ticks after recovery
+    // so any delayed/duplicate "lapsed" detection would have shown up.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let _ = logic.kill();
+    let _ = logic.wait();
+    let _ = transport.kill();
+    let _ = transport.wait();
+    let _ = redis.kill();
+    let _ = redis.wait();
+
+    let log = std::fs::read_to_string(&transport_log).unwrap_or_default();
+    let lapsed_count = log.matches("node lease had lapsed while alive").count();
+    let _ = std::fs::remove_dir_all(&db_dir);
+    assert!(
+        lapsed_count <= 1,
+        "a single real outage must cause at most one 'lease had lapsed' detection, not a repeated flap (QA finding: the old two-command EXISTS+SET EX had a TOCTOU window for this); saw {lapsed_count} in:\n{log}"
+    );
+}
+
 /// Shard the fabric follow-up: an inbound envelope is published through the
 /// Redis shard its `connection_id` hashes to, not any other shard, and a
 /// single connection's successive messages stay in order on its own shard.
@@ -3530,6 +3730,100 @@ async fn rooms_distributed_across_logic_nodes() {
     }
 }
 
+/// Regression test for the cross-node rating divergence gap: each logic
+/// instance keeps its own independent SQLite file, and `CreateRoom`
+/// placement round-robins across live logic nodes (same mechanism
+/// `rooms_distributed_across_logic_nodes` exercises above), so the same
+/// device can have consecutive games owned by different logic instances.
+/// Without the Redis rating mirror, the instance that never saw a device's
+/// previous game would show it the default 1500 instead of its real rating.
+#[tokio::test]
+#[ignore]
+async fn rating_survives_cross_node_room_placement() {
+    let _guard = e2e_guard();
+    let h = start_split_multi_logic(2, &[PORT_RATING_MIRROR]).await;
+    assert_eq!(h.logic_count(), 2, "two logic instances must be running");
+
+    let transport_port = h.port(0);
+    const DEVICE_A: &str = "device-rating-a";
+
+    let mut last_owner: Option<String> = None;
+    let mut rating_after_previous_game: Option<f64> = None;
+
+    // Create rooms for A against disposable opponents until two consecutive
+    // games land on different logic instances (round-robin placement on one
+    // transport node cycles through live logic nodes, same as
+    // `rooms_distributed_across_logic_nodes`).
+    for i in 0..8 {
+        let opponent = format!("device-rating-opp-{i}");
+
+        let mut a = connect(transport_port).await;
+        send(
+            &mut a,
+            ClientMessage::CreateRoom {
+                v: VERSION,
+                player_id: DEVICE_A.to_string(),
+                time_control: None,
+                token: None,
+            },
+        )
+        .await;
+        let (room_code, seated_rating) = match recv(&mut a, "A create", is_room_ready, 10).await {
+            ServerMessage::RoomReady { room_code, state, .. } => (room_code, state.white_rating),
+            other => panic!("expected RoomReady, got {other:?}"),
+        };
+
+        let owner = wait_room_owner(&room_code, true)
+            .await
+            .expect("room must have an owner");
+
+        if last_owner.as_deref().is_some_and(|prev| prev != owner.as_str()) {
+            // The regression this test exists to catch: without the mirror,
+            // this logic instance never saw A's previous game, so it would
+            // seat A at the default 1500 instead of A's real rating.
+            assert_eq!(
+                Some(seated_rating),
+                rating_after_previous_game,
+                "A's rating must carry over to a room owned by a different logic node"
+            );
+            return;
+        }
+        last_owner = Some(owner);
+
+        let mut b = connect(transport_port).await;
+        send(
+            &mut b,
+            ClientMessage::JoinRoom {
+                v: VERSION,
+                player_id: opponent,
+                room_code: room_code.clone(),
+                token: None,
+            },
+        )
+        .await;
+        recv(&mut b, "B join", is_room_ready, 10).await;
+        // The creator's "opponent now online" snapshot (always a full
+        // `State`, regardless of `incremental_updates`).
+        recv(&mut a, "A opponent online", |_| true, 10).await;
+
+        send(&mut b, ClientMessage::Resign { v: VERSION }).await;
+        let a_rating_after = match recv(
+            &mut a,
+            "A terminal result",
+            |m| matches!(m, ServerMessage::Update { status, .. } if *status != Status::Playing),
+            10,
+        )
+        .await
+        {
+            ServerMessage::Update { white_rating, .. } => white_rating,
+            other => panic!("expected a terminal update, got {other:?}"),
+        };
+        rating_after_previous_game = Some(a_rating_after);
+    }
+
+    panic!("A's rooms never landed on two different logic nodes within 8 tries");
+}
+
 async fn sample_rss_fds(pid: u32) -> (u64, u64) {
     #[cfg(target_os = "linux")]
     {
@@ -3543,16 +3837,16 @@ async fn sample_rss_fds(pid: u32) -> (u64, u64) {
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
-        let fd_count = tokio::fs::read_dir(format!("/proc/{pid}/fd"))
-            .await
-            .map(|mut d| {
-                let mut c = 0;
-                while d.next_entry().await.is_ok() {
+        let fd_count = match tokio::fs::read_dir(format!("/proc/{pid}/fd")).await {
+            Ok(mut d) => {
+                let mut c: u64 = 0;
+                while let Ok(Some(_)) = d.next_entry().await {
                     c += 1;
                 }
                 c
-            })
-            .unwrap_or(0);
+            }
+            Err(_) => 0,
+        };
         (rss_kb, fd_count)
     }
     #[cfg(target_os = "macos")]

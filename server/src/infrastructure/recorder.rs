@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
-use crate::application::ports::{GameRecorder, RecorderError, TournamentRecorder};
+use crate::application::ports::{
+    GameRecorder, RatingMirror, RatingState, RecorderError, TournamentRecorder,
+};
 use crate::domain::game_record::FinishedGame;
 
 /// The embedded versioned migrations (design D5): compiled from
@@ -26,6 +28,32 @@ impl GameRecorder for NoopGameRecorder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
     {
         Box::pin(async move { Ok(()) })
+    }
+}
+
+/// Mirrors nothing and always reports no mirrored value: the monolith
+/// (`TIER=all`) and any single-logic-node split deployment have no
+/// cross-node divergence to guard against, same role as `NoopGameRecorder`.
+#[derive(Default)]
+pub struct NoopRatingMirror;
+
+impl RatingMirror for NoopRatingMirror {
+    fn mirror<'a>(
+        &'a self,
+        _device_id: &'a str,
+        _state: RatingState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        _device_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<RatingState>, RecorderError>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(None) })
     }
 }
 
