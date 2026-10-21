@@ -117,3 +117,35 @@ Profiles the *monolith's* (`TIER=all`) setup ceiling, adjacent to R6-D.
   event-loop / scheduler starvation in the accept/setup path under raw task +
   connection count (same family as R6-D). The instrumentation was reverted and
   `shard-room-registry-locks` is closed with this negative result.
+
+---
+
+## Round 7 (2026-10-21) — the authentication change does not move the move path
+
+- Head: `118c9ec` (working tree: the `lichess-like-auth` change, uncommitted).
+- Host: Apple M2 Max, 12 cores, macOS 26.6.2 (not idle; `caffeinate -is`).
+- **Question** (`lichess-like-auth`): the change adds an email-backed account
+  system, a rate limiter, a mail transport and a client-address resolution to
+  the server. Does it cost the move path any throughput or latency?
+- **Method**: an A/B on the same host, alternating the two builds. The
+  baseline is `git archive HEAD` extracted to a temp directory (the working
+  tree is never touched) and built with the same command; the current build is
+  the working tree. Both are `--release`, both run the monolith
+  (`TIER=all`, `chess-server`) on their own port with their own SQLite file,
+  and both are driven by the repo's own `load_gen` with the same parameters as
+  the round-6 baseline (2000 games, pace 25 ms, saturating). 12 rounds per
+  variant, alternating, 90 s apart so the previous run's sockets leave
+  `TIME_WAIT` (without that pause the ephemeral port range is exhausted and
+  the later rounds seat no games at all — the same effect measured in the
+  round-6 note about 16k ports per source).
+- **Result**: 2000/2000 games seated in every round of both variants.
+  Throughput 59,334 vs 58,784 moves/s (**-0.93 %, 0.52 sigma**); ack p50
+  31.6 vs 31.4 ms (**-0.79 %, 0.81 sigma**); ack p95 36.9 vs 39.4 ms
+  (**+6.95 %, 1.20 sigma** — inside the run-to-run spread, whose own
+  intra-variant deviation is 5.4 ms). The host's own spread within a
+  variant is 2.4k moves/s, so the difference is far below the noise floor.
+- **Verdict**: **no measurable regression.** The move path is unchanged: the
+  chess core has zero diff, the room actor and the engine have zero diff, and
+  the only per-frame cost the change had introduced — a clone of the
+  forwarding header on every inbound frame — was removed by resolving the
+  client address once per connection, at the upgrade.
