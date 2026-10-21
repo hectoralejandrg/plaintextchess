@@ -7,10 +7,7 @@ The client SHALL send `register`, `login`, `logout`, and `set_profile` messages
 over the existing WebSocket endpoint (`wss://<host>/ws` in the TLS deployment,
 `ws://` against a local server), using protocol version `1` (`"v":1`). The
 messages SHALL follow the wire format defined in the server protocol
-(`server/src/interface/protocol.rs`). The client SHALL also send the
-email-related messages (`forgot_password`, `reset_password`, `change_email`,
-`verify_email`) in the same protocol version, and SHALL only offer the flows
-that the server it is talking to actually supports.
+(`server/src/interface/protocol.rs`).
 
 #### Scenario: Guest plays without authentication
 - **WHEN** a user opens the app and selects an online mode without sending any authentication message
@@ -23,12 +20,7 @@ that the server it is talking to actually supports.
 ### Requirement: Client can register an account
 The client SHALL provide a `register` message that includes `username`,
 `email`, and `password`, and SHALL receive a `Session` message containing a
-`token` when the account is created. If the username or the email is already
-taken, the client SHALL receive the matching error code (`username_taken` or
-`email_taken`), and if a field is malformed, the matching validation error,
-which names the offending field in a machine-readable field. The client SHALL
-keep the registration form open after a refusal, SHALL mark the field the
-error names, and SHALL keep what the player typed.
+`token` when the account is created.
 
 #### Scenario: Registration succeeds
 - **WHEN** the user submits a valid username, a valid email address, and a valid password (8-128 chars) through the client UI
@@ -50,10 +42,7 @@ error names, and SHALL keep what the player typed.
 The client SHALL provide a `login` message that includes the identifier the
 player typed and a `password`, and SHALL receive `Session` with a `token` when
 the credentials match. The identifier MAY be the account's username or its
-email address. If the identifier is unknown or the password is wrong, the
-client SHALL receive `invalid_credentials` with the identical generic message
-(`"That username and password do not match an account"`) and no session is
-issued. The client SHALL offer a single field for the identifier.
+email address, and the client SHALL offer a single field for it.
 
 #### Scenario: Login succeeds
 - **WHEN** the user submits existing credentials
@@ -82,6 +71,38 @@ also discard the session the client stored, so the app comes back signed out.
 - **THEN** the app starts as a guest, with no stored session presented
 
 ## ADDED Requirements
+
+### Requirement: Client sends the email-related messages
+The client SHALL send the email-related messages (`forgot_password`,
+`reset_password`, `change_email`, `verify_email`) in the same protocol
+version, and SHALL only offer the flows that the server it is talking to
+actually supports.
+
+#### Scenario: The email flows use the same protocol version
+- **WHEN** the client sends a password-reset request
+- **THEN** the message carries the protocol version the game messages carry
+
+### Requirement: A refused registration is shown on the form
+If the username or the email is already taken, the client SHALL receive the
+matching error code (`username_taken` or `email_taken`), and if a field is
+malformed, the matching validation error, which names the offending field in a
+machine-readable field. The client SHALL keep the registration form open after a
+refusal, SHALL mark the field the error names, and SHALL keep what the player
+typed.
+
+#### Scenario: The form keeps what the player typed
+- **WHEN** a registration is refused
+- **THEN** the form stays open with the fields the player filled in, and the field the error names is marked
+
+### Requirement: A refused sign-in says nothing about the account
+If the identifier is unknown or the password is wrong, the client SHALL receive
+`invalid_credentials` with the identical generic message
+(`"That username and password do not match an account"`) and no session is
+issued.
+
+#### Scenario: The message does not say whether the account exists
+- **WHEN** a sign-in is refused for an identifier that belongs to no account
+- **THEN** the client shows the same message it would show for an account that exists with a wrong password
 
 ### Requirement: Client keeps the session across launches
 The client SHALL store the session token in the platform's secure storage — the
