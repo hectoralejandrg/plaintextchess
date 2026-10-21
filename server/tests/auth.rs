@@ -275,6 +275,18 @@ async fn assert_silent(client: &mut WsClient) {
     }
 }
 
+/// A fresh email address for a registration.
+///
+/// The address is unique per call, so two tests that register the same
+/// username in different cases do not collide on the address (which is unique
+/// across accounts).
+fn fresh_email(username: &str) -> String {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let local = username.to_lowercase().replace(['_', ' '], "-");
+    format!("{local}-{count}@example.test")
+}
+
 async fn register(
     client: &mut WsClient,
     username: &str,
@@ -286,6 +298,7 @@ async fn register(
         &ClientMessage::Register {
             v: 1,
             username: username.into(),
+            email: Some(fresh_email(username)),
             password: password.into(),
             device_id: device_id.map(str::to_string),
         },
@@ -304,7 +317,8 @@ async fn login(
         client,
         &ClientMessage::Login {
             v: 1,
-            username: username.into(),
+            username: None,
+            identifier: Some(username.into()),
             password: password.into(),
             device_id: device_id.map(str::to_string),
         },
@@ -430,8 +444,8 @@ async fn registration_issues_a_usable_session_without_storing_the_password() {
     else {
         panic!("expected a session");
     };
-    assert_eq!(username, "Ana");
-    assert_eq!(display_name, "Ana", "the display name defaults to the username");
+    assert_eq!(username, "ana", "the username is stored lowercase");
+    assert_eq!(display_name, "ana", "the display name defaults to the username");
     assert!(*expires_at_ms > 0, "a session must say when it expires");
     assert!(!token.is_empty(), "a session must carry a token");
 
@@ -684,8 +698,8 @@ async fn logout_revokes_only_the_presented_session() {
             expires_at_ms,
         } => {
             assert_eq!(ended, account_id);
-            assert_eq!(username, "Ana");
-            assert_eq!(display_name, "Ana");
+            assert_eq!(username, "ana");
+            assert_eq!(display_name, "ana");
             assert!(expires_at_ms > 0, "the answer says when the session ended");
         }
         other => panic!("expected session_ok, got {other:?}"),

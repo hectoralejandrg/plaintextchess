@@ -31,9 +31,35 @@ services:
       RECONNECT_GRACE_SECS: ${RECONNECT_GRACE_SECS:-30}
       SESSION_TTL_SECS: ${SESSION_TTL_SECS:-2592000}
       RUST_LOG: ${RUST_LOG:-info}
+      # The mail transport and the address its links are built from
+      # (spec "Pluggable Email Delivery"). The credential itself is a
+      # mounted file, not an environment value (design D5).
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-resend}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-plaintextchess://app}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-production}
+      HIBP_ENABLED: ${HIBP_ENABLED:-1}
+      # The proxies whose forwarding header may be trusted: the address the
+      # rate limit keys on comes from it, and only from them (spec
+      # "Authentication Rate Limiting").
+      # The networks whose forwarding header may be trusted. Empty means the
+      # rate limit keys on the proxy's own address, so every player behind it
+      # shares one bucket.
+      AUTH_TRUSTED_PROXY_CIDRS: ${AUTH_TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
     volumes:
       # Persistent state (design D5): ratings, games, accounts, sessions.
       - server-data:/data
+      # The provider's credential, read from a file so it never appears in
+      # the container's environment (design D5). The file must exist: the
+      # deployment refuses to start without it rather than silently running
+      # with no credential. `cp secrets/resend_key.example secrets/resend_key`.
+      - type: bind
+        source: ./secrets/resend_key
+        target: /run/secrets/resend_key
+        read_only: true
+        bind:
+          create_host_path: false
     # Restart behavior and a stop grace period long enough for a clean
     # shutdown of in-flight requests (spec "Operational Lifecycle").
     restart: unless-stopped

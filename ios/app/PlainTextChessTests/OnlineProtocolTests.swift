@@ -77,10 +77,10 @@ final class OnlineProtocolTests: XCTestCase {
             .move(uci: "g7h8q"),
             .resign,
             .leave,
-            .register(username: "ana", password: "passw0rd", deviceID: "device-a"),
-            .register(username: "ana", password: "passw0rd", deviceID: nil),
-            .login(username: "ana", password: "passw0rd", deviceID: "device-a"),
-            .login(username: "ana", password: "passw0rd", deviceID: nil),
+            .register(username: "ana", email: "ana@example.com", password: "passw0rd", deviceID: "device-a"),
+            .register(username: "ana", email: "ana@example.com", password: "passw0rd", deviceID: nil),
+            .login(identifier: "ana", password: "passw0rd", deviceID: "device-a"),
+            .login(identifier: "ana", password: "passw0rd", deviceID: nil),
             .logout(token: "tok-123"),
             .setProfile(token: "tok-123", displayName: "Ana"),
         ] {
@@ -94,7 +94,7 @@ final class OnlineProtocolTests: XCTestCase {
 
     func testRegisterEncodingCarriesTheDeviceID() throws {
         let json = try OnlineCodec.encodeClient(
-            .register(username: "ana", password: "passw0rd", deviceID: "device-a"))
+            .register(username: "ana", email: "ana@example.com", password: "passw0rd", deviceID: "device-a"))
         let object = try jsonObject(json)
         XCTAssertEqual(object["type"] as? String, "register")
         XCTAssertEqual(object["v"] as? Int, 1)
@@ -105,10 +105,10 @@ final class OnlineProtocolTests: XCTestCase {
 
     func testLoginOmitsAnUnknownDeviceID() throws {
         let json = try OnlineCodec.encodeClient(
-            .login(username: "ana", password: "passw0rd", deviceID: nil))
+            .login(identifier: "ana", password: "passw0rd", deviceID: nil))
         let object = try jsonObject(json)
         XCTAssertEqual(object["type"] as? String, "login")
-        XCTAssertEqual(object["username"] as? String, "ana")
+        XCTAssertEqual(object["identifier"] as? String, "ana")
         XCTAssertNil(object["device_id"], "an unknown device must omit the field, not send null")
     }
 
@@ -116,7 +116,7 @@ final class OnlineProtocolTests: XCTestCase {
         let json = """
         {"v":1,"type":"session","account_id":"a1","username":"ana","display_name":"Ana","token":"tok-123","expires_at_ms":1700000000000}
         """
-        guard case .session(let token) = try OnlineCodec.decodeServer(json) else {
+        guard case .session(let token, _, _, _) = try OnlineCodec.decodeServer(json) else {
             return XCTFail("expected session")
         }
         XCTAssertEqual(token, "tok-123")
@@ -128,7 +128,7 @@ final class OnlineProtocolTests: XCTestCase {
         let json = """
         {"v":1,"type":"error","code":"invalid_credentials","message":"That username and password do not match an account"}
         """
-        guard case .error(let code, let message) = try OnlineCodec.decodeServer(json) else {
+        guard case .error(let code, let message, _) = try OnlineCodec.decodeServer(json) else {
             return XCTFail("expected error")
         }
         XCTAssertEqual(code, .invalidCredentials)
@@ -301,7 +301,7 @@ final class OnlineProtocolTests: XCTestCase {
             let json = """
             {"v":1,"type":"error","code":"\(code.rawValue)","message":"\(code.displayMessage)"}
             """
-            guard case .error(let decoded, let message) = try OnlineCodec.decodeServer(json) else {
+            guard case .error(let decoded, let message, _) = try OnlineCodec.decodeServer(json) else {
                 XCTFail("expected error for \(code)")
                 continue
             }
@@ -342,5 +342,123 @@ final class OnlineProtocolTests: XCTestCase {
                 return XCTFail("unexpected error \(error)")
             }
         }
+    }
+
+    // MARK: - The authentication flows
+
+    func testRegisterCarriesTheEmail() throws {
+        let json = try OnlineCodec.encodeClient(
+            .register(username: "ana", email: "ana@example.com", password: "correct horse battery", deviceID: "device-a")
+        )
+        let object = try jsonObject(json)
+        XCTAssertEqual(object["type"] as? String, "register")
+        XCTAssertEqual(object["username"] as? String, "ana")
+        XCTAssertEqual(object["email"] as? String, "ana@example.com")
+        XCTAssertEqual(object["password"] as? String, "correct horse battery")
+    }
+
+    func testRegisterWithoutAnEmailOmitsTheField() throws {
+        let json = try OnlineCodec.encodeClient(
+            .register(username: "ana", email: "", password: "correct horse battery", deviceID: nil)
+        )
+        let object = try jsonObject(json)
+        XCTAssertNil(object["email"], "an unset address must be absent, not null")
+    }
+
+    func testLoginCarriesTheIdentifier() throws {
+        let json = try OnlineCodec.encodeClient(
+            .login(identifier: "ana@example.com", password: "correct horse battery", deviceID: nil)
+        )
+        let object = try jsonObject(json)
+        XCTAssertEqual(object["type"] as? String, "login")
+        XCTAssertEqual(object["identifier"] as? String, "ana@example.com")
+    }
+
+    func testLoginCarriesTheLegacyUsernameToo() throws {
+        let json = try OnlineCodec.encodeClient(
+            .login(identifier: "ana", password: "correct horse battery", deviceID: nil)
+        )
+        let object = try jsonObject(json)
+        XCTAssertEqual(object["identifier"] as? String, "ana")
+        XCTAssertEqual(
+            object["username"] as? String, "ana",
+            "a server that only knows the legacy field must still be able to decode the frame"
+        )
+    }
+
+    func testTheEmailFlowsEncode() throws {
+        let resume = try jsonObject(try OnlineCodec.encodeClient(.resumeSession(token: "t")))
+        XCTAssertEqual(resume["type"] as? String, "resume_session")
+        XCTAssertEqual(resume["token"] as? String, "t")
+
+        let forgot = try jsonObject(try OnlineCodec.encodeClient(.forgotPassword(email: "ana@example.com")))
+        XCTAssertEqual(forgot["type"] as? String, "forgot_password")
+
+        let reset = try jsonObject(try OnlineCodec.encodeClient(.resetPassword(token: "t", password: "p")))
+        XCTAssertEqual(reset["type"] as? String, "reset_password")
+
+        let verify = try jsonObject(try OnlineCodec.encodeClient(.verifyEmail(token: "t")))
+        XCTAssertEqual(verify["type"] as? String, "verify_email")
+
+        let resend = try jsonObject(try OnlineCodec.encodeClient(.resendVerification(token: "t")))
+        XCTAssertEqual(resend["type"] as? String, "resend_verification")
+
+        let change = try jsonObject(try OnlineCodec.encodeClient(.changeEmail(token: "t", email: "new@example.com")))
+        XCTAssertEqual(change["type"] as? String, "change_email")
+    }
+
+    func testAnErrorCarriesTheFieldItRefused() throws {
+        let json = """
+        {"type":"error","v":1,"code":"invalid_request","message":"that is not a valid email address","field":"email"}
+        """
+        let message = try OnlineCodec.decodeServer(json)
+        guard case .error(let code, let text, let field) = message else {
+            return XCTFail("expected an error, got \(message)")
+        }
+        XCTAssertEqual(code, .invalidRequest)
+        XCTAssertEqual(text, "that is not a valid email address")
+        XCTAssertEqual(field, "email", "the refused field is named machine-readably")
+    }
+
+    func testASessionCarriesTheVerificationState() throws {
+        let json = """
+        {"type":"session","v":1,"account_id":"a","username":"ana","display_name":"ana","token":"t","expires_at_ms":1,"email_verified":true}
+        """
+        let message = try OnlineCodec.decodeServer(json)
+        guard case .session(let token, let username, let displayName, let emailVerified) = message else {
+            return XCTFail("expected a session, got \(message)")
+        }
+        XCTAssertEqual(token, "t")
+        XCTAssertEqual(username, "ana")
+        XCTAssertEqual(displayName, "ana")
+        XCTAssertTrue(emailVerified)
+    }
+
+    func testTheEmailRepliesDecode() throws {
+        let reset = try OnlineCodec.decodeServer("{\"type\":\"password_reset_requested\",\"v\":1}")
+        guard case .passwordResetRequested = reset else {
+            return XCTFail("expected a reset acknowledgement, got \(reset)")
+        }
+        let verified = try OnlineCodec.decodeServer("{\"type\":\"email_verified\",\"v\":1,\"email_verified\":true}")
+        guard case .emailVerified(let emailVerified) = verified else {
+            return XCTFail("expected a confirmation, got \(verified)")
+        }
+        XCTAssertTrue(emailVerified)
+    }
+
+    // MARK: - The stored session
+
+    func testTheSessionStoreRoundTrips() {
+        SessionStore.clear()
+        XCTAssertNil(SessionStore.load(), "nothing is stored at first")
+
+        SessionStore.save(token: "a-token")
+        XCTAssertEqual(SessionStore.load(), "a-token")
+
+        SessionStore.save(token: "another-token")
+        XCTAssertEqual(SessionStore.load(), "another-token", "the last token wins")
+
+        SessionStore.clear()
+        XCTAssertNil(SessionStore.load(), "signing out discards the stored session")
     }
 }

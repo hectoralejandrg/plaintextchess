@@ -177,10 +177,33 @@ final class GameViewModel: ObservableObject {
     /// The last register/login failure, shown in the new-game sheet (e.g.
     /// the server's generic `invalid_credentials` message).
     @Published private(set) var authError: String?
+    /// The field the last refusal named, so the form can mark the right
+    /// input (spec "Authentication Error Codes").
+    @Published private(set) var authField: String?
+    /// Whether the signed-in account's email address is confirmed (spec
+    /// "Email Verification").
+    @Published private(set) var authEmailVerified = false
+    /// The signed-in account's name, as the server reports it.
+    @Published private(set) var authAccountName: String?
+    /// Whether the session is kept across app launches (spec "Client keeps
+    /// the session across launches"). The player's choice, honored as
+    /// written.
+    @Published var keepSession = true {
+        didSet { SessionStore.setKeepSession(keepSession) }
+    }
+    /// The authentication features the server reports it supports (spec
+    /// "Client degrades when the server lacks a feature"). Empty means the
+    /// server supports no optional feature: either it is an older one, or
+    /// the probe did not answer.
+    @Published private(set) var serverFeatures: Set<String> = []
     /// The auth reply expected next: register/login store the issued token,
     /// logout clears it (task 3.1), set_profile records the display name
     /// (task 3.2).
-    private enum AuthPendingAction { case login, register, logout, setProfile }
+    private enum AuthPendingAction {
+        case login, register, logout, setProfile
+        case resume, forgotPassword, resetPassword
+        case verifyEmail, resendVerification, changeEmail
+    }
     private var pendingAuthAction: AuthPendingAction = .login
     /// The trimmed `display_name` submitted for the `set_profile` in flight,
     /// recorded on `profile_updated` (task 3.2).
@@ -277,9 +300,16 @@ final class GameViewModel: ObservableObject {
     }
     #endif
 
+    /// The session token the keychain holds, read once at startup. It is the
+    /// token the app resumes with (spec "Client keeps the session across
+    /// launches").
+    private var storedSessionToken: String?
+
     init() {
         let session = newGameSession(initialRating: 1500.0)
         self.session = session
+        self.storedSessionToken = SessionStore.load()
+        self.keepSession = SessionStore.keepSession()
         do {
             self.board = try FenBoard(board: session.getBoardState(), sideToMove: toMove)
             refreshStatus()
@@ -768,6 +798,12 @@ final class GameViewModel: ObservableObject {
     /// was persisted mid-game, re-attach to it on startup so the server's
     /// reconnect window can resume the game on this device.
     func restoreOnlineSessionIfNeeded(serverURLString: String?) {
+        // The server's features are needed before any flow is offered, so
+        // the probe goes first (spec "Client degrades when the server lacks a
+        // feature"). The resume waits for the answer: a server that does not
+        // know the message would close the connection on the frame.
+        probeServerFeatures(serverURLString: serverURLString)
+
         // A persisted in-progress room wins over the fresh local default game
         // (which always has zero moves at startup, design D8).
         guard moveList.isEmpty else { return }
@@ -841,6 +877,12 @@ final class GameViewModel: ObservableObject {
         manager.onAuthResult = { [weak self] success, payload in
             self?.handleAuthResult(success: success, payload: payload)
         }
+        manager.onAuthField = { [weak self] field in
+            self?.authField = field
+        }
+        manager.onAuthRefusal = { [weak self] refused in
+            self?.pendingAuthErrorIsRefusal = refused
+        }
         online = manager
     }
 
@@ -849,28 +891,96 @@ final class GameViewModel: ObservableObject {
     /// Log in with an existing account (task 2.3): the server answers
     /// `Session` (token) or `invalid_credentials` carrying the generic
     /// message. No-op while already signed in; guest play is unaffected.
-    func doLogin(username: String, password: String, serverURLString: String?) {
+    func doLogin(identifier: String, password: String, serverURLString: String?) {
         guard authToken == nil else { return }
         guard ensureAuthConnection(serverURLString: serverURLString) else {
             authError = "No online server configured."
             return
         }
         authError = nil
+        authField = nil
         pendingAuthAction = .login
-        online?.startLogin(username: username, password: password)
+        online?.startLogin(identifier: identifier, password: password)
     }
 
     /// Register a new account (task 2.1): the server answers `Session`
     /// (token) or `username_taken`. Same connection rules as `doLogin`.
-    func doRegister(username: String, password: String, serverURLString: String?) {
+    func doRegister(username: String, email: String, password: String, serverURLString: String?) {
         guard authToken == nil else { return }
         guard ensureAuthConnection(serverURLString: serverURLString) else {
             authError = "No online server configured."
             return
         }
         authError = nil
+        authField = nil
         pendingAuthAction = .register
-        online?.startRegister(username: username, password: password)
+        online?.startRegister(username: username, email: email, password: password)
+    }
+
+    /// Ask for a password-reset link (spec "Client offers password reset").
+    ///
+    /// The answer never says whether the address is registered, and the
+    /// player is not signed in by asking.
+    func doForgotPassword(email: String, serverURLString: String?) {
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        authField = nil
+        pendingAuthAction = .forgotPassword
+        online?.startForgotPassword(email: email)
+    }
+
+    /// Set a new password with a reset token (spec "Client offers password
+    /// reset"). The player is not signed in by resetting.
+    func doResetPassword(token: String, password: String, serverURLString: String?) {
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        authField = nil
+        pendingAuthAction = .resetPassword
+        online?.startResetPassword(token: token, password: password)
+    }
+
+    /// Confirm the signed-in account's email address.
+    func doVerifyEmail(token: String, serverURLString: String?) {
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        authField = nil
+        pendingAuthAction = .verifyEmail
+        online?.startVerifyEmail(token: token)
+    }
+
+    /// Ask for another verification message.
+    func doResendVerification(serverURLString: String?) {
+        guard let token = authToken else { return }
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        pendingAuthAction = .resendVerification
+        online?.startResendVerification(token: token)
+    }
+
+    /// Ask for a different email address (spec "Email Change"). The current
+    /// address stays in force until the new one is confirmed.
+    func doChangeEmail(email: String, serverURLString: String?) {
+        guard let token = authToken else { return }
+        guard ensureAuthConnection(serverURLString: serverURLString) else {
+            authError = "No online server configured."
+            return
+        }
+        authError = nil
+        authField = nil
+        pendingAuthAction = .changeEmail
+        online?.startChangeEmail(token: token, email: email)
     }
 
     /// Log out (task 3.1): sends the token, expects `session_ok`, and
@@ -917,6 +1027,11 @@ final class GameViewModel: ObservableObject {
         online?.startSetProfile(displayName: trimmed)
     }
 
+    /// Whether the last refusal was the server refusing the session (an
+    /// unknown, expired, or revoked token) rather than a connection
+    /// failure. Only a refusal means the stored session is stale.
+    private var pendingAuthErrorIsRefusal = false
+
     /// Apply the reply of the auth action in flight: register/login store
     /// the issued token; logout clears it; any refusal keeps the connection
     /// open (guest play continues) and surfaces the server's message in
@@ -927,14 +1042,53 @@ final class GameViewModel: ObservableObject {
             if success {
                 if let token = payload {
                     authToken = token
+                    // The token is kept only when the player asked for it
+                    // (spec "Client keeps the session across launches"). A
+                    // token that is already stored is discarded when the
+                    // choice is declined.
+                    if keepSession {
+                        SessionStore.save(token: token)
+                    } else {
+                        SessionStore.clear()
+                    }
+                }
+                // The account's name and its verification state, as the
+                // server reported them.
+                if let manager = online {
+                    authAccountName = manager.accountName.isEmpty ? nil : manager.accountName
+                    authEmailVerified = manager.emailVerified
                 }
                 authError = nil
+                authField = nil
             } else {
                 authError = payload ?? "Authentication failed"
+            }
+        case .resume:
+            // The stored session is still good: the player is signed in
+            // again, with no new token.
+            if success {
+                authToken = storedSessionToken
+                authError = nil
+                authField = nil
+            } else {
+                // A stale token is discarded: the player continues as a
+                // guest and can sign in again. A connection failure is not
+                // a refusal, and must not sign the player out.
+                if pendingAuthErrorIsRefusal {
+                    SessionStore.clear()
+                    storedSessionToken = nil
+                }
+                authToken = nil
+                authError = nil
             }
         case .logout:
             if success {
                 authToken = nil
+                authEmailVerified = false
+                authAccountName = nil
+                // Signing out discards the stored session too.
+                SessionStore.clear()
+                storedSessionToken = nil
                 authError = nil
             } else {
                 authError = payload ?? "Logout failed"
@@ -948,7 +1102,93 @@ final class GameViewModel: ObservableObject {
                 pendingDisplayName = nil
                 authError = payload ?? "Could not update profile"
             }
+        case .forgotPassword:
+            // The answer is the same for a registered and an unregistered
+            // address: the player is told the message is on its way, and
+            // nothing else.
+            authError = nil
+            authField = nil
+        case .resetPassword:
+            // A reset does not sign the player in.
+            authError = success ? nil : (payload ?? "Could not reset the password")
+        case .verifyEmail, .resendVerification:
+            authError = success ? nil : (payload ?? "Could not send the confirmation")
+        case .changeEmail:
+            authError = success ? nil : (payload ?? "Could not change the email address")
         }
+    }
+
+    /// Resume the session the keychain holds, when there is one.
+    ///
+    /// The server answers with the account it resolved, and no new token: a
+    /// resumed session is the same session the player already had.
+    func resumeStoredSession(serverURLString: String?) {
+        guard authToken == nil, let token = storedSessionToken, !token.isEmpty else { return }
+        guard ensureAuthConnection(serverURLString: serverURLString) else { return }
+        authError = nil
+        pendingAuthAction = .resume
+        online?.startResumeSession(token: token)
+    }
+
+    /// Read the server's advertised authentication features.
+    ///
+    /// The probe is a plain HTTPS request to the same origin as the game
+    /// connection. A server that does not answer, or answers without the
+    /// list, is treated as supporting no optional feature: the flows that
+    /// need one are hidden rather than offered and refused.
+    func probeServerFeatures(serverURLString: String?) {
+        guard let urlString = serverURLString,
+              let url = Self.healthURL(for: urlString)
+        else {
+            serverFeatures = []
+            return
+        }
+        var request = URLRequest(url: url)
+        // A short timeout: the feature list is optional, so a slow server
+        // must not hold the request (spec "Client degrades when the server
+        // lacks a feature").
+        request.timeoutInterval = 5
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            let features: Set<String>
+            if let data,
+               let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let names = body["auth_features"] as? [String] {
+                features = Set(names)
+            } else {
+                features = []
+            }
+            DispatchQueue.main.async {
+                self?.serverFeatures = features
+                // A stored session is resumed only against a server that
+                // supports the message: the player who signed in stays
+                // signed in, and the connection is never spent on a frame
+                // the server would refuse (spec "Client keeps the session
+                // across launches").
+                if features.contains("session_resumption") {
+                    self?.resumeStoredSession(serverURLString: serverURLString)
+                }
+            }
+        }.resume()
+    }
+
+    /// The readiness URL for a game server address: the same origin, without
+    /// the WebSocket path.
+    static func healthURL(for serverURLString: String) -> URL? {
+        guard var components = URLComponents(string: serverURLString) else { return nil }
+        switch components.scheme {
+        case "wss", "https": components.scheme = "https"
+        default: components.scheme = "http"
+        }
+        components.path = "/healthz"
+        components.query = nil
+        components.fragment = nil
+        return components.url
+    }
+
+    /// Whether the server supports a feature (spec "Client degrades when the
+    /// server lacks a feature").
+    func serverSupports(_ feature: String) -> Bool {
+        serverFeatures.contains(feature)
     }
 
     /// A usable socket for authentication: reuse the open online connection

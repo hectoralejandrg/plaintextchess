@@ -1,6 +1,7 @@
 package com.hectoralejandrg.plaintextchess
 
 import android.content.Context
+import java.net.URL
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -216,6 +217,22 @@ class GameViewModel(private val context: Context) {
 
     /** Protocol token after register/login; null while guest (device_id play). */
     var authToken by mutableStateOf<String?>(null)
+    /** The field a refused request named, so the form can mark the right
+     * input (spec "Authentication Error Codes"). */
+    var authField by mutableStateOf<String?>(null)
+    /** Whether the signed-in account's email address is confirmed (spec
+     * "Email Verification"). */
+    var authEmailVerified by mutableStateOf(false)
+    /** The signed-in account's name, as the server reports it. */
+    var authAccountName by mutableStateOf<String?>(null)
+    /** Whether the session is kept across app launches (spec "Client keeps
+     * the session across launches"). The player's choice, honored as
+     * written. */
+    var keepSession by mutableStateOf(true)
+    /** The authentication features the server reports it supports (spec
+     * "Client degrades when the server lacks a feature"). Empty means the
+     * server supports no optional feature. */
+    var serverFeatures by mutableStateOf<Set<String>>(emptySet())
         private set
 
     private var online: OnlineConnectionManager? = null
@@ -283,6 +300,9 @@ class GameViewModel(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     init {
+        // The "keep me signed in" choice is remembered (spec "Client keeps the
+        // session across launches").
+        keepSession = SessionStore.keepSession(context)
         try {
             board = FenBoard.parse(session.getBoardState(), toMove)
             refreshStatus()
@@ -764,6 +784,12 @@ class GameViewModel(private val context: Context) {
      * room was persisted mid-game, re-attach to it on startup so the server's
      * reconnect window can resume the game on this device. */
     fun restoreOnlineSessionIfNeeded() {
+        // The server's features are needed before any flow is offered, so the
+        // probe goes first (spec "Client degrades when the server lacks a
+        // feature"). The resume waits for the answer: a server that does not
+        // know the message would close the connection on the frame.
+        probeServerFeatures()
+
         // A persisted in-progress room wins over the fresh local default game
         // (which always has zero moves at startup, design D8).
         if (moveList.isNotEmpty()) return
@@ -1260,8 +1286,9 @@ class GameViewModel(private val context: Context) {
         return true
     }
 
-    /** Perform register (username + password) via the online protocol. */
-    fun doRegister(username: String, password: String) {
+    /** Perform register (username + email + password) via the online
+     * protocol. */
+    fun doRegister(username: String, email: String, password: String) {
         if (authToken != null) return // already logged in
         if (!ensureAuthConnection()) return
         val conn = online ?: return
@@ -1273,11 +1300,14 @@ class GameViewModel(private val context: Context) {
                 authError = tokenOrError ?: "register_failed"
             }
         }
-        conn.startRegister(username, password)
+        conn.startRegister(username, email, password)
     }
 
-    /** Perform login (username + password) via the online protocol. */
-    fun doLogin(username: String, password: String) {
+    /** Perform login (identifier + password) via the online protocol.
+     *
+     * The identifier is what the player typed: a username or an email
+     * address (spec "Login and Session Issuance"). */
+    fun doLogin(identifier: String, password: String) {
         if (authToken != null) return // already logged in
         if (!ensureAuthConnection()) return
         val conn = online ?: return
@@ -1289,7 +1319,69 @@ class GameViewModel(private val context: Context) {
                 authError = tokenOrError ?: "login_failed"
             }
         }
-        conn.startLogin(username, password)
+        conn.startLogin(identifier, password)
+    }
+
+    /** Ask for a password-reset link (spec "Client offers password reset").
+     *
+     * The answer never says whether the address is registered, and the
+     * player is not signed in by asking. */
+    fun doForgotPassword(email: String) {
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            authError = if (success) null else (tokenOrError ?: "forgot_password_failed")
+        }
+        conn.startForgotPassword(email)
+    }
+
+    /** Set a new password with a reset token (spec "Client offers password
+     * reset"). The player is not signed in by resetting. */
+    fun doResetPassword(token: String, password: String) {
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            authError = if (success) null else (tokenOrError ?: "reset_password_failed")
+        }
+        conn.startResetPassword(token, password)
+    }
+
+    /** Confirm the signed-in account's email address. */
+    fun doVerifyEmail(token: String) {
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            authError = if (success) null else (tokenOrError ?: "verify_email_failed")
+        }
+        conn.startVerifyEmail(token)
+    }
+
+    /** Ask for another verification message. */
+    fun doResendVerification() {
+        val token = authToken ?: return
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            authError = if (success) null else (tokenOrError ?: "resend_verification_failed")
+        }
+        conn.startResendVerification(token)
+    }
+
+    /** Ask for a different email address (spec "Email Change"). The current
+     * address stays in force until the new one is confirmed. */
+    fun doChangeEmail(email: String) {
+        val token = authToken ?: return
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            authError = if (success) null else (tokenOrError ?: "change_email_failed")
+        }
+        conn.startChangeEmail(token, email)
     }
 
     /** Perform logout via the online protocol. */
@@ -1304,6 +1396,10 @@ class GameViewModel(private val context: Context) {
                 userName = null
                 authMode = null
                 authError = null
+                authEmailVerified = false
+                authAccountName = null
+                // Signing out discards the stored session too.
+                SessionStore.clear(context)
             } else {
                 // A refusal (e.g. `not_authenticated`, `session_expired`)
                 // keeps the token and surfaces the server's message.
@@ -1344,13 +1440,129 @@ class GameViewModel(private val context: Context) {
         conn.startSetProfile(authToken!!, trimmed)
     }
 
-    /** Mark that we are now logged in with the given token. */
+    /** Record the "keep me signed in" choice (spec "Client keeps the session
+     * across launches"). The choice is remembered, the token is not: it only
+     * stays when the player asked for it. */
+    fun updateKeepSession(keep: Boolean) {
+        keepSession = keep
+        SessionStore.setKeepSession(context, keep)
+    }
+
+    /** Whether the last failure was the server refusing the request, rather
+     * than the connection going away. Only a refusal means the stored
+     * session is stale (spec "Client keeps the session across launches"). */
+    private var authRefused = false
+
+    /** Mark that we are now logged in with the given token.
+     *
+     * The token is kept only when the player asked for it (spec "Client
+     * keeps the session across launches"). */
     fun setAuthTokenValue(token: String) {
         authToken = token
         authMode = null
         userName = null
         authError = null
+        authField = null
+        // The token is kept only when the player asked for it. A token that
+        // is already stored is discarded when the choice is declined.
+        if (keepSession) {
+            SessionStore.save(context, token)
+        } else {
+            SessionStore.clear(context)
+        }
+        // The account's name and its verification state, as the server
+        // reported them.
+        online?.let { conn ->
+            authAccountName = conn.accountName.ifEmpty { null }
+            authEmailVerified = conn.emailVerified
+        }
     }
+
+    /** Resume the session the encrypted preferences hold, when there is
+     * one (spec "Client keeps the session across launches"). */
+    fun resumeStoredSession() {
+        if (authToken != null) return
+        val stored = SessionStore.load(context) ?: return
+        if (stored.isEmpty()) return
+        if (!ensureAuthConnection()) return
+        val conn = online ?: return
+        conn.onAuthRefused = { refused -> authRefused = refused }
+        conn.onAuthResult = { success, tokenOrError ->
+            conn.onAuthResult = null // one exchange per request
+            if (success) {
+                authToken = stored
+                authError = null
+            } else {
+                // A stale token is discarded: the player continues as a
+                // guest and can sign in again. A connection failure is not
+                // a refusal, and must not sign the player out.
+                if (authRefused) {
+                    SessionStore.clear(context)
+                }
+                authToken = null
+                authError = null
+            }
+        }
+        conn.startResumeSession(stored)
+    }
+
+    /** Read the server's advertised authentication features (spec "Client
+     * degrades when the server lacks a feature").
+     *
+     * The probe is a plain HTTPS request to the same origin as the game
+     * connection. A server that does not answer, or answers without the
+     * list, is treated as supporting no optional feature. */
+    fun probeServerFeatures() {
+        val url = healthUrl() ?: run {
+            serverFeatures = emptySet()
+            return
+        }
+        Thread {
+            val features = try {
+                // A short timeout: the feature list is optional, so a slow
+                // server must not hold the request (spec "Client degrades
+                // when the server lacks a feature").
+                val connection = url.openConnection()
+                connection.connectTimeout = 5_000
+                connection.readTimeout = 5_000
+                val body = connection.getInputStream().bufferedReader().use { it.readText() }
+                val json = org.json.JSONObject(body)
+                val array = json.optJSONArray("auth_features") ?: org.json.JSONArray()
+                (0 until array.length()).mapNotNull { array.optString(it, null) }.toSet()
+            } catch (e: Exception) {
+                emptySet()
+            }
+            androidx.compose.runtime.snapshots.Snapshot.withMutableSnapshot {
+                serverFeatures = features
+            }
+            if (features.contains("session_resumption")) {
+                // A stored session is resumed only against a server that
+                // supports the message: the player who signed in stays signed
+                // in, and the connection is never spent on a frame the server
+                // would refuse (spec "Client keeps the session across
+                // launches").
+                resumeStoredSession()
+            }
+        }.start()
+    }
+
+    /** The readiness URL for the configured server: the same origin, without
+     * the WebSocket path. */
+    private fun healthUrl(): java.net.URL? {
+        val configured = resolvedServerURL()?.trim().orEmpty()
+        if (configured.isEmpty()) return null
+        return try {
+            val url = java.net.URL(configured)
+            val scheme = if (url.protocol == "wss" || url.protocol == "https") "https" else "http"
+            java.net.URL("$scheme://${url.host}${url.port.takeIf { it > 0 }?.let { ":$it" } ?: ""}/healthz")
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Whether the server supports a feature (spec "Client degrades when
+     * the server lacks a feature"). */
+    fun serverSupports(feature: String): Boolean = serverFeatures.contains(feature)
 
     /** Mark that the auth session expired; re-show login. */
     fun setAuthSessionExpired() {

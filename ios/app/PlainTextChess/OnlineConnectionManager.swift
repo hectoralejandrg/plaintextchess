@@ -51,6 +51,13 @@ final class OnlineConnectionManager: ObservableObject {
     /// carries the server's error message (e.g. the generic
     /// `invalid_credentials` text).
     var onAuthResult: ((Bool, String?) -> Void)?
+    /// The field a refused request named, so the form can mark the right
+    /// input (spec "Authentication Error Codes").
+    var onAuthField: ((String?) -> Void)?
+    /// Whether the last failure was the server refusing the request, rather
+    /// than the connection going away. Only a refusal means a stored session
+    /// is stale.
+    var onAuthRefusal: ((Bool) -> Void)?
 
     /// Server reconnect window: the server's default grace is 120 s, so we
     /// keep retrying a little past it before giving up.
@@ -69,6 +76,11 @@ final class OnlineConnectionManager: ObservableObject {
     private var retryDeadline: Date?
     /// Session token issued by register/login; used for logout/set_profile.
     private var token: String? = nil
+    /// Whether the signed-in account's email address is confirmed (spec
+    /// "Email Verification").
+    private(set) var emailVerified = false
+    /// The signed-in account's name, as the server reports it.
+    private(set) var accountName = ""
     /// True while a register/login (or later logout/set_profile) reply is
     /// expected, so unrelated structured errors (e.g. a join failure) are
     /// never reported as auth results.
@@ -160,17 +172,60 @@ final class OnlineConnectionManager: ObservableObject {
 
     /// Send a register request; the reply arrives as `onAuthResult(true,
     /// token)` or `onAuthResult(false, message)` (e.g. `username_taken`).
-    func startRegister(username: String, password: String) {
+    func startRegister(username: String, email: String, password: String) {
         awaitingAuthResult = true
-        send(.register(username: username, password: password, deviceID: deviceID))
+        send(.register(username: username, email: email, password: password, deviceID: deviceID))
     }
 
     /// Send a login request; the reply arrives as `onAuthResult(true,
     /// token)` or `onAuthResult(false, message)` (`invalid_credentials`
     /// carries the server's generic message).
-    func startLogin(username: String, password: String) {
+    ///
+    /// The identifier is what the player typed: a username or an email
+    /// address (spec "Login and Session Issuance").
+    func startLogin(identifier: String, password: String) {
         awaitingAuthResult = true
-        send(.login(username: username, password: password, deviceID: deviceID))
+        send(.login(identifier: identifier, password: password, deviceID: deviceID))
+    }
+
+    /// Resume the session the client stored earlier (spec "Session
+    /// Resumption"). The reply is `session_resumed`, which carries no token:
+    /// resuming issues nothing new.
+    func startResumeSession(token: String) {
+        awaitingAuthResult = true
+        send(.resumeSession(token: token))
+    }
+
+    /// Ask for a password-reset link. The reply is
+    /// `password_reset_requested`, the same answer for a registered and an
+    /// unregistered address.
+    func startForgotPassword(email: String) {
+        awaitingAuthResult = true
+        send(.forgotPassword(email: email))
+    }
+
+    /// Set a new password with a reset token.
+    func startResetPassword(token: String, password: String) {
+        awaitingAuthResult = true
+        send(.resetPassword(token: token, password: password))
+    }
+
+    /// Confirm an email address with the token the player received.
+    func startVerifyEmail(token: String) {
+        awaitingAuthResult = true
+        send(.verifyEmail(token: token))
+    }
+
+    /// Ask for another verification message.
+    func startResendVerification(token: String) {
+        awaitingAuthResult = true
+        send(.resendVerification(token: token))
+    }
+
+    /// Ask for a different email address.
+    func startChangeEmail(token: String, email: String) {
+        awaitingAuthResult = true
+        send(.changeEmail(token: token, email: email))
     }
 
     /// Send a logout request; the reply is `session_ok` → `onAuthResult(
@@ -354,7 +409,7 @@ final class OnlineConnectionManager: ObservableObject {
             setPhase(.inGame)
             onUpdate?(update)
 
-        case .error(let code, let message):
+        case .error(let code, let message, let field):
             switch code {
             case .roomNotFound, .roomFull, .invalidRoomCode, .alreadyInRoom:
                 // Definitive for the join in flight: the room is gone or
@@ -368,13 +423,47 @@ final class OnlineConnectionManager: ObservableObject {
                 // A refused register/login (e.g. `invalid_credentials`):
                 // report the server's message and stop expecting a reply.
                 awaitingAuthResult = false
+                onAuthRefusal?(true)
+                onAuthField?(field)
                 onAuthResult?(false, message)
             }
-        case .session(let tokenStr):
+        case .session(let tokenStr, let username, let displayName, let emailVerified):
             self.token = tokenStr
+            self.emailVerified = emailVerified
+            self.accountName = displayName.isEmpty ? username : displayName
             if awaitingAuthResult {
                 awaitingAuthResult = false
                 onAuthResult?(true, tokenStr)
+            }
+        case .sessionResumed(let username, let emailVerified):
+            // The stored session is still good: the account is reported and
+            // no new token is issued.
+            self.emailVerified = emailVerified
+            self.accountName = username
+            if awaitingAuthResult {
+                awaitingAuthResult = false
+                onAuthResult?(true, nil)
+            }
+        case .passwordResetRequested:
+            if awaitingAuthResult {
+                awaitingAuthResult = false
+                onAuthResult?(true, nil)
+            }
+        case .passwordReset:
+            if awaitingAuthResult {
+                awaitingAuthResult = false
+                onAuthResult?(true, nil)
+            }
+        case .emailVerificationRequested:
+            if awaitingAuthResult {
+                awaitingAuthResult = false
+                onAuthResult?(true, nil)
+            }
+        case .emailVerified(let emailVerified):
+            self.emailVerified = emailVerified
+            if awaitingAuthResult {
+                awaitingAuthResult = false
+                onAuthResult?(true, nil)
             }
         case .profileUpdated:
             if awaitingAuthResult {
@@ -477,6 +566,12 @@ final class OnlineConnectionManager: ObservableObject {
             .logout(token: self.token ?? "")
         case .setProfile(let token, let displayName):
             .setProfile(token: self.token ?? "", displayName: displayName)
+        case .verifyEmail(let token):
+            .verifyEmail(token: self.token ?? token)
+        case .resendVerification(let token):
+            .resendVerification(token: self.token ?? token)
+        case .changeEmail(let token, let email):
+            .changeEmail(token: self.token ?? token, email: email)
         default:
             message
         }

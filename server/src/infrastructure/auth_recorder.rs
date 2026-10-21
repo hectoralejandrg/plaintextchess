@@ -11,11 +11,30 @@
 use sqlx::sqlite::SqlitePool;
 
 use crate::application::ports::{AuthRecorder, RecorderError};
-use crate::domain::account::{Account, Profile, Session};
+use crate::domain::account::{
+    Account, Profile, ResetToken, Session, VerificationToken,
+};
 use crate::infrastructure::recorder::MIGRATIONS;
 
 /// One `sessions` row, in the order `load_all` selects it.
 type SessionRow = (String, String, String, String, i64, i64, Option<i64>);
+
+/// A row of the `accounts` table: the account's identity, its credentials,
+/// and its email (the last three columns are `NULL`/false for the accounts
+/// created before the email existed).
+type AccountRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+    i64,
+    Option<String>,
+    Option<String>,
+);
 
 pub struct SqliteAuthRecorder {
     pool: SqlitePool,
@@ -33,9 +52,19 @@ impl SqliteAuthRecorder {
     /// tell "revoked" apart from "never existed".
     pub async fn load_all(
         pool: &SqlitePool,
-    ) -> Result<(Vec<Account>, Vec<Profile>, Vec<Session>), RecorderError> {
-        let account_rows: Vec<(String, String, String, String, Option<String>, i64)> = sqlx::query_as(
-            "SELECT account_id, username, username_key, password_hash, display_name, created_at_ms \
+    ) -> Result<
+        (
+            Vec<Account>,
+            Vec<Profile>,
+            Vec<Session>,
+            Vec<VerificationToken>,
+            Vec<ResetToken>,
+        ),
+        RecorderError,
+    > {
+        let account_rows: Vec<AccountRow> = sqlx::query_as(
+            "SELECT account_id, username, username_key, password_hash, display_name, created_at_ms, \
+                    email, email_key, email_verified, pending_email, pending_email_key \
              FROM accounts ORDER BY account_id",
         )
         .fetch_all(pool)
@@ -60,18 +89,54 @@ impl SqliteAuthRecorder {
         .await
         .map_err(|e| e.to_string())?;
 
+        // The email tokens that are still within their lifetime. A token
+        // that expired while the server was down is simply not loaded: the
+        // player asks for a new one.
+        let verification_rows: Vec<(String, String, String, i64, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT account_id, address, token_hash, created_at_ms, expires_at_ms, used_at_ms \
+             FROM email_verifications WHERE expires_at_ms > ? ORDER BY account_id",
+        )
+        .bind(now_ms)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let reset_rows: Vec<(String, String, i64, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT token_hash, account_id, created_at_ms, expires_at_ms, used_at_ms \
+             FROM password_reset_tokens WHERE expires_at_ms > ? ORDER BY token_hash",
+        )
+        .bind(now_ms)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
         let accounts = account_rows
             .into_iter()
             .map(
-                |(account_id, username, username_key, password_hash, display_name, created_at_ms)| {
-                    Account {
-                        account_id,
-                        username,
-                        username_key,
-                        password_hash,
-                        display_name,
-                        created_at_ms,
-                    }
+                |(
+                    account_id,
+                    username,
+                    username_key,
+                    password_hash,
+                    display_name,
+                    created_at_ms,
+                    email,
+                    email_key,
+                    email_verified,
+                    pending_email,
+                    pending_email_key,
+                )| Account {
+                    account_id,
+                    username,
+                    username_key,
+                    password_hash,
+                    display_name,
+                    email,
+                    email_key,
+                    email_verified: email_verified != 0,
+                    pending_email,
+                    pending_email_key,
+                    created_at_ms,
                 },
             )
             .collect();
@@ -108,7 +173,61 @@ impl SqliteAuthRecorder {
                 },
             )
             .collect();
-        Ok((accounts, profiles, sessions))
+        let verification_tokens = verification_rows
+            .into_iter()
+            .map(
+                |(account_id, address, token_hash, created_at_ms, expires_at_ms, used_at_ms)| {
+                    VerificationToken {
+                        account_id,
+                        address,
+                        token_hash,
+                        created_at_ms,
+                        expires_at_ms,
+                        used_at_ms,
+                    }
+                },
+            )
+            .collect();
+        let reset_tokens = reset_rows
+            .into_iter()
+            .map(
+                |(token_hash, account_id, created_at_ms, expires_at_ms, used_at_ms)| ResetToken {
+                    account_id,
+                    token_hash,
+                    created_at_ms,
+                    expires_at_ms,
+                    used_at_ms,
+                },
+            )
+            .collect();
+        Ok((
+            accounts,
+            profiles,
+            sessions,
+            verification_tokens,
+            reset_tokens,
+        ))
+    }
+
+    /// Delete every email token that expired at or before `now_ms`: a
+    /// confirmation or a reset link that is past its life is dead weight.
+    pub async fn purge_expired_tokens(
+        pool: &SqlitePool,
+        now_ms: i64,
+    ) -> Result<usize, RecorderError> {
+        let verifications = sqlx::query(
+            "DELETE FROM email_verifications WHERE expires_at_ms <= ?",
+        )
+        .bind(now_ms)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        let resets = sqlx::query("DELETE FROM password_reset_tokens WHERE expires_at_ms <= ?")
+            .bind(now_ms)
+            .execute(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((verifications.rows_affected() + resets.rows_affected()) as usize)
     }
 
     /// Delete every session that expired at or before `now_ms` (design D7).
@@ -145,9 +264,9 @@ impl AuthRecorder for SqliteAuthRecorder {
             sqlx::query(
                 r#"INSERT INTO accounts (
                        account_id, username, username_key, password_hash,
-                       display_name, created_at_ms
+                       display_name, created_at_ms, email, email_key, email_verified
                    )
-                   VALUES (?, ?, ?, ?, ?, ?)"#,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&account.account_id)
             .bind(&account.username)
@@ -155,6 +274,9 @@ impl AuthRecorder for SqliteAuthRecorder {
             .bind(&account.password_hash)
             .bind(&account.display_name)
             .bind(account.created_at_ms)
+            .bind(&account.email)
+            .bind(&account.email_key)
+            .bind(i64::from(account.email_verified))
             .execute(&self.pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -255,6 +377,163 @@ impl AuthRecorder for SqliteAuthRecorder {
             Ok(())
         })
     }
+
+    fn record_email_verified<'a>(
+        &'a self,
+        account_id: &'a str,
+        verified: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            sqlx::query("UPDATE accounts SET email_verified = ? WHERE account_id = ?")
+                .bind(i64::from(verified))
+                .bind(account_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_verification_token<'a>(
+        &'a self,
+        token: &'a VerificationToken,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // One row per account: asking again replaces the row, which is
+            // what retires the previous token.
+            sqlx::query(
+                "INSERT INTO email_verifications (account_id, address, token_hash, created_at_ms, expires_at_ms, used_at_ms) \
+                 VALUES (?, ?, ?, ?, ?, NULL) \
+                 ON CONFLICT(account_id) DO UPDATE SET address = excluded.address, \
+                     token_hash = excluded.token_hash, created_at_ms = excluded.created_at_ms, \
+                     expires_at_ms = excluded.expires_at_ms, used_at_ms = NULL",
+            )
+            .bind(&token.account_id)
+            .bind(&token.address)
+            .bind(&token.token_hash)
+            .bind(token.created_at_ms)
+            .bind(token.expires_at_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_reset_token<'a>(
+        &'a self,
+        token: &'a ResetToken,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO password_reset_tokens (token_hash, account_id, created_at_ms, expires_at_ms, used_at_ms) \
+                 VALUES (?, ?, ?, ?, NULL) \
+                 ON CONFLICT(token_hash) DO UPDATE SET account_id = excluded.account_id, \
+                     created_at_ms = excluded.created_at_ms, expires_at_ms = excluded.expires_at_ms, used_at_ms = NULL",
+            )
+            .bind(&token.token_hash)
+            .bind(&token.account_id)
+            .bind(token.created_at_ms)
+            .bind(token.expires_at_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_password_changed<'a>(
+        &'a self,
+        account_id: &'a str,
+        password_hash: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            sqlx::query("UPDATE accounts SET password_hash = ? WHERE account_id = ?")
+                .bind(password_hash)
+                .bind(account_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_pending_email<'a>(
+        &'a self,
+        account_id: &'a str,
+        email: &'a str,
+        email_key: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // The current address stays in force: only the pending one is
+            // written here (spec "Email Change").
+            sqlx::query(
+                "UPDATE accounts SET pending_email = ?, pending_email_key = ? WHERE account_id = ?",
+            )
+            .bind(email)
+            .bind(email_key)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_pending_email_confirmed<'a>(
+        &'a self,
+        account_id: &'a str,
+        email: &'a str,
+        email_key: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // The confirmed address replaces the pending one and becomes the
+            // account's address, verified.
+            sqlx::query(
+                "UPDATE accounts SET email = ?, email_key = ?, email_verified = 1, \
+                     pending_email = NULL, pending_email_key = NULL WHERE account_id = ?",
+            )
+            .bind(email)
+            .bind(email_key)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
+
+    fn record_token_used<'a>(
+        &'a self,
+        token_hash: &'a str,
+        used_at_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // The hash lives in one of the two token tables; marking it used
+            // in both is what makes a token single-use whichever flow it came
+            // from.
+            sqlx::query("UPDATE email_verifications SET used_at_ms = ? WHERE token_hash = ?")
+                .bind(used_at_ms)
+                .bind(token_hash)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE password_reset_tokens SET used_at_ms = ? WHERE token_hash = ?")
+                .bind(used_at_ms)
+                .bind(token_hash)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    }
 }
 
 /// Apply the migrations and return a pool ready for both recorders. Shared
@@ -315,6 +594,11 @@ mod tests {
             username_key: crate::domain::account::username_key(username),
             password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
             display_name: None,
+            email: None,
+            email_key: None,
+            email_verified: false,
+            pending_email: None,
+            pending_email_key: None,
             created_at_ms: 1_000,
         }
     }
@@ -345,6 +629,34 @@ mod tests {
     // ------------------------------------------------------------------
     // 4.2 Account insert and display name
     // ------------------------------------------------------------------
+
+    /// An account written before the email existed keeps its row and keeps
+    /// working (spec "Email Identity", task 3.1).
+    #[tokio::test]
+    async fn a_database_written_before_the_email_existed_keeps_its_accounts() {
+        let db = TempDb::new().await;
+        let pool = db.pool.clone();
+        MIGRATIONS.run(&pool).await.expect("migrate");
+
+        // A row exactly as the previous schema wrote it: no email, no
+        // pending address, and the verification flag at its default.
+        sqlx::query(
+            "INSERT INTO accounts (account_id, username, username_key, password_hash, display_name, created_at_ms) \
+             VALUES ('account-legacy', 'Ana', 'ana', '$argon2id$seed', NULL, 1000)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert the legacy account");
+
+        let (accounts, _profiles, _sessions, _verification, _reset) =
+            SqliteAuthRecorder::load_all(&pool).await.expect("load");
+        assert_eq!(accounts.len(), 1, "the account survived the migration");
+        let account = &accounts[0];
+        assert_eq!(account.username, "Ana", "the username is kept as it was");
+        assert_eq!(account.email, None, "the account has no address yet");
+        assert!(!account.email_verified);
+        assert_eq!(account.pending_email, None);
+    }
 
     #[tokio::test]
     async fn an_account_row_carries_the_hash_and_never_the_plaintext() {
@@ -601,7 +913,7 @@ mod tests {
 
         // Restart: a brand-new pool on the same file.
         let reopened = db.reopen().await;
-        let (accounts, profiles, sessions) =
+        let (accounts, profiles, sessions, _, _) =
             SqliteAuthRecorder::load_all(&reopened).await.expect("load");
 
         assert_eq!(accounts.len(), 1);
@@ -651,7 +963,7 @@ mod tests {
         recorder.record_session_issued(&live).await.expect("write");
 
         let reopened = db.reopen().await;
-        let (_, _, sessions) = SqliteAuthRecorder::load_all(&reopened).await.expect("load");
+        let (_, _, sessions, _, _) = SqliteAuthRecorder::load_all(&reopened).await.expect("load");
         assert_eq!(
             sessions.len(),
             1,
@@ -760,7 +1072,7 @@ mod tests {
         recorder.record_session_revoked("hash-1", 5_000).await.expect("revoke");
         assert!(store.revoke_session("hash-1", 5_000));
 
-        let (accounts, profiles, sessions) =
+        let (accounts, profiles, sessions, _, _) =
             SqliteAuthRecorder::load_all(&db.pool).await.expect("load");
         assert_eq!(accounts[0].display_name, ana.display_name);
         assert_eq!(profiles[0].account_id, linked.account_id);

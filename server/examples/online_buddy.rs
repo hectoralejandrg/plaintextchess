@@ -195,6 +195,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Tournament messages (add-tournaments): a guest buddy never joins a
             // tournament, so there is nothing to do with them here.
+            // The email flows are not part of this example's vocabulary.
+            ServerMessage::PasswordResetRequested { .. }
+            | ServerMessage::PasswordReset { .. }
+            | ServerMessage::EmailVerificationRequested { .. }
+            | ServerMessage::EmailVerified { .. }
+            | ServerMessage::SessionResumed { .. } => {}
             ServerMessage::TournamentJoined { .. }
             | ServerMessage::TournamentPairing { .. }
             | ServerMessage::TournamentStandings { .. }

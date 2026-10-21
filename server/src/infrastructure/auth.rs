@@ -11,9 +11,12 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::application::ports::{
-    Accounts, AuthError, AuthRecorder, ProfileStore, RecorderError, SessionLookup, Sessions,
+    Accounts, AuthError, AuthRecorder, AuthTokens, ProfileStore, RecorderError, SessionLookup,
+    Sessions,
 };
-use crate::domain::account::{username_key, Account, Profile, Session};
+use crate::domain::account::{
+    username_key, Account, Profile, ResetToken, Session, VerificationToken,
+};
 
 /// The three authentication ports over one in-memory store (design D4).
 ///
@@ -33,6 +36,10 @@ struct AuthState {
     /// Keyed by the case-folded username, so a lookup cannot miss a case
     /// variant (design D3).
     by_username: HashMap<String, Account>,
+    /// Keyed by the case-folded email address, so a player can sign in with
+    /// the address they registered (spec "Email Identity"). An account
+    /// without an address is absent from this index.
+    by_email: HashMap<String, Account>,
     accounts: HashMap<String, Account>,
     /// Device identifier to account identifier. The primary key of the
     /// `profiles` table (design D2), so a device follows one account at a
@@ -41,6 +48,16 @@ struct AuthState {
     profiles: HashMap<String, Profile>,
     /// Token hash to session. Only the hash is ever stored (design D6).
     sessions: HashMap<String, Session>,
+    /// Token hash to the token that confirms an address (spec "Email
+    /// Verification"). Only the hash is ever stored.
+    verification_tokens: HashMap<String, VerificationToken>,
+    /// Token hash to the token that allows a password reset (spec "Password
+    /// Reset by Email"). Only the hash is ever stored.
+    reset_tokens: HashMap<String, ResetToken>,
+    /// The case-folded pending address to the account that is moving to it
+    /// (spec "Email Change"). A pending address is reserved the moment it is
+    /// asked for, so two accounts cannot claim the same one.
+    pending_emails: HashMap<String, String>,
 }
 
 impl PlayerAuthStore {
@@ -73,6 +90,18 @@ impl PlayerAuthStore {
     }
 }
 
+impl PlayerAuthStore {
+    /// Reserve a pending address for an account, without touching the
+    /// account itself. Used at startup, where the reservations are rebuilt
+    /// from the loaded rows.
+    pub fn reserve_pending_email(&self, email_key: &str, account_id: &str) {
+        let mut state = self.write();
+        state
+            .pending_emails
+            .insert(email_key.to_string(), account_id.to_string());
+    }
+}
+
 impl Accounts for PlayerAuthStore {
     fn account_by_username(&self, username: &str) -> Option<Account> {
         // Trim before folding, the same way `validate_username` does, so a
@@ -85,8 +114,14 @@ impl Accounts for PlayerAuthStore {
         self.read().accounts.get(account_id).cloned()
     }
 
+    fn account_by_email(&self, email: &str) -> Option<Account> {
+        let key = crate::domain::account::email_key(email);
+        self.read().by_email.get(&key).cloned()
+    }
+
     fn insert_account(&self, account: Account) -> Result<(), AuthError> {
         let key = account.username_key.clone();
+        let email_key = account.email_key.clone();
         let mut state = self.write();
         if state.by_username.contains_key(&key) {
             return Err(AuthError::DuplicateUsername);
@@ -94,8 +129,20 @@ impl Accounts for PlayerAuthStore {
         if state.accounts.contains_key(&account.account_id) {
             return Err(AuthError::DuplicateAccount);
         }
+        // The email index is what makes the address unique; an account
+        // without an address is absent from it and cannot collide. A
+        // *pending* address is reserved too: another account must not take
+        // an address that is already being moved to (spec "Email Change").
+        if let Some(email_key) = email_key.as_ref() {
+            if state.by_email.contains_key(email_key) || state.pending_emails.contains_key(email_key) {
+                return Err(AuthError::DuplicateEmail);
+            }
+        }
         state.accounts.insert(account.account_id.clone(), account.clone());
-        state.by_username.insert(key, account);
+        state.by_username.insert(key, account.clone());
+        if let Some(email_key) = email_key {
+            state.by_email.insert(email_key, account);
+        }
         Ok(())
     }
 
@@ -130,9 +177,118 @@ impl Accounts for PlayerAuthStore {
             None => None,
         };
         if let Some(account) = updated {
+            Self::reindex(&mut state, account);
+        }
+    }
+
+    fn set_password_hash(&self, account_id: &str, password_hash: &str) {
+        let mut state = self.write();
+        let updated = match state.accounts.get_mut(account_id) {
+            Some(account) => {
+                account.password_hash = password_hash.to_string();
+                Some(account.clone())
+            }
+            None => None,
+        };
+        if let Some(account) = updated {
+            Self::reindex(&mut state, account);
+        }
+    }
+
+    fn set_pending_email(
+        &self,
+        account_id: &str,
+        email: &str,
+        email_key: &str,
+    ) -> Result<(), AuthError> {
+        let mut state = self.write();
+        // The address must be free both as an address in force and as one
+        // another account is already moving to.
+        if state.by_email.contains_key(email_key) || state.pending_emails.contains_key(email_key) {
+            return Err(AuthError::DuplicateEmail);
+        }
+        let previous_key = state
+            .accounts
+            .get(account_id)
+            .and_then(|account| account.pending_email_key.clone());
+        let updated = match state.accounts.get_mut(account_id) {
+            Some(account) => {
+                account.pending_email = Some(email.to_string());
+                account.pending_email_key = Some(email_key.to_string());
+                Some(account.clone())
+            }
+            None => None,
+        };
+        if let Some(account) = updated {
+            if let Some(previous_key) = previous_key {
+                state.pending_emails.remove(&previous_key);
+            }
             state
-                .by_username
-                .insert(account.username_key.clone(), account);
+                .pending_emails
+                .insert(email_key.to_string(), account_id.to_string());
+            Self::reindex(&mut state, account);
+        }
+        Ok(())
+    }
+
+    fn confirm_pending_email(&self, account_id: &str) -> Option<String> {
+        let mut state = self.write();
+        let pending = state
+            .accounts
+            .get(account_id)
+            .and_then(|account| account.pending_email.clone())?;
+        let pending_key = state
+            .accounts
+            .get(account_id)
+            .and_then(|account| account.pending_email_key.clone());
+        let previous_key = state
+            .accounts
+            .get(account_id)
+            .and_then(|account| account.email_key.clone());
+        let updated = {
+            let account = state.accounts.get_mut(account_id)?;
+            account.email = Some(pending.clone());
+            account.email_key = pending_key.clone();
+            account.pending_email = None;
+            account.pending_email_key = None;
+            account.email_verified = true;
+            account.clone()
+        };
+        if let Some(pending_key) = pending_key {
+            state.pending_emails.remove(&pending_key);
+        }
+        if let Some(previous_key) = previous_key {
+            state.by_email.remove(&previous_key);
+        }
+        Self::reindex(&mut state, updated);
+        Some(pending)
+    }
+
+    fn set_email_verified(&self, account_id: &str, verified: bool) {
+        let mut state = self.write();
+        let updated = match state.accounts.get_mut(account_id) {
+            Some(account) => {
+                account.email_verified = verified;
+                Some(account.clone())
+            }
+            None => None,
+        };
+        if let Some(account) = updated {
+            Self::reindex(&mut state, account);
+        }
+    }
+
+}
+
+impl PlayerAuthStore {
+    /// Put an account back into every index it belongs to. The username and
+    /// the email index must never serve a stale copy of the record.
+    fn reindex(state: &mut AuthState, account: Account) {
+        state
+            .by_username
+            .insert(account.username_key.clone(), account.clone());
+        if let Some(email_key) = account.email_key.clone() {
+            state.by_email.insert(email_key, account);
         }
     }
 }
@@ -190,6 +346,95 @@ impl Sessions for PlayerAuthStore {
             .sessions
             .retain(|_, session| !session.is_expired(now_ms));
         before - state.sessions.len()
+    }
+}
+
+impl AuthTokens for PlayerAuthStore {
+    fn insert_verification_token(&self, token: VerificationToken) {
+        let mut state = self.write();
+        // One token per account: asking again replaces the row, which is
+        // what retires the previous token.
+        state
+            .verification_tokens
+            .retain(|_, existing| existing.account_id != token.account_id);
+        state
+            .verification_tokens
+            .insert(token.token_hash.clone(), token);
+    }
+
+    fn verification_token_by_hash(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Option<VerificationToken> {
+        let state = self.read();
+        state
+            .verification_tokens
+            .get(token_hash)
+            .filter(|token| token.is_usable(now_ms))
+            .cloned()
+    }
+
+    fn consume_verification_token(
+        &self,
+        token_hash: &str,
+        now_ms: i64,
+    ) -> Option<VerificationToken> {
+        let mut state = self.write();
+        let token = state
+            .verification_tokens
+            .get(token_hash)
+            .filter(|token| token.is_usable(now_ms))
+            .cloned()?;
+        state
+            .verification_tokens
+            .insert(token_hash.to_string(), VerificationToken {
+                used_at_ms: Some(now_ms),
+                ..token.clone()
+            });
+        Some(token)
+    }
+
+    fn insert_reset_token(&self, token: ResetToken) {
+        let mut state = self.write();
+        state
+            .reset_tokens
+            .insert(token.token_hash.clone(), token);
+    }
+
+    fn reset_token_by_hash(&self, token_hash: &str, now_ms: i64) -> Option<ResetToken> {
+        let state = self.read();
+        state
+            .reset_tokens
+            .get(token_hash)
+            .filter(|token| token.is_usable(now_ms))
+            .cloned()
+    }
+
+    fn consume_reset_token(&self, token_hash: &str, now_ms: i64) -> Option<ResetToken> {
+        let mut state = self.write();
+        let token = state
+            .reset_tokens
+            .get(token_hash)
+            .filter(|token| token.is_usable(now_ms))
+            .cloned()?;
+        state
+            .reset_tokens
+            .insert(token_hash.to_string(), ResetToken {
+                used_at_ms: Some(now_ms),
+                ..token.clone()
+            });
+        Some(token)
+    }
+
+    fn purge_expired_tokens(&self, now_ms: i64) -> usize {
+        let mut state = self.write();
+        let before = state.verification_tokens.len() + state.reset_tokens.len();
+        state
+            .verification_tokens
+            .retain(|_, token| !token.is_expired(now_ms));
+        state.reset_tokens.retain(|_, token| !token.is_expired(now_ms));
+        before - state.verification_tokens.len() - state.reset_tokens.len()
     }
 }
 
@@ -265,6 +510,69 @@ impl AuthRecorder for NoopAuthRecorder {
     {
         ok()
     }
+
+    fn record_email_verified<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _verified: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        ok()
+    }
+
+    fn record_verification_token<'a>(
+        &'a self,
+        _token: &'a VerificationToken,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        ok()
+    }
+
+    fn record_reset_token<'a>(
+        &'a self,
+        _token: &'a ResetToken,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        ok()
+    }
+
+    fn record_token_used<'a>(
+        &'a self,
+        _token_hash: &'a str,
+        _used_at_ms: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        ok()
+    }
+
+    fn record_password_changed<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _password_hash: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        ok()
+    }
+
+    fn record_pending_email<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _email: &'a str,
+        _email_key: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        ok()
+    }
+
+    fn record_pending_email_confirmed<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _email: &'a str,
+        _email_key: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RecorderError>> + Send + 'a>>
+    {
+        ok()
+    }
 }
 
 #[cfg(test)]
@@ -279,7 +587,20 @@ mod tests {
             username_key: username_key(username),
             password_hash: "$argon2id$fake".to_string(),
             display_name: None,
+            email: None,
+            email_key: None,
+            email_verified: false,
+            pending_email: None,
+            pending_email_key: None,
             created_at_ms: 1_000,
+        }
+    }
+
+    fn account_with_email(account_id: &str, username: &str, email: &str) -> Account {
+        Account {
+            email: Some(email.to_string()),
+            email_key: Some(crate::domain::account::email_key(email)),
+            ..account(account_id, username)
         }
     }
 
@@ -336,6 +657,137 @@ mod tests {
         assert!(
             store.account_by_username("Bob").is_none(),
             "a different username is a miss, not a prefix match"
+        );
+    }
+
+    #[test]
+    fn an_email_address_finds_the_account() {
+        let store = PlayerAuthStore::new();
+        store
+            .insert_account(account_with_email("account-1", "Ana", "ana@example.com"))
+            .expect("insert");
+        for spelling in ["ana@example.com", "Ana@Example.com", " ana@example.com "] {
+            assert_eq!(
+                store.account_by_email(spelling).map(|a| a.account_id),
+                Some("account-1".to_string()),
+                "`{spelling}` must resolve to the same account"
+            );
+        }
+    }
+
+    #[test]
+    fn a_duplicate_email_is_refused() {
+        let store = PlayerAuthStore::new();
+        store
+            .insert_account(account_with_email("account-1", "Ana", "ana@example.com"))
+            .expect("insert");
+        assert_eq!(
+            store.insert_account(account_with_email("account-2", "Bob", "ANA@example.com")),
+            Err(AuthError::DuplicateEmail),
+            "the case-folded key is what makes `ANA@` collide with `ana@`"
+        );
+        assert!(store.account_by_id("account-2").is_none());
+    }
+
+    #[test]
+    fn an_account_without_an_email_is_absent_from_the_email_index() {
+        let store = PlayerAuthStore::new();
+        store.insert_account(account("account-1", "Ana")).expect("insert");
+        assert!(store.account_by_email("ana@example.com").is_none());
+    }
+
+    #[test]
+    fn the_verification_state_is_kept() {
+        let store = PlayerAuthStore::new();
+        store
+            .insert_account(account_with_email("account-1", "Ana", "ana@example.com"))
+            .expect("insert");
+        assert!(!store
+            .account_by_id("account-1")
+            .expect("the account")
+            .email_verified);
+        store.set_email_verified("account-1", true);
+        assert!(store
+            .account_by_id("account-1")
+            .expect("the account")
+            .email_verified);
+        assert!(
+            store
+                .account_by_email("ana@example.com")
+                .expect("the account")
+                .email_verified,
+            "the email index must not serve a stale copy"
+        );
+    }
+
+    #[test]
+    fn the_current_address_stays_in_force_until_the_new_one_is_confirmed() {
+        let store = PlayerAuthStore::new();
+        store
+            .insert_account(account_with_email("account-1", "Ana", "ana@example.com"))
+            .expect("insert");
+        store
+            .set_pending_email("account-1", "new@example.com", "new@example.com")
+            .expect("the address is free");
+        assert_eq!(
+            store.account_by_email("ana@example.com").map(|a| a.account_id),
+            Some("account-1".to_string()),
+            "the address in force is still the old one"
+        );
+        assert_eq!(
+            store.confirm_pending_email("account-1").as_deref(),
+            Some("new@example.com")
+        );
+        assert!(
+            store.account_by_email("ana@example.com").is_none(),
+            "the old address no longer resolves"
+        );
+        assert_eq!(
+            store.account_by_email("new@example.com").map(|a| a.account_id),
+            Some("account-1".to_string())
+        );
+        assert!(
+            store
+                .account_by_id("account-1")
+                .expect("the account")
+                .email_verified,
+            "the confirmed address is verified"
+        );
+    }
+
+    #[test]
+    fn a_pending_address_that_is_taken_is_refused() {
+        let store = PlayerAuthStore::new();
+        store
+            .insert_account(account_with_email("account-1", "Ana", "ana@example.com"))
+            .expect("insert");
+        store
+            .insert_account(account_with_email("account-2", "Bob", "bob@example.com"))
+            .expect("insert");
+        assert_eq!(
+            store.set_pending_email("account-1", "bob@example.com", "bob@example.com"),
+            Err(AuthError::DuplicateEmail)
+        );
+        assert_eq!(
+            store.account_by_email("ana@example.com").map(|a| a.account_id),
+            Some("account-1".to_string()),
+            "the refused change left the address alone"
+        );
+    }
+
+    #[test]
+    fn a_pending_address_is_reserved_while_it_is_pending() {
+        let store = PlayerAuthStore::new();
+        store
+            .insert_account(account_with_email("account-1", "Ana", "ana@example.com"))
+            .expect("insert");
+        store
+            .set_pending_email("account-1", "new@example.com", "new@example.com")
+            .expect("the address is free");
+        assert_eq!(
+            store.set_pending_email("account-2", "new@example.com", "new@example.com"),
+            Err(AuthError::DuplicateEmail),
+            "two accounts cannot claim the same pending address"
         );
     }
 

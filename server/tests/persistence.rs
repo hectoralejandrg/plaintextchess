@@ -438,7 +438,8 @@ async fn an_account_its_device_links_and_its_sessions_survive_a_restart() {
             &mut phone,
             &ClientMessage::Register {
                 v: 1,
-                username: "Ana".into(),
+                email: Some("ana-1@example.com".into()),
+            username: "Ana".into(),
                 password: "correct horse battery".into(),
                 device_id: Some("device-phone".into()),
             },
@@ -454,7 +455,8 @@ async fn an_account_its_device_links_and_its_sessions_survive_a_restart() {
             &mut tablet,
             &ClientMessage::Login {
                 v: 1,
-                username: "ana".into(),
+                identifier: None,
+            username: Some("ana".into()),
                 password: "correct horse battery".into(),
                 device_id: Some("device-tablet".into()),
             },
@@ -512,7 +514,8 @@ async fn an_account_its_device_links_and_its_sessions_survive_a_restart() {
             &mut shared,
             &ClientMessage::Register {
                 v: 1,
-                username: "Bob".into(),
+                email: Some("bob-2@example.com".into()),
+            username: "Bob".into(),
                 password: "another long password".into(),
                 device_id: Some("device-phone".into()),
             },
@@ -612,7 +615,8 @@ async fn a_failed_authentication_write_is_logged_and_leaves_the_player_able_to_p
             &mut client,
             &ClientMessage::Register {
                 v: 1,
-                username: "Ana".into(),
+                email: Some("ana-3@example.com".into()),
+            username: "Ana".into(),
                 password: "correct horse battery".into(),
                 device_id: Some("device-a".into()),
             },

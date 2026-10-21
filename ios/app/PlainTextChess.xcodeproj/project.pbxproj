@@ -16,6 +16,7 @@
 		AA0000000000000000000026 /* BoardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000023 /* BoardView.swift */; };
 		AA0000000000000000000028 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000027 /* Assets.xcassets */; };
 		AA000000000000000000002A /* OnlineProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000029 /* OnlineProtocol.swift */; };
+		AA0000000000000000000039 /* SessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000000000000000000038 /* SessionStore.swift */; };
 		AA000000000000000000002C /* OnlineConnectionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000000000000000000002B /* OnlineConnectionManager.swift */; };
 		AA000000000000000000002F /* OnlineProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000000000000000000002E /* OnlineProtocolTests.swift */; };
 /* End PBXBuildFile section */
@@ -33,6 +34,8 @@
 		AA0000000000000000000023 /* BoardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoardView.swift; sourceTree = "<group>"; };
 		AA0000000000000000000027 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AA0000000000000000000029 /* OnlineProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnlineProtocol.swift; sourceTree = "<group>"; };
+		AA0000000000000000000038 /* SessionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionStore.swift; sourceTree = "<group>"; };
+		AA000000000000000000003A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		AA000000000000000000002B /* OnlineConnectionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnlineConnectionManager.swift; sourceTree = "<group>"; };
 		AA000000000000000000002D /* PlainTextChessTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PlainTextChessTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA000000000000000000002E /* OnlineProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnlineProtocolTests.swift; sourceTree = "<group>"; };
@@ -72,6 +75,8 @@
 				AA0000000000000000000027 /* Assets.xcassets */,
 				AA0000000000000000000029 /* OnlineProtocol.swift */,
 				AA000000000000000000002B /* OnlineConnectionManager.swift */,
+				AA0000000000000000000038 /* SessionStore.swift */,
+				AA000000000000000000003A /* Info.plist */,
 			);
 			path = PlainTextChess;
 			sourceTree = "<group>";
@@ -232,6 +237,7 @@
 				AA0000000000000000000026 /* BoardView.swift in Sources */,
 				AA000000000000000000002A /* OnlineProtocol.swift in Sources */,
 				AA000000000000000000002C /* OnlineConnectionManager.swift in Sources */,
+				AA0000000000000000000039 /* SessionStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -346,7 +352,8 @@
 					"$(inherited)",
 					"$(SRCROOT)/../Frameworks",
 				);
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = PlainTextChess/Info.plist;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(SRCROOT)/../../target/uniffi/ios",

@@ -474,6 +474,12 @@ fn route_kind(message: &ClientMessage, seated_room: Option<&str>) -> Route {
         | ClientMessage::Login { .. }
         | ClientMessage::Logout { .. }
         | ClientMessage::SetProfile { .. }
+        | ClientMessage::ResumeSession { .. }
+        | ClientMessage::ForgotPassword { .. }
+        | ClientMessage::ResetPassword { .. }
+        | ClientMessage::VerifyEmail { .. }
+        | ClientMessage::ResendVerification { .. }
+        | ClientMessage::ChangeEmail { .. }
         | ClientMessage::JoinTournament { .. }
         | ClientMessage::LeaveTournament { .. }
         | ClientMessage::ListTournaments { .. } => Route::Control,
@@ -1320,7 +1326,13 @@ impl LogicState {
             ClientMessage::Register { .. }
             | ClientMessage::Login { .. }
             | ClientMessage::Logout { .. }
-            | ClientMessage::SetProfile { .. } => self.handle_auth(logic_conn, message).await,
+            | ClientMessage::SetProfile { .. }
+            | ClientMessage::ResumeSession { .. }
+            | ClientMessage::ForgotPassword { .. }
+            | ClientMessage::ResetPassword { .. }
+            | ClientMessage::VerifyEmail { .. }
+            | ClientMessage::ResendVerification { .. }
+            | ClientMessage::ChangeEmail { .. } => self.handle_auth(logic_conn, message).await,
             // Arena tournaments (add-tournaments phase 1) are monolith-only
             // (`TIER=all`, see `ws.rs`): the split tier has no tournament
             // registry to route these to. Explicit non-goal of this phase,
@@ -1466,6 +1478,24 @@ impl LogicState {
         }
     }
 
+    /// The rate-limit key for an attempt on this connection.
+    ///
+    /// The split tier does not see the peer's address — the transport node
+    /// does — so the connection is the key it can offer. The device is keyed
+    /// as well, which is what identifies the player across connections (spec
+    /// "Authentication Rate Limiting"). The address is never a single
+    /// shared bucket: that would let one client lock out every player.
+    fn auth_client(
+        &self,
+        connection_id: &str,
+        device_id: Option<&str>,
+    ) -> crate::infrastructure::server::AuthClient {
+        crate::infrastructure::server::AuthClient {
+            address: format!("conn:{connection_id}"),
+            device_id: device_id.map(str::to_string),
+        }
+    }
+
     /// Route an auth message to the authoritative `App` and send the reply
     /// back. The transport never decides auth (design D5/D11). A successful
     /// login also upgrades the connection's pinned identity.
@@ -1473,11 +1503,22 @@ impl LogicState {
         let reply = match message {
             ClientMessage::Register {
                 username,
+                email,
                 password,
                 device_id,
                 ..
             } => {
-                let reply = self.app.register(&username, &password, device_id).await;
+                let client = self.auth_client(&logic_conn.connection_id, device_id.as_deref());
+                let reply = self
+                    .app
+                    .register(
+                        &username,
+                        email.as_deref(),
+                        &password,
+                        device_id,
+                        &client,
+                    )
+                    .await;
                 // Phase 3 (task 4.5): mirror the freshly issued session
                 // to Redis so another logic node accepts the same token.
                 self.mirror_if_session(&reply).await;
@@ -1485,16 +1526,52 @@ impl LogicState {
             }
             ClientMessage::Login {
                 username,
+                identifier,
                 password,
                 device_id,
                 ..
             } => {
-                let reply = self.app.login(&username, &password, device_id).await;
+                // The identifier is what the player typed: a username or an
+                // email address (spec "Login and Session Issuance"). The
+                // legacy field is the fallback.
+                let identifier = identifier
+                    .clone()
+                    .or_else(|| username.clone())
+                    .unwrap_or_default();
+                let client = self.auth_client(&logic_conn.connection_id, device_id.as_deref());
+                let reply = self
+                    .app
+                    .login(&identifier, &password, device_id, &client)
+                    .await;
                 self.mirror_if_session(&reply).await;
                 reply
             }
+            ClientMessage::ResumeSession { token, .. } => self.app.resume_session(&token),
+            ClientMessage::ForgotPassword { email, .. } => {
+                self.app
+                    .forgot_password(&email, &self.auth_client(&logic_conn.connection_id, None))
+                    .await
+            }
+            ClientMessage::ResetPassword { token, password, .. } => {
+                self.app.reset_password(&token, &password).await
+            }
+            ClientMessage::VerifyEmail { token, .. } => self.app.verify_email(&token).await,
+            ClientMessage::ResendVerification { token, .. } => {
+                self.app
+                    .resend_verification(&token, &self.auth_client(&logic_conn.connection_id, None))
+                    .await
+            }
+            ClientMessage::ChangeEmail { token, email, .. } => {
+                self.app
+                    .change_email(
+                        &token,
+                        &email,
+                        &self.auth_client(&logic_conn.connection_id, None),
+                    )
+                    .await
+            }
             ClientMessage::Logout { token, .. } => {
-                let reply = self.app.logout(&token);
+                let reply = self.app.logout(&token).await;
                 // Phase 3 (task 4.5): revoke the mirrored session so the
                 // token is invalid on every logic node at once. When the
                 // local store has no such session it was issued by another
@@ -1686,6 +1763,7 @@ impl LogicState {
             v: VERSION,
             code: code.as_str().to_string(),
             message: code.message().to_string(),
+            field: None,
         };
         self.send_to_transport(
             &logic_conn.connection_id,
@@ -1817,7 +1895,8 @@ mod tests {
     fn control_and_move_messages_use_separate_pools() {
         let login = ClientMessage::Login {
             v: VERSION,
-            username: "u".into(),
+            username: Some("u".into()),
+            identifier: None,
             password: "p".into(),
             device_id: None,
         };
@@ -1894,6 +1973,7 @@ mod tests {
                     v: VERSION,
                     code: code.to_string(),
                     message: code.to_string(),
+                    field: None,
                 },
             },
             connection_id: conn.to_string(),

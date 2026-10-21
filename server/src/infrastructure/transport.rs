@@ -309,6 +309,7 @@ pub fn error_message(code: ErrorCode) -> ServerMessage {
         v: crate::interface::protocol::VERSION,
         code: code.as_str().to_string(),
         message: code.message().to_string(),
+        field: None,
     }
 }
 

@@ -965,7 +965,8 @@ mod tests {
                 v: VERSION,
                 code: code.to_string(),
                 message: code.to_string(),
-            },
+                field: None,
+},
         };
 
         // Interleave: a1, b1, a2, b2 - per-connection order must be a1<a2 and b1<b2.
@@ -1018,7 +1019,8 @@ mod tests {
                 v: VERSION,
                 code: "single".to_string(),
                 message: "single".to_string(),
-            },
+                field: None,
+},
         };
         super::dispatch_outbound_wire(&outboxes, OutboundWire::Envelope(envelope));
 
@@ -1030,7 +1032,8 @@ mod tests {
                 v: VERSION,
                 code: "dropped".to_string(),
                 message: "dropped".to_string(),
-            },
+                field: None,
+},
         };
         // Must not panic when the connection has no outbox.
         super::dispatch_outbound_wire(&outboxes, OutboundWire::Envelope(unknown));

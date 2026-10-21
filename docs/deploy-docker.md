@@ -202,7 +202,95 @@ docker run --rm \
 docker compose -f docker-compose.prod.yml start ws-server
 ```
 
-## 7. Box capacity (record on first deploy)
+## 7. Mail (password reset and email verification)
+
+The account flows need a way to deliver two messages: the confirmation of an
+email address and the password-reset link. The transport is selected by
+configuration, so the deployment works before a provider or a domain exists.
+
+| `EMAIL_TRANSPORT` | What it does | When |
+|-------------------|--------------|------|
+| `log` | Writes the whole message to the server log | Development and CI. The log holds the link, so the flow is complete and testable. |
+| `resend` (the production default) | Sends the message through the provider's API | Production, once a credential and a sending domain exist. |
+
+`EMAIL_TRANSPORT=log` is **refused at startup** when `DEPLOYMENT_MODE=production`:
+the message carries a one-time token, and a token in a production log is a
+credential in a log.
+
+### Development (no provider, no domain)
+
+```sh
+# .env — the development pair
+EMAIL_TRANSPORT=log
+DEPLOYMENT_MODE=development
+PUBLIC_BASE_URL=plaintextchess://app
+```
+
+The production defaults are `EMAIL_TRANSPORT=resend` and
+`DEPLOYMENT_MODE=production`: a deployment that was never configured cannot
+start with the log transport, so a token cannot reach a production log by
+accident.
+
+The link the player would receive is in the log:
+
+```sh
+docker compose -f docker-compose.prod.yml logs ws-server | grep -A3 'email body'
+```
+
+The app opens the same link through its own scheme (`plaintextchess://app/...`),
+so a reset can be completed on a device without any server setup.
+
+### Production (a real provider)
+
+```sh
+cp secrets/resend_key.example secrets/resend_key
+# put the provider's credential in it
+chmod 600 secrets/resend_key
+```
+
+```sh
+# .env
+EMAIL_TRANSPORT=resend
+DEPLOYMENT_MODE=production
+EMAIL_FROM=no-reply@play.tudominio.com
+PUBLIC_BASE_URL=https://play.tudominio.com
+```
+
+The credential is read from the file `EMAIL_API_KEY_FILE` points at, which the
+compose mounts at `/run/secrets/resend_key`. It never sits in the container's
+environment, so `docker inspect` does not show it. The inline `EMAIL_API_KEY`
+is accepted as a fallback, for CI.
+
+The sending domain needs its DNS records (SPF, DKIM, and the provider's
+return-path record) before the messages are delivered. Until then, the provider
+accepts the request and the mail lands in spam.
+
+### The trusted proxy
+
+The rate limit keys on the client's address, which the reverse proxy reports in
+`X-Forwarded-For`. That header is a claim, so it is used only when the peer is
+one of the configured proxies:
+
+```sh
+# .env: the docker network the proxy lives in
+AUTH_TRUSTED_PROXY_CIDRS=172.16.0.0/12
+```
+
+With no trusted proxy configured, the server keys every attempt on the peer's
+own address, which behind the proxy is the proxy's.
+
+The attempt limits are configured too, and they apply per address *and* per
+device, so a shared network does not lock everybody out:
+
+```sh
+# .env
+AUTH_RATE_LIMIT_LOGIN_PER_MIN=10
+AUTH_RATE_LIMIT_REGISTER_PER_HOUR=20
+```
+
+`0` means no limit. The limits are in memory: a restart clears them.
+
+## 8. Box capacity (record on first deploy)
 
 The deployment holds many **live** games comfortably. Concurrent **room
 creation** is the sharper limit: the monolith profile measured 24.7% setup

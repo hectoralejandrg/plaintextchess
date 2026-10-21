@@ -21,6 +21,12 @@ redis = { version = "0.26", features = ["tokio-comp", "connection-manager", "scr
 # hash is the right choice there and no second KDF is needed).
 argon2 = "0.5"
 sha2 = "0.10"
+# The mail transport and the breached-password check need an outbound HTTPS
+# client. ureq keeps the tree small and brings its own TLS (rustls, bundled
+# roots), so the runtime image needs no OpenSSL.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# The breach corpus's k-anonymity API is keyed by SHA-1.
+sha1 = "0.10"
 
 [dev-dependencies]
 futures-util = "0.3"

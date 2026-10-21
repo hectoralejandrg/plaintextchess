@@ -220,6 +220,23 @@ enum OnlineErrorCode: String, Codable, Equatable, CaseIterable {
     case sessionExpired = "session_expired"
     case invalidRequest = "invalid_request"
     case invalidDisplayName = "invalid_display_name"
+    /// The email address is already registered (spec "Email Identity").
+    case emailTaken = "email_taken"
+    /// Too many attempts; the message says when to try again (spec
+    /// "Authentication Rate Limiting").
+    case tooManyAttempts = "too_many_attempts"
+    /// The confirmation link is unknown, expired, already used, or belongs
+    /// to another address.
+    case invalidVerificationToken = "invalid_verification_token"
+    /// A code this build does not know. It is shown like any other error
+    case invalidResetToken = "invalid_reset_token"
+    /// The account's email address is not confirmed yet.
+    case emailNotVerified = "email_not_verified"
+    /// The message could not be sent.
+    case emailUnavailable = "email_unavailable"
+    /// A code this build does not know. It is shown like any other error
+    /// instead of failing the frame, which would drop the connection.
+    case unknown = "unknown"
 
     /// Human-readable fallback when the server's message is missing. The auth
     /// entries mirror the server's texts (`ErrorCode::message`), so a refused
@@ -256,6 +273,20 @@ enum OnlineErrorCode: String, Codable, Equatable, CaseIterable {
             return "A field failed validation"
         case .invalidDisplayName:
             return "A display name must be 1 to 32 characters with no control characters"
+        case .emailTaken:
+            return "That email address is already registered"
+        case .tooManyAttempts:
+            return "Too many attempts; try again later"
+        case .invalidResetToken:
+            return "That link is no longer valid"
+        case .emailNotVerified:
+            return "This email address is not confirmed yet"
+        case .emailUnavailable:
+            return "The message could not be sent; try again later"
+        case .invalidVerificationToken:
+            return "That confirmation link is no longer valid"
+        case .unknown:
+            return "The server refused the request"
         }
     }
 }
@@ -297,10 +328,27 @@ enum OnlineClientMessage: Codable, Equatable {
     case createRoom(playerID: String, timeControl: String?)
     case joinRoom(playerID: String, roomCode: String)
     case move(uci: String)
-    case register(username: String, password: String, deviceID: String?)
-    case login(username: String, password: String, deviceID: String?)
+    /// Create an account: the username is the public handle, the email is
+    /// the private identity (spec "Player Account Registration").
+    case register(username: String, email: String, password: String, deviceID: String?)
+    /// Sign in with the identifier the player typed: a username or an email
+    /// address (spec "Login and Session Issuance").
+    case login(identifier: String, password: String, deviceID: String?)
     case logout(token: String)
     case setProfile(token: String, displayName: String)
+    /// Resume the session the client stored earlier (spec "Session
+    /// Resumption").
+    case resumeSession(token: String)
+    /// Ask for a password-reset link (spec "Password Reset by Email").
+    case forgotPassword(email: String)
+    /// Set a new password with a reset token.
+    case resetPassword(token: String, password: String)
+    /// Confirm an email address with the token the player received.
+    case verifyEmail(token: String)
+    /// Ask for another verification message.
+    case resendVerification(token: String)
+    /// Ask for a different email address.
+    case changeEmail(token: String, email: String)
     case resign
     case leave
     /// Join an Arena tournament's waiting pool (add-tournaments phase 1).
@@ -315,6 +363,8 @@ enum OnlineClientMessage: Codable, Equatable {
         case roomCode = "room_code"
         case timeControl = "time_control"
         case username
+        case email
+        case identifier
         case password
         case token
         case displayName = "display_name"
@@ -348,14 +398,39 @@ enum OnlineClientMessage: Codable, Equatable {
             self = .leave
         case "register":
             let username = try container.decode(String.self, forKey: .username)
+            let email = try container.decodeIfPresent(String.self, forKey: .email) ?? ""
             let password = try container.decode(String.self, forKey: .password)
             let deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID)
-            self = .register(username: username, password: password, deviceID: deviceID)
+            self = .register(username: username, email: email, password: password, deviceID: deviceID)
         case "login":
-            let username = try container.decode(String.self, forKey: .username)
+            // The identifier is what the player typed; the legacy `username`
+            // field is the fallback.
+            let identifier = try container.decodeIfPresent(String.self, forKey: .identifier)
+                ?? container.decodeIfPresent(String.self, forKey: .username)
+                ?? ""
             let password = try container.decode(String.self, forKey: .password)
             let deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID)
-            self = .login(username: username, password: password, deviceID: deviceID)
+            self = .login(identifier: identifier, password: password, deviceID: deviceID)
+        case "resume_session":
+            let token = try container.decode(String.self, forKey: .token)
+            self = .resumeSession(token: token)
+        case "forgot_password":
+            let email = try container.decode(String.self, forKey: .email)
+            self = .forgotPassword(email: email)
+        case "reset_password":
+            let token = try container.decode(String.self, forKey: .token)
+            let password = try container.decode(String.self, forKey: .password)
+            self = .resetPassword(token: token, password: password)
+        case "verify_email":
+            let token = try container.decode(String.self, forKey: .token)
+            self = .verifyEmail(token: token)
+        case "resend_verification":
+            let token = try container.decode(String.self, forKey: .token)
+            self = .resendVerification(token: token)
+        case "change_email":
+            let token = try container.decode(String.self, forKey: .token)
+            let email = try container.decode(String.self, forKey: .email)
+            self = .changeEmail(token: token, email: email)
         case "logout":
             let token = try container.decode(String.self, forKey: .token)
             self = .logout(token: token)
@@ -396,20 +471,48 @@ enum OnlineClientMessage: Codable, Equatable {
             try container.encode("resign", forKey: .type)
         case .leave:
             try container.encode("leave", forKey: .type)
-        case .register(let username, let password, let deviceID):
+        case .register(let username, let email, let password, let deviceID):
             try container.encode("register", forKey: .type)
             try container.encode(username, forKey: .username)
+            if !email.isEmpty {
+                try container.encode(email, forKey: .email)
+            }
             try container.encode(password, forKey: .password)
             if let deviceID {
                 try container.encode(deviceID, forKey: .deviceID)
             }
-        case .login(let username, let password, let deviceID):
+        case .login(let identifier, let password, let deviceID):
             try container.encode("login", forKey: .type)
-            try container.encode(username, forKey: .username)
+            // The identifier is sent twice: as `identifier` for a server that
+            // knows it, and as the legacy `username` for a server that does
+            // not. An old server requires the field, and a frame it cannot
+            // decode costs the connection.
+            try container.encode(identifier, forKey: .identifier)
+            try container.encode(identifier, forKey: .username)
             try container.encode(password, forKey: .password)
             if let deviceID {
                 try container.encode(deviceID, forKey: .deviceID)
             }
+        case .resumeSession(let token):
+            try container.encode("resume_session", forKey: .type)
+            try container.encode(token, forKey: .token)
+        case .forgotPassword(let email):
+            try container.encode("forgot_password", forKey: .type)
+            try container.encode(email, forKey: .email)
+        case .resetPassword(let token, let password):
+            try container.encode("reset_password", forKey: .type)
+            try container.encode(token, forKey: .token)
+            try container.encode(password, forKey: .password)
+        case .verifyEmail(let token):
+            try container.encode("verify_email", forKey: .type)
+            try container.encode(token, forKey: .token)
+        case .resendVerification(let token):
+            try container.encode("resend_verification", forKey: .type)
+            try container.encode(token, forKey: .token)
+        case .changeEmail(let token, let email):
+            try container.encode("change_email", forKey: .type)
+            try container.encode(token, forKey: .token)
+            try container.encode(email, forKey: .email)
         case .logout(let token):
             try container.encode("logout", forKey: .type)
             try container.encode(token, forKey: .token)
@@ -477,8 +580,24 @@ enum OnlineServerMessage: Codable, Equatable {
     /// Incremental per-move / terminal update (server "Game Authority").
     case update(OnlineUpdate)
     /// Structured business-rule error (the connection stays open).
-    case error(code: OnlineErrorCode, message: String)
-    case session(token: String)
+    ///
+    /// `field` names the field that was refused, so the client can mark the
+    /// right input without reading the message (spec "Authentication Error
+    /// Codes").
+    case error(code: OnlineErrorCode, message: String, field: String?)
+    /// A newly issued session.
+    case session(token: String, username: String, displayName: String, emailVerified: Bool)
+    /// The session a stored token resumed: no new token, no new expiry.
+    case sessionResumed(username: String, emailVerified: Bool)
+    /// The acknowledgement of a password-reset request. The same answer for
+    /// a registered and an unregistered address.
+    case passwordResetRequested
+    /// The password was changed. It carries no session.
+    case passwordReset
+    /// The acknowledgement of a verification request.
+    case emailVerificationRequested
+    /// The account's email address is confirmed.
+    case emailVerified(emailVerified: Bool)
     case profileUpdated
     case sessionOk
     /// Registered in a tournament's waiting pool (add-tournaments phase 1).
@@ -502,7 +621,11 @@ enum OnlineServerMessage: Codable, Equatable {
         case state
         case code
         case message
+        case field
         case token
+        case username
+        case displayName = "display_name"
+        case emailVerified = "email_verified"
         case tournamentID = "tournament_id"
         case entries
         case finalStandings = "final_standings"
@@ -527,12 +650,35 @@ enum OnlineServerMessage: Codable, Equatable {
         case "update":
             self = .update(try OnlineUpdate(from: decoder))
         case "error":
-            let code = try container.decode(OnlineErrorCode.self, forKey: .code)
+            // The code is decoded leniently: a code this build does not know
+            // must not fail the frame, or the socket would be dropped
+            // instead of showing the error.
+            let rawCode = try container.decode(String.self, forKey: .code)
+            let code = OnlineErrorCode(rawValue: rawCode) ?? .unknown
             let message = try container.decode(String.self, forKey: .message)
-            self = .error(code: code, message: message)
+            let field = try container.decodeIfPresent(String.self, forKey: .field)
+            self = .error(code: code, message: message, field: field)
         case "session":
             let token = try container.decode(String.self, forKey: .token)
-            self = .session(token: token)
+            // The verification flag is absent on a server that does not know
+            // about it, so it defaults to "not confirmed".
+            let emailVerified = try container.decodeIfPresent(Bool.self, forKey: .emailVerified) ?? false
+            let username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
+            let displayName = try container.decodeIfPresent(String.self, forKey: .displayName) ?? username
+            self = .session(token: token, username: username, displayName: displayName, emailVerified: emailVerified)
+        case "session_resumed":
+            let username = try container.decodeIfPresent(String.self, forKey: .username) ?? ""
+            let emailVerified = try container.decodeIfPresent(Bool.self, forKey: .emailVerified) ?? false
+            self = .sessionResumed(username: username, emailVerified: emailVerified)
+        case "password_reset_requested":
+            self = .passwordResetRequested
+        case "password_reset":
+            self = .passwordReset
+        case "email_verification_requested":
+            self = .emailVerificationRequested
+        case "email_verified":
+            let emailVerified = try container.decodeIfPresent(Bool.self, forKey: .emailVerified) ?? true
+            self = .emailVerified(emailVerified: emailVerified)
         case "profile_updated":
             self = .profileUpdated
         case "session_ok":
@@ -579,13 +725,32 @@ enum OnlineServerMessage: Codable, Equatable {
         case .update(let update):
             try container.encode("update", forKey: .type)
             try update.encode(to: encoder)
-        case .error(let code, let message):
+        case .error(let code, let message, let field):
             try container.encode("error", forKey: .type)
             try container.encode(code, forKey: .code)
             try container.encode(message, forKey: .message)
-        case .session(let token):
+            if let field {
+                try container.encode(field, forKey: .field)
+            }
+        case .session(let token, let username, let displayName, let emailVerified):
             try container.encode("session", forKey: .type)
             try container.encode(token, forKey: .token)
+            try container.encode(username, forKey: .username)
+            try container.encode(displayName, forKey: .displayName)
+            try container.encode(emailVerified, forKey: .emailVerified)
+        case .sessionResumed(let username, let emailVerified):
+            try container.encode("session_resumed", forKey: .type)
+            try container.encode(username, forKey: .username)
+            try container.encode(emailVerified, forKey: .emailVerified)
+        case .passwordResetRequested:
+            try container.encode("password_reset_requested", forKey: .type)
+        case .passwordReset:
+            try container.encode("password_reset", forKey: .type)
+        case .emailVerificationRequested:
+            try container.encode("email_verification_requested", forKey: .type)
+        case .emailVerified(let emailVerified):
+            try container.encode("email_verified", forKey: .type)
+            try container.encode(emailVerified, forKey: .emailVerified)
         case .profileUpdated:
             try container.encode("profile_updated", forKey: .type)
         case .sessionOk:

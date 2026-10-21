@@ -915,6 +915,7 @@ async fn split_mode_auth_is_decided_by_logic() {
         &mut p,
         ClientMessage::Register {
             v: VERSION,
+            email: Some("ana@example.com".into()),
             username: "e2e-ana".into(),
             password: "correcthorsebattery".into(),
             device_id: Some("device-auth".into()),
@@ -929,7 +930,8 @@ async fn split_mode_auth_is_decided_by_logic() {
         &mut p2,
         ClientMessage::Login {
             v: VERSION,
-            username: "e2e-ana".into(),
+            identifier: None,
+            username: Some("e2e-ana".into()),
             password: "correcthorsebattery".into(),
             device_id: Some("device-auth-2".into()),
         },
@@ -943,7 +945,8 @@ async fn split_mode_auth_is_decided_by_logic() {
         &mut p3,
         ClientMessage::Login {
             v: VERSION,
-            username: "e2e-ana".into(),
+            identifier: None,
+            username: Some("e2e-ana".into()),
             password: "wrong-password".into(),
             device_id: Some("device-auth-3".into()),
         },
@@ -1105,6 +1108,7 @@ async fn split_mode_login_mid_connection_keeps_one_room_per_account() {
         &mut pa,
         ClientMessage::Register {
             v: VERSION,
+            email: Some("ana@example.com".into()),
             username: "e2e-d8-ana".into(),
             password: "correcthorsebattery".into(),
             device_id: Some("device-d8a".into()),
@@ -2582,6 +2586,7 @@ async fn cross_instance_session_round_trip() {
         &mut c1,
         ClientMessage::Register {
             v: VERSION,
+            email: Some("ana@example.com".into()),
             username: "e2e-session-user".into(),
             password: "password-123".into(),
             device_id: Some("device-e2e-sess".into()),
@@ -3937,6 +3942,7 @@ async fn unseated_connections_stay_unbound() {
         &mut guest,
         ClientMessage::Register {
             v: VERSION,
+            email: Some("ana@example.com".into()),
             username: "rt-guest".into(),
             password: "hunter2hunter2".into(),
             device_id: None,

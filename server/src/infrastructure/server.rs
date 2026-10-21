@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::application::ports::{
-    Accounts, AuthRecorder, ChessEngine, GameRecorder, PlayerAuth, ProfileStore, RatingMirror,
-    Ratings, RoomRegistry, RoomServices, SessionLookup, Sessions, TimeSource, TournamentRecorder,
+    Accounts, AuthError, AuthRecorder, AuthTokens, ChessEngine, EmailSender, GameRecorder,
+    PlayerAuth, ProfileStore, RatingMirror, Ratings, RoomRegistry, RoomServices, SessionLookup,
+    Sessions, TimeSource, TournamentRecorder,
 };
 use crate::infrastructure::broker::Broker;
 use crate::application::room_actor::{run_room, RoomMsg};
@@ -26,6 +27,13 @@ use crate::domain::time_control::TimeControl;
 use crate::domain::tournament::{Tournament, TournamentStatus};
 use crate::infrastructure::auth::{NoopAuthRecorder, PlayerAuthStore};
 use crate::infrastructure::auth_recorder::SqliteAuthRecorder;
+use crate::infrastructure::email::{
+    reset_email, reset_link, verification_email, verification_link, LogEmailSender,
+    RESET_TOKEN_TTL_SECS, VERIFICATION_TOKEN_TTL_SECS,
+};
+use crate::infrastructure::net::Cidr;
+use crate::infrastructure::password::generate_token;
+use crate::infrastructure::rate_limit::{RateDecision, RateLimiter};
 use crate::infrastructure::config::Config;
 use crate::infrastructure::engine::CoreEngine;
 use crate::infrastructure::password::{hash_token, now_ms, PasswordHasher};
@@ -122,7 +130,34 @@ pub struct App {
     /// `JoinTournament`/`ListTournaments` to the right mailbox.
     tournaments: Mutex<HashMap<String, TournamentHandle>>,
     tournament_recorder: Arc<dyn TournamentRecorder>,
+    /// The transport that delivers the transactional messages (spec
+    /// "Pluggable Email Delivery").
+    email_sender: Arc<dyn EmailSender>,
+    /// The attempt windows (spec "Authentication Rate Limiting").
+    rate_limiter: Arc<RateLimiter>,
+    /// The proxy networks whose forwarding header may be trusted.
+    trusted_networks: Vec<Cidr>,
+    /// A hash no account has, used to give an attempt with an unknown
+    /// identifier the same cost as one with a wrong password (spec
+    /// "Credential Attempts Do Not Reveal Account Existence").
+    dummy_hash: std::sync::OnceLock<String>,
 }
+
+/// Who is making an authentication attempt (spec "Authentication Rate
+/// Limiting").
+#[derive(Debug, Clone, Default)]
+pub struct AuthClient {
+    /// The address the attempt is keyed by: the client's address as the
+    /// reverse proxy saw it, or the peer's own address.
+    pub address: String,
+    /// The device the attempt is keyed by, when the client declared one.
+    pub device_id: Option<String>,
+}
+
+/// The window a registration attempt is counted in.
+const REGISTER_WINDOW_MS: i64 = 60 * 60 * 1000;
+/// The window a sign-in attempt is counted in.
+const LOGIN_WINDOW_MS: i64 = 60 * 1000;
 
 impl RoomRegistry for App {
     fn remove_room(&self, code: &str) {
@@ -186,6 +221,12 @@ impl App {
             broker: None,
             tournaments: Mutex::new(HashMap::new()),
             tournament_recorder: Arc::new(NoopTournamentRecorder),
+            // A run without a database delivers no mail: the tests that use
+            // this constructor are not about mail.
+            email_sender: Arc::new(LogEmailSender),
+            rate_limiter: Arc::new(RateLimiter::new()),
+            trusted_networks: Vec::new(),
+            dummy_hash: std::sync::OnceLock::new(),
         }
     }
 
@@ -196,6 +237,21 @@ impl App {
     /// never a half-initialized app — when the database cannot be created,
     /// opened, or migrated.
     pub async fn init(config: Config) -> Result<Self, String> {
+        // The transport is built from the configuration; the test hook below
+        // is the only way to replace it.
+        let email_sender = crate::infrastructure::email::from_config(&config)
+            .map_err(|err| format!("the email transport is not usable: {err}"))?;
+        Self::init_with_email_sender(config, email_sender).await
+    }
+
+    /// The production constructor with an explicit mail transport.
+    ///
+    /// A test injects a recording transport so it can read the messages the
+    /// flows deliver; everything else behaves exactly as in `init`.
+    pub async fn init_with_email_sender(
+        config: Config,
+        email_sender: Arc<dyn EmailSender>,
+    ) -> Result<Self, String> {
         let database_url = config.database_url.clone().ok_or_else(|| {
             "persistence is disabled: App::init requires a Config with database_url \
              (use App::new for the in-memory test path)"
@@ -258,20 +314,46 @@ impl App {
         let purged = SqliteAuthRecorder::purge_expired(&pool, started_at_ms)
             .await
             .map_err(|e| format!("purging expired sessions failed for `{database_url}`: {e}"))?;
-        let (accounts, profiles, sessions) = SqliteAuthRecorder::load_all(&pool)
+        let purged_tokens = SqliteAuthRecorder::purge_expired_tokens(&pool, started_at_ms)
             .await
-            .map_err(|e| format!("loading player accounts failed for `{database_url}`: {e}"))?;
+            .map_err(|e| format!("purging expired email tokens failed for `{database_url}`: {e}"))?;
+        let (accounts, profiles, sessions, verification_tokens, reset_tokens) =
+            SqliteAuthRecorder::load_all(&pool)
+                .await
+                .map_err(|e| {
+                    format!("loading player accounts failed for `{database_url}`: {e}")
+                })?;
+
+        let trusted_networks = crate::infrastructure::net::trusted_networks(
+            &config.auth_trusted_proxy_cidrs,
+        );
+        if config.production_mode && trusted_networks.is_empty() {
+            // Behind the reverse proxy every player would share one bucket,
+            // and the limit would fall on everybody (spec "Authentication
+            // Rate Limiting").
+            tracing::warn!(
+                "AUTH_TRUSTED_PROXY_CIDRS is empty: every client behind the proxy shares one rate-limit bucket; set it to the proxy's network"
+            );
+        }
 
         let auth = Arc::new(PlayerAuthStore::new());
         for account in accounts {
             // A duplicate here is unreachable: `account_id` is the primary key
             // and the store starts empty. Logged rather than ignored silently
             // so a corrupt file is visible.
-            if let Err(err) = auth.insert_account(account) {
+            if let Err(err) = auth.insert_account(account.clone()) {
                 tracing::error!(
                     error = %err,
                     "a persisted account could not be loaded and was skipped"
                 );
+                continue;
+            }
+            // The pending-address reservations are rebuilt from the loaded
+            // accounts: they are what keeps two accounts from claiming the
+            // same address while their change is pending (spec "Email
+            // Change").
+            if let Some(key) = account.pending_email_key.clone() {
+                auth.reserve_pending_email(&key, &account.account_id);
             }
         }
         // `create_profile` fills both the profile row and the device→account
@@ -282,8 +364,20 @@ impl App {
         for session in sessions {
             auth.insert_session(session);
         }
+        // The email tokens that are still within their lifetime: a link sent
+        // before a restart still works (spec "Email Verification", "Password
+        // Reset by Email").
+        for token in verification_tokens {
+            auth.insert_verification_token(token);
+        }
+        for token in reset_tokens {
+            auth.insert_reset_token(token);
+        }
         if purged > 0 {
             tracing::info!(purged, "dropped expired sessions at startup");
+        }
+        if purged_tokens > 0 {
+            tracing::info!(purged = purged_tokens, "dropped expired email tokens at startup");
         }
         tracing::info!(
             accounts = auth.account_count(),
@@ -304,6 +398,10 @@ impl App {
             auth,
             auth_recorder: Arc::new(SqliteAuthRecorder::new(pool)),
             broker: None,
+            email_sender,
+            rate_limiter: Arc::new(RateLimiter::new()),
+            trusted_networks,
+            dummy_hash: std::sync::OnceLock::new(),
             tournaments: Mutex::new(HashMap::new()),
             tournament_recorder,
         })
@@ -378,6 +476,43 @@ impl App {
                 guest()
             }
         }
+    }
+
+    /// The address an attempt is keyed by (spec "Authentication Rate
+    /// Limiting").
+    ///
+    /// The forwarding header is used only when the peer is one of the
+    /// configured trusted proxies; from any other peer the peer's own
+    /// address is the answer.
+    pub fn client_address(
+        &self,
+        peer: Option<std::net::SocketAddr>,
+        forwarded: Option<&str>,
+    ) -> String {
+        crate::infrastructure::net::client_address(peer, forwarded, &self.trusted_networks)
+    }
+
+    /// The transport that delivers the transactional messages.
+    pub fn email_sender(&self) -> &Arc<dyn EmailSender> {
+        &self.email_sender
+    }
+
+    /// The authentication features this server supports (spec "Server Health
+    /// and Configuration").
+    ///
+    /// The names are part of the contract: a client branches on them, so
+    /// they cannot change once published.
+    pub fn auth_features(&self) -> Vec<&'static str> {
+        let mut features = vec![
+            "password_reset",
+            "email_verification",
+            "email_change",
+            "session_resumption",
+        ];
+        if self.config.hibp_enabled {
+            features.push("breached_password_refusal");
+        }
+        features
     }
 
     /// The authentication authority, for the WebSocket auth handlers (spec
@@ -763,29 +898,96 @@ impl App {
 
 /// Auth methods for the logic tier (extracted from ws.rs for reuse).
 impl App {
-    /// Register a new account (mirrors ws.rs::register).
+    /// Register a new account (spec "Player Account Registration").
+    ///
+    /// The username, the email address, and the password are all required:
+    /// the email is the account's private identity, and the address is where
+    /// a password reset would be sent.
     pub async fn register(
         self: &Arc<Self>,
         username: &str,
+        email: Option<&str>,
         password: &str,
         device_id: Option<String>,
+        client: &AuthClient,
     ) -> ServerMessage {
-        use crate::domain::account::{validate_password, validate_username, PasswordError};
-        use crate::infrastructure::password::now_ms;
+        use crate::domain::account::{
+            email_key, is_rejected_username, password_matches_username, validate_email,
+            validate_password, validate_username,
+        };
 
-        // Validate before hashing
+        // The limit runs first: a refused attempt must not cost an argon2
+        // pass (spec "Authentication Rate Limiting").
+        if let Some(refusal) = self.rate_limited(
+            "register",
+            client,
+            self.config.auth_rate_limit_register_per_hour,
+            REGISTER_WINDOW_MS,
+        ) {
+            return refusal;
+        }
+
+        // Validate before hashing, so a rejected input costs nothing (spec
+        // "Credential and Session Data Protection").
         let username = match validate_username(username) {
             Ok(username) => username,
             Err(err) => return self.username_error_message(err),
         };
-        if let Err(PasswordError::Length) = validate_password(password) {
+        let Some(raw_email) = email else {
+            return ErrorCode::InvalidRequest
+                .with_field("email", "an email address is required to create an account");
+        };
+        let email = match validate_email(raw_email) {
+            Ok(email) => email,
+            Err(err) => return self.email_error_message(err),
+        };
+        if validate_password(password).is_err() {
             return self.password_error_message();
+        }
+        if password_matches_username(password, &username) {
+            return ErrorCode::InvalidRequest
+                .with_field("password", "the password must not be the username");
+        }
+        if is_rejected_username(&username) {
+            // The reject list is a policy, not a security boundary: the
+            // refusal names the field and nothing else (spec "Username
+            // Uniqueness and Rejection").
+            tracing::info!(username = %username, "registration refused: the username is on the reject list");
+            return ErrorCode::InvalidRequest
+                .with_field("username", "that username cannot be used");
+        }
+
+        // The mail-domain check is advisory: it never refuses, and it must
+        // not hold the request up, so it runs in a blocking task (spec
+        // "Email Identity").
+        {
+            let address = email.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::infrastructure::email::domain::check_and_record(&address);
+            });
         }
 
         let store = self.auth();
         if store.account_by_username(&username).is_some() {
+            // Checked before any hashing, so a taken username cannot be used
+            // to make the server spend argon2 time.
             tracing::info!(username = %username, "registration refused: the username is taken");
-            return ServerMessage::error(ErrorCode::UsernameTaken);
+            return ErrorCode::UsernameTaken.with_field("username", ErrorCode::UsernameTaken.message());
+        }
+        let email_key = email_key(&email);
+        if store.account_by_email(&email_key).is_some() {
+            tracing::info!("registration refused: the email address is taken");
+            return ErrorCode::EmailTaken.with_field("email", ErrorCode::EmailTaken.message());
+        }
+
+        // The breach check (spec "Breached Password Refusal"). It runs
+        // before the account is created, so a breached password never
+        // reaches the database.
+        if self.config.hibp_enabled && self.is_breached(password).await {
+            return ErrorCode::InvalidRequest.with_field(
+                "password",
+                "that password appears in a known data breach; choose another one",
+            );
         }
 
         let tooling = self.auth_tooling();
@@ -803,11 +1005,22 @@ impl App {
             username_key: crate::domain::account::username_key(&username),
             password_hash,
             display_name: None,
+            email: Some(email.clone()),
+            email_key: Some(email_key),
+            email_verified: false,
+            pending_email: None,
+            pending_email_key: None,
             created_at_ms: now_ms(),
         };
         if let Err(err) = store.insert_account(account.clone()) {
-            tracing::info!(username = %username, error = %err, "registration refused: the username is taken");
-            return ServerMessage::error(ErrorCode::UsernameTaken);
+            tracing::info!(username = %username, error = %err, "registration refused");
+            return match err {
+                AuthError::DuplicateEmail => {
+                    ErrorCode::EmailTaken.with_field("email", ErrorCode::EmailTaken.message())
+                }
+                _ => ErrorCode::UsernameTaken
+                    .with_field("username", ErrorCode::UsernameTaken.message()),
+            };
         }
         let recorder = self.auth_recorder().clone();
         let written = account.clone();
@@ -816,11 +1029,20 @@ impl App {
         })
         .await;
 
+        // A device known at registration time is bound right away (spec
+        // "Device-to-Account Profile Linkage"); otherwise the first room
+        // message carrying this session's token binds it.
         if let Some(device) = device_id.as_deref() {
             self.link_device_to(device, &account.account_id).await;
         }
 
         let (token, expires_at_ms) = self.issue_session(&account, device_id.as_deref()).await;
+
+        // The verification message (spec "Email Verification"). A delivery
+        // that fails does not undo the account: the player can ask again.
+        let address = account.email.clone().unwrap_or_default();
+        self.send_verification(&account, &address).await;
+
         tracing::info!(
             account_id = %account.account_id,
             username = %account.username,
@@ -829,22 +1051,47 @@ impl App {
         self.session_message(&account, &token, expires_at_ms)
     }
 
-    /// Login (mirrors ws.rs::login).
+    /// Sign in with an identifier (spec "Login and Session Issuance").
+    ///
+    /// The identifier is the account's username or its email address.
     pub async fn login(
         self: &Arc<Self>,
-        username: &str,
+        identifier: &str,
         password: &str,
         device_id: Option<String>,
+        client: &AuthClient,
     ) -> ServerMessage {
         use crate::domain::account::validate_password;
 
+        if let Some(refusal) = self.rate_limited(
+            "login",
+            client,
+            self.config.auth_rate_limit_login_per_min,
+            LOGIN_WINDOW_MS,
+        ) {
+            return refusal;
+        }
+
+        // A password outside the accepted length never reaches argon2 (spec
+        // "Credential and Session Data Protection").
         if validate_password(password).is_err() {
+            // Reported as a credential failure, not a format failure: a login
+            // asserts something about existing data, and "too short" would
+            // tell an attacker a fact about the account they do not otherwise
+            // get.
             tracing::info!("login refused: the password is outside the accepted length");
             return ServerMessage::error(ErrorCode::InvalidCredentials);
         }
 
         let store = self.auth();
-        let Some(account) = store.account_by_username(username) else {
+        let account = store
+            .account_by_username(identifier)
+            .or_else(|| store.account_by_email(identifier));
+        let Some(account) = account else {
+            // The same work as a wrong password, so the time the reply takes
+            // does not disclose whether the account exists (spec "Credential
+            // Attempts Do Not Reveal Account Existence").
+            self.dummy_verification(password).await;
             tracing::info!("login refused: no such account");
             return ServerMessage::error(ErrorCode::InvalidCredentials);
         };
@@ -859,6 +1106,8 @@ impl App {
             return ServerMessage::error(ErrorCode::InvalidCredentials);
         }
 
+        // A device that belonged to another account follows this one (spec
+        // "Guest Play Fallback", "Device-to-Account Profile Linkage").
         if let Some(device) = device_id.as_deref() {
             self.link_device_to(device, &account.account_id).await;
         }
@@ -872,8 +1121,512 @@ impl App {
         self.session_message(&account, &token, expires_at_ms)
     }
 
+    /// Resume a session the client stored earlier (spec "Session
+    /// Resumption").
+    ///
+    /// No new token is issued and the session's lifetime is not extended:
+    /// this is the same session the client already had.
+    pub fn resume_session(self: &Arc<Self>, token: &str) -> ServerMessage {
+        let store = self.auth();
+        let token_hash = hash_token(token);
+        let now_ms = now_ms();
+
+        let Some(session) = store.session_of_token_hash(&token_hash) else {
+            tracing::info!("resumption presented a token the server has never issued");
+            return ServerMessage::error(ErrorCode::NotAuthenticated);
+        };
+        match store.session_by_token_hash(&token_hash, now_ms) {
+            SessionLookup::Usable => {}
+            SessionLookup::Revoked => {
+                tracing::info!(account_id = %session.account_id, "resumption with a revoked session");
+                return ServerMessage::error(ErrorCode::NotAuthenticated);
+            }
+            SessionLookup::Absent => {
+                tracing::info!(account_id = %session.account_id, "resumption with an expired session");
+                return ServerMessage::error(ErrorCode::SessionExpired);
+            }
+        }
+
+        let Some(account) = store.account_by_id(&session.account_id) else {
+            return ServerMessage::error(ErrorCode::NotAuthenticated);
+        };
+        tracing::info!(account_id = %account.account_id, "session resumed");
+        ServerMessage::SessionResumed {
+            v: VERSION,
+            account_id: account.account_id.clone(),
+            username: account.username.clone(),
+            display_name: account.reported_name().to_string(),
+            expires_at_ms: session.expires_at_ms,
+            email_verified: account.email_verified,
+        }
+    }
+
+    /// Ask for a password-reset link (spec "Password Reset by Email").
+    ///
+    /// The answer is the same whether or not the address belongs to an
+    /// account, so the requester cannot learn which addresses are
+    /// registered.
+    pub async fn forgot_password(self: &Arc<Self>, email: &str, client: &AuthClient) -> ServerMessage {
+        use crate::domain::account::validate_email;
+
+        if let Some(refusal) = self.rate_limited(
+            "login",
+            client,
+            self.config.auth_rate_limit_login_per_min,
+            LOGIN_WINDOW_MS,
+        ) {
+            return refusal;
+        }
+
+        // A malformed address is answered with the same confirmation: the
+        // request is not about an account, it is about a message.
+        let Ok(email) = validate_email(email) else {
+            return ServerMessage::PasswordResetRequested { v: VERSION };
+        };
+
+        let store = self.auth();
+        let Some(account) = store.account_by_email(&email) else {
+            // Nothing is sent, and nothing is said: the answer is the same
+            // one a registered address gets.
+            tracing::info!("password reset requested for an address no account holds");
+            return ServerMessage::PasswordResetRequested { v: VERSION };
+        };
+        let Some(raw_email) = account.email.clone() else {
+            return ServerMessage::PasswordResetRequested { v: VERSION };
+        };
+
+        let token = generate_token();
+        let token_hash = hash_token(&token);
+        let created_at_ms = now_ms();
+        let expires_at_ms = created_at_ms + RESET_TOKEN_TTL_SECS * 1000;
+        let record = crate::domain::account::ResetToken {
+            account_id: account.account_id.clone(),
+            token_hash: token_hash.clone(),
+            created_at_ms,
+            expires_at_ms,
+            used_at_ms: None,
+        };
+        store.insert_reset_token(record.clone());
+        let recorder = self.auth_recorder().clone();
+        let written = record.clone();
+        let account_id = account.account_id.clone();
+        self.persist_auth(recorder, account_id.clone(), move |recorder| {
+            Box::pin(async move { recorder.record_reset_token(&written).await })
+        })
+        .await;
+
+        let link = reset_link(&self.config.public_base_url, &token);
+        let message = reset_email(&raw_email, &account.username, &link);
+        // The delivery happens in the background: the answer must not take
+        // longer for a registered address than for an unregistered one, or
+        // the timing tells the requester which addresses exist (spec
+        // "Password Reset by Email").
+        let sender = Arc::clone(self.email_sender());
+        let for_account = account_id.clone();
+        tokio::spawn(async move {
+            if let Err(err) = sender.send(&message).await {
+                // The token exists but was not delivered: the player asks
+                // again and a fresh token is issued.
+                tracing::warn!(error = %err, account_id = %for_account, "the password reset message could not be delivered");
+            }
+        });
+        tracing::info!(%account_id, "a password reset was requested");
+        ServerMessage::PasswordResetRequested { v: VERSION }
+    }
+
+    /// Set a new password with a reset token (spec "Password Reset by
+    /// Email"). No session is issued: the player signs in with the new
+    /// password.
+    pub async fn reset_password(self: &Arc<Self>, token: &str, password: &str) -> ServerMessage {
+        use crate::domain::account::validate_password;
+
+        if validate_password(password).is_err() {
+            return self.password_error_message();
+        }
+
+        let store = self.auth();
+        let token_hash = hash_token(token);
+        let now_ms = now_ms();
+        // The token is looked up, not spent, while the password is checked:
+        // a refused password must not burn the player's only link (spec
+        // "Password Reset by Email").
+        let Some(record) = store.reset_token_by_hash(&token_hash, now_ms) else {
+            tracing::info!("a password reset presented a token that is unknown, expired, or already used");
+            return ServerMessage::error(ErrorCode::InvalidResetToken);
+        };
+        let Some(account) = store.account_by_id(&record.account_id) else {
+            return ServerMessage::error(ErrorCode::InvalidResetToken);
+        };
+        if crate::domain::account::password_matches_username(password, &account.username) {
+            return ErrorCode::InvalidRequest
+                .with_field("password", "the password must not be the username");
+        }
+
+        if self.config.hibp_enabled && self.is_breached(password).await {
+            return ErrorCode::InvalidRequest.with_field(
+                "password",
+                "that password appears in a known data breach; choose another one",
+            );
+        }
+
+        // The policy passed: now the token is spent.
+        if store.consume_reset_token(&token_hash, now_ms).is_none() {
+            return ServerMessage::error(ErrorCode::InvalidResetToken);
+        }
+
+        let tooling = self.auth_tooling();
+        let password_hash = match tooling.hasher.hash(password).await {
+            Ok(hash) => hash,
+            Err(err) => {
+                tracing::error!(error = %err, "password hashing failed during a password reset");
+                return ServerMessage::error(ErrorCode::InvalidRequest);
+            }
+        };
+        store.set_password_hash(&account.account_id, &password_hash);
+        let recorder = self.auth_recorder().clone();
+        let account_id = account.account_id.clone();
+        let hash = password_hash.clone();
+        self.persist_auth(recorder, account_id.clone(), move |recorder| {
+            Box::pin(async move { recorder.record_password_changed(&account_id, &hash).await })
+        })
+        .await;
+        // The token is spent, in the database too.
+        let recorder = self.auth_recorder().clone();
+        let spent = token_hash.clone();
+        self.persist_auth(recorder, account.account_id.clone(), move |recorder| {
+            Box::pin(async move { recorder.record_token_used(&spent, now_ms).await })
+        })
+        .await;
+
+        tracing::info!(account_id = %account.account_id, "the password was reset");
+        ServerMessage::PasswordReset {
+            v: VERSION,
+            account_id: account.account_id,
+        }
+    }
+
+    /// Confirm an email address (spec "Email Verification").
+    pub async fn verify_email(self: &Arc<Self>, token: &str) -> ServerMessage {
+        let store = self.auth();
+        let token_hash = hash_token(token);
+        let now_ms = now_ms();
+        let Some(record) = store.consume_verification_token(&token_hash, now_ms) else {
+            tracing::info!("a verification presented a token that is unknown, expired, or already used");
+            return ErrorCode::InvalidVerificationToken
+                .with_message("that confirmation link is no longer valid");
+        };
+        let Some(account) = store.account_by_id(&record.account_id) else {
+            return ErrorCode::InvalidVerificationToken
+                .with_message("that confirmation link is no longer valid");
+        };
+
+        // A token confirms the address it was mailed to, and no other: a
+        // token sent to the old address cannot confirm a new one (spec
+        // "Email Change").
+        let pending = account.pending_email.clone();
+        let current = account.email.clone();
+        let confirmed_address = current.clone().filter(|address| Some(address) == pending.as_ref())
+            .or_else(|| current.clone().filter(|address| address == &record.address))
+            .or_else(|| pending.clone().filter(|address| address == &record.address));
+        if confirmed_address.is_none() {
+            tracing::info!(
+                account_id = %account.account_id,
+                "a confirmation presented a token that belongs to another address"
+            );
+            return ErrorCode::InvalidVerificationToken
+                .with_message("that confirmation link is no longer valid");
+        }
+
+        // A pending address takes over when it is confirmed: it becomes the
+        // account's address and the old one stops receiving its mail (spec
+        // "Email Change"). Without a pending address, the confirmation is
+        // the one the account was created with.
+        let pending = account.pending_email.clone();
+        let recorder = self.auth_recorder().clone();
+        match pending {
+            Some(confirmed) => {
+                let key = crate::domain::account::email_key(&confirmed);
+                store.confirm_pending_email(&account.account_id);
+                let account_id = account.account_id.clone();
+                self.persist_auth(recorder, account_id.clone(), move |recorder| {
+                    Box::pin(async move {
+                        recorder
+                            .record_pending_email_confirmed(&account_id, &confirmed, &key)
+                            .await
+                    })
+                })
+                .await;
+            }
+            None => {
+                store.set_email_verified(&account.account_id, true);
+                let account_id = account.account_id.clone();
+                self.persist_auth(recorder, account_id.clone(), move |recorder| {
+                    Box::pin(async move { recorder.record_email_verified(&account_id, true).await })
+                })
+                .await;
+            }
+        }
+        let recorder = self.auth_recorder().clone();
+        let spent = token_hash.clone();
+        self.persist_auth(recorder, account.account_id.clone(), move |recorder| {
+            Box::pin(async move { recorder.record_token_used(&spent, now_ms).await })
+        })
+        .await;
+
+        tracing::info!(account_id = %account.account_id, "the email address was confirmed");
+        ServerMessage::EmailVerified {
+            v: VERSION,
+            account_id: account.account_id,
+            email_verified: true,
+        }
+    }
+
+    /// Ask for another verification message (spec "Email Verification").
+    ///
+    /// The new token retires the previous one, and the account keeps its
+    /// state either way.
+    pub async fn resend_verification(
+        self: &Arc<Self>,
+        token: &str,
+        client: &AuthClient,
+    ) -> ServerMessage {
+        // A resend is a message to an address, so it is limited like the
+        // other message-sending requests (spec "Authentication Rate
+        // Limiting").
+        if let Some(refusal) = self.rate_limited(
+            "resend",
+            client,
+            self.config.auth_rate_limit_login_per_min,
+            LOGIN_WINDOW_MS,
+        ) {
+            return refusal;
+        }
+        let Some(account) = self.account_of_token(token) else {
+            return ServerMessage::error(ErrorCode::NotAuthenticated);
+        };
+        // The message goes to the address that is being confirmed: the
+        // pending one when a change is in flight, the current one otherwise.
+        let address = account
+            .pending_email
+            .clone()
+            .or_else(|| account.email.clone());
+        let Some(address) = address else {
+            // The account has no address to confirm.
+            return ServerMessage::error(ErrorCode::EmailNotVerified);
+        };
+        self.send_verification(&account, &address).await;
+        tracing::info!(account_id = %account.account_id, "another verification message was requested");
+        ServerMessage::EmailVerificationRequested { v: VERSION }
+    }
+
+    /// Ask for a different email address (spec "Email Change").
+    ///
+    /// The current address stays in force until the new one is confirmed.
+    pub async fn change_email(
+        self: &Arc<Self>,
+        token: &str,
+        email: &str,
+        client: &AuthClient,
+    ) -> ServerMessage {
+        use crate::domain::account::{email_key, validate_email};
+
+        // A change sends a message to an address the player chose, so it is
+        // limited like the other message-sending requests: without a limit
+        // it is a way to mail anyone (spec "Authentication Rate Limiting").
+        if let Some(refusal) = self.rate_limited(
+            "change",
+            client,
+            self.config.auth_rate_limit_login_per_min,
+            LOGIN_WINDOW_MS,
+        ) {
+            return refusal;
+        }
+        let Some(account) = self.account_of_token(token) else {
+            return ServerMessage::error(ErrorCode::NotAuthenticated);
+        };
+        let email = match validate_email(email) {
+            Ok(email) => email,
+            Err(err) => return self.email_error_message(err),
+        };
+        let email_key = email_key(&email);
+        if self.auth().account_by_email(&email_key).is_some() {
+            tracing::info!("an email change was refused: the address is taken");
+            return ServerMessage::error(ErrorCode::EmailTaken);
+        }
+
+        if let Err(err) = self
+            .auth()
+            .set_pending_email(&account.account_id, &email, &email_key)
+        {
+            tracing::info!(error = %err, "an email change was refused: the address is taken");
+            return ServerMessage::error(ErrorCode::EmailTaken);
+        }
+        let recorder = self.auth_recorder().clone();
+        let account_id = account.account_id.clone();
+        let key = email_key.clone();
+        let address = email.clone();
+        self.persist_auth(recorder, account_id.clone(), move |recorder| {
+            Box::pin(async move {
+                recorder
+                    .record_pending_email(&account_id, &address, &key)
+                    .await
+            })
+        })
+        .await;
+
+        // The confirmation token is stored, so the link that goes to the new
+        // address can actually confirm it (spec "Email Change"). It replaces
+        // the account's previous token, as a resend does.
+        let token = generate_token();
+        let token_hash = hash_token(&token);
+        let created_at_ms = now_ms();
+        let expires_at_ms = created_at_ms + VERIFICATION_TOKEN_TTL_SECS * 1000;
+        let record = crate::domain::account::VerificationToken {
+            account_id: account.account_id.clone(),
+            // The token is bound to the address it is sent to.
+            address: email.clone(),
+            token_hash: token_hash.clone(),
+            created_at_ms,
+            expires_at_ms,
+            used_at_ms: None,
+        };
+        self.auth().insert_verification_token(record.clone());
+        let recorder = self.auth_recorder().clone();
+        let written = record.clone();
+        self.persist_auth(recorder, account.account_id.clone(), move |recorder| {
+            Box::pin(async move { recorder.record_verification_token(&written).await })
+        })
+        .await;
+
+        // The message goes to the address being moved to; the current one
+        // stays in force until it is confirmed.
+        let link = verification_link(&self.config.public_base_url, &token);
+        let message = verification_email(&email, &account.username, &link);
+        if let Err(err) = self.email_sender.send(&message).await {
+            tracing::warn!(error = %err, "the confirmation message could not be delivered");
+        }
+        tracing::info!(account_id = %account.account_id, "an email change was requested");
+        ServerMessage::EmailVerificationRequested { v: VERSION }
+    }
+
+    /// The account a session token resolves to, when the token is usable.
+    fn account_of_token(&self, token: &str) -> Option<crate::domain::account::Account> {
+        let store = self.auth();
+        let token_hash = hash_token(token);
+        let session = store.usable_session(&token_hash, now_ms())?;
+        store.account_by_id(&session.account_id)
+    }
+
+    /// Deliver the verification message for an account (spec "Email
+    /// Verification").
+    ///
+    /// The message goes to `address`, and the token is bound to it: a token
+    /// confirms the address it was mailed to and no other.
+    ///
+    /// A delivery that fails is logged and the account survives: the player
+    /// can ask for another message.
+    async fn send_verification(
+        &self,
+        account: &crate::domain::account::Account,
+        address: &str,
+    ) {
+        let token = generate_token();
+        let token_hash = hash_token(&token);
+        let created_at_ms = now_ms();
+        let expires_at_ms = created_at_ms + VERIFICATION_TOKEN_TTL_SECS * 1000;
+        let record = crate::domain::account::VerificationToken {
+            account_id: account.account_id.clone(),
+            address: address.to_string(),
+            token_hash: token_hash.clone(),
+            created_at_ms,
+            expires_at_ms,
+            used_at_ms: None,
+        };
+        self.auth().insert_verification_token(record.clone());
+        let recorder = self.auth_recorder().clone();
+        let written = record.clone();
+        self.persist_auth(recorder, account.account_id.clone(), move |recorder| {
+            Box::pin(async move { recorder.record_verification_token(&written).await })
+        })
+        .await;
+
+        let link = verification_link(&self.config.public_base_url, &token);
+        let message = verification_email(address, &account.username, &link);
+        if let Err(err) = self.email_sender.send(&message).await {
+            tracing::warn!(
+                error = %err,
+                account_id = %account.account_id,
+                "the verification message could not be delivered"
+            );
+        }
+    }
+
+    /// Whether the password appears in a known breach (spec "Breached
+    /// Password Refusal"). The blocking call runs in a blocking task, and a
+    /// corpus that cannot be reached leaves the password alone.
+    async fn is_breached(&self, password: &str) -> bool {
+        let password = password.to_string();
+        tokio::task::spawn_blocking(move || crate::infrastructure::breach::is_breached(&password))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// A verification against a hash no account has, so an attempt with an
+    /// unknown identifier costs the same as one with a wrong password (spec
+    /// "Credential Attempts Do Not Reveal Account Existence").
+    async fn dummy_verification(&self, password: &str) {
+        let tooling = self.auth_tooling();
+        let hash = match self.dummy_hash.get() {
+            Some(hash) => hash.clone(),
+            None => {
+                let random = generate_token();
+                match tooling.hasher.hash(&random).await {
+                    Ok(hash) => {
+                        let _ = self.dummy_hash.set(hash.clone());
+                        hash
+                    }
+                    Err(_) => return,
+                }
+            }
+        };
+        let _ = tooling.hasher.verify(password, &hash).await;
+    }
+
+    /// Whether the client may make another attempt, recording it when it
+    /// may (spec "Authentication Rate Limiting").
+    fn rate_limited(
+        &self,
+        action: &str,
+        client: &AuthClient,
+        limit: u32,
+        window_ms: i64,
+    ) -> Option<ServerMessage> {
+        if limit == 0 {
+            return None;
+        }
+        let now_ms = now_ms();
+        // The keys are namespaced per action: a player who signs in often
+        // must not fill the registration window, and the other way round.
+        let mut keys = vec![format!("{action}:addr:{}", client.address)];
+        if let Some(device) = client.device_id.as_deref() {
+            keys.push(format!("{action}:device:{device}"));
+        }
+        // The check and the record are one operation: concurrent attempts
+        // would otherwise all pass the check before any of them was recorded.
+        for key in &keys {
+            if let RateDecision::Refused { retry_after_secs } =
+                self.rate_limiter.check_and_record(key, limit, window_ms, now_ms)
+            {
+                return Some(ErrorCode::TooManyAttempts.with_message(format!(
+                    "too many attempts; try again in {retry_after_secs} seconds"
+                )));
+            }
+        }
+        None
+    }
+
     /// Logout (mirrors ws.rs::logout).
-    pub fn logout(self: &Arc<Self>, token: &str) -> ServerMessage {
+    pub async fn logout(self: &Arc<Self>, token: &str) -> ServerMessage {
         let store = self.auth();
         let token_hash = hash_token(token);
         let now_ms = now_ms();
@@ -898,13 +1651,14 @@ impl App {
         let recorder = self.auth_recorder().clone();
         let hash = token_hash.clone();
         let revoked_for = session.account_id.clone();
-        let this = Arc::clone(self);
-        tokio::spawn(async move {
-            this.persist_auth(recorder, revoked_for, move |recorder| {
-                Box::pin(async move { recorder.record_session_revoked(&hash, now_ms).await })
-            })
-            .await;
-        });
+        // The revocation is persisted before the answer: a crash between the
+        // reply and the write would leave the session revoked in memory but
+        // alive in the database, and it would authenticate again after a
+        // restart.
+        self.persist_auth(recorder, revoked_for, move |recorder| {
+            Box::pin(async move { recorder.record_session_revoked(&hash, now_ms).await })
+        })
+        .await;
 
         let Some(account) = store.account_by_id(&session.account_id) else {
             return ServerMessage::error(ErrorCode::NotAuthenticated);
@@ -952,7 +1706,8 @@ impl App {
                     reason = ?err,
                     "display name refused: outside the accepted format"
                 );
-                return ServerMessage::error(ErrorCode::InvalidDisplayName);
+                return ErrorCode::InvalidDisplayName
+                    .with_field("display_name", ErrorCode::InvalidDisplayName.message());
             }
         };
 
@@ -983,6 +1738,7 @@ impl App {
             display_name: account.reported_name().to_string(),
             token: token.to_string(),
             expires_at_ms,
+            email_verified: account.email_verified,
         }
     }
 
@@ -995,14 +1751,32 @@ impl App {
             UsernameError::Charset => {
                 "username may only contain letters, digits, underscore, and hyphen".to_string()
             }
+            UsernameError::Shape => {
+                "username must start with a letter, end with a letter or a digit, and carry no repeated separator"
+                    .to_string()
+            }
         };
-        ErrorCode::InvalidRequest.with_message(detail)
+        // The message names the offending field, and the error carries it
+        // machine-readably (spec "Authentication Error Codes").
+        ErrorCode::InvalidRequest.with_field("username", detail)
+    }
+
+    fn email_error_message(&self, err: crate::domain::account::EmailError) -> ServerMessage {
+        use crate::domain::account::EmailError;
+        let detail = match err {
+            EmailError::Shape => "that is not a valid email address".to_string(),
+            EmailError::Domain => "the email address must name a domain".to_string(),
+            EmailError::Length => "that email address is too long".to_string(),
+        };
+        ErrorCode::InvalidRequest.with_field("email", detail)
     }
 
     fn password_error_message(&self) -> ServerMessage {
         use crate::domain::account::{MAX_PASSWORD_LEN, MIN_PASSWORD_LEN};
-        ErrorCode::InvalidRequest
-            .with_message(format!("password must be {MIN_PASSWORD_LEN} to {MAX_PASSWORD_LEN} characters"))
+        ErrorCode::InvalidRequest.with_field(
+            "password",
+            format!("password must be {MIN_PASSWORD_LEN} to {MAX_PASSWORD_LEN} characters"),
+        )
     }
 
     async fn issue_session(
@@ -1185,6 +1959,11 @@ mod tests {
             username_key: crate::domain::account::username_key(username),
             password_hash: "$argon2id$seed".into(),
             display_name: None,
+            email: None,
+            email_key: None,
+            email_verified: false,
+            pending_email: None,
+            pending_email_key: None,
             created_at_ms: now_ms(),
         };
         app.auth().insert_account(account).expect("seed account");
@@ -1219,6 +1998,11 @@ mod tests {
                 username_key: crate::domain::account::username_key("Ana"),
                 password_hash: "$argon2id$seed".into(),
                 display_name: Some("Ana T.".into()),
+                email: None,
+                email_key: None,
+                email_verified: false,
+                pending_email: None,
+                pending_email_key: None,
                 created_at_ms: now_ms(),
             };
             recorder.record_account_created(&account).await.expect("account");

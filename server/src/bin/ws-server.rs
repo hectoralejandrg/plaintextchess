@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::ListenerExt;
+use std::net::SocketAddr;
 use chess_server::infrastructure::broker::{generate_node_id, Broker};
 use chess_server::infrastructure::config::{Config, Tier};
 use chess_server::infrastructure::logic_handler::LogicState;
@@ -132,11 +133,11 @@ async fn run_monolith(config: Config, app: Arc<App>) {
     );
 
     let router = axum::Router::new()
-        .route("/healthz", axum::routing::get(ws::healthz))
+        .route("/healthz", axum::routing::get(ws::healthz_with_features))
         .route("/ws", axum::routing::get(ws::ws_upgrade))
         .with_state(app);
 
-    let server = axum::serve(listener, router).into_future();
+    let server = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).into_future();
     shutdown_on_signal(server).await;
     tracing::info!("chess-server stopped");
 }
@@ -182,7 +183,7 @@ async fn run_transport(config: Config) {
         .route("/ws", axum::routing::get(transport_handler::ws_upgrade))
         .with_state(state);
 
-    let server = axum::serve(listener, router).into_future();
+    let server = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).into_future();
     shutdown_on_signal(server).await;
     tracing::info!("ws-server (transport) stopped");
 }
@@ -244,7 +245,7 @@ async fn run_logic(config: Config, mut app: Arc<App>) {
             }
         }),
     );
-    let health_server = axum::serve(listener, router).into_future();
+    let health_server = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).into_future();
     tokio::spawn(async move {
         if let Err(err) = health_server.await {
             tracing::error!(%err, "logic health endpoint exited");
@@ -358,7 +359,7 @@ async fn run_combined(config: Config, mut app: Arc<App>) {
         )
         .with_state(transport_state);
 
-    let server = axum::serve(listener, router).into_future();
+    let server = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).into_future();
     tokio::spawn(async move {
         if let Err(err) = server.await {
             tracing::error!(%err, "ws-server (combined) exited");

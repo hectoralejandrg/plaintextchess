@@ -18,6 +18,29 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- The link an emailed password reset opens (spec "Client
+                 offers password reset"). The scheme is the app's own, so the
+                 link works before the deployment has a public domain; an
+                 app-link takes its place once it does. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="plaintextchess"
+                    android:host="app"
+                    android:pathPrefix="/reset-password" />
+            </intent-filter>
+            <!-- The confirmation link an email verification carries. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="plaintextchess"
+                    android:host="app"
+                    android:pathPrefix="/verify-email" />
+            </intent-filter>
         </activity>
     </application>
 

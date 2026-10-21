@@ -226,6 +226,25 @@ enum class OnlineErrorCode(val code: String, val displayMessage: String) {
         "invalid_display_name",
         "A display name must be 1 to 32 characters with no control characters",
     ),
+    /** The confirmation link is unknown, expired, already used, or belongs to
+     * another address (spec "Email Verification"). */
+    INVALID_VERIFICATION_TOKEN(
+        "invalid_verification_token",
+        "That confirmation link is no longer valid",
+    ),
+    /** The email address is already registered (spec "Email Identity"). */
+    EMAIL_TAKEN("email_taken", "That email address is already registered"),
+    /** Too many attempts (spec "Authentication Rate Limiting"). */
+    TOO_MANY_ATTEMPTS("too_many_attempts", "Too many attempts; try again later"),
+    /** The reset or confirmation link is unknown, expired, or already used. */
+    INVALID_RESET_TOKEN("invalid_reset_token", "That link is no longer valid"),
+    /** The account's email address is not confirmed yet. */
+    EMAIL_NOT_VERIFIED("email_not_verified", "This email address is not confirmed yet"),
+    /** The message could not be sent. */
+    EMAIL_UNAVAILABLE("email_unavailable", "The message could not be sent; try again later"),
+    /** A code this build does not know. It is shown like any other error
+     * instead of being dropped. */
+    UNKNOWN("unknown", "The server refused the request"),
     /** Tournament errors (add-tournaments phase 1): join-time only, same
      * "definitive" treatment as a bad room code. */
     TOURNAMENT_NOT_FOUND("tournament_not_found", "No tournament has that id"),
@@ -319,11 +338,36 @@ sealed class ServerMessage {
     /** Incremental per-move / terminal update (server "Game Authority"). */
     data class Update(val update: OnlineUpdate) : ServerMessage()
 
-    /** Structured business-rule error (the connection stays open). */
-    data class Error(val code: String, val message: String) : ServerMessage()
+    /** Structured business-rule error (the connection stays open).
+     *
+     * [field] names the field that was refused, so the form can mark the
+     * right input without reading the message (spec "Authentication Error
+     * Codes"). */
+    data class Error(val code: String, val message: String, val field: String? = null) : ServerMessage()
 
     /** Authentication session issued (register/login). */
-    data class Session(val token: String) : ServerMessage()
+    data class Session(
+        val token: String,
+        val username: String = "",
+        val displayName: String = "",
+        val emailVerified: Boolean = false,
+    ) : ServerMessage()
+
+    /** The session a stored token resumed: no new token, no new expiry. */
+    data class SessionResumed(val username: String, val emailVerified: Boolean) : ServerMessage()
+
+    /** The acknowledgement of a password-reset request. The same answer for
+     * a registered and an unregistered address. */
+    data object PasswordResetRequested : ServerMessage()
+
+    /** The password was changed. It carries no session. */
+    data object PasswordReset : ServerMessage()
+
+    /** The acknowledgement of a verification request. */
+    data object EmailVerificationRequested : ServerMessage()
+
+    /** The account's email address is confirmed. */
+    data class EmailVerified(val emailVerified: Boolean) : ServerMessage()
 
     /** Profile display name updated (set_profile). */
     data object ProfileUpdated : ServerMessage()
@@ -373,8 +417,25 @@ sealed class ServerMessage {
                     )
                     "state" -> State(OnlineState.decode(root.getJSONObject("state")))
                     "update" -> Update(OnlineUpdate.decode(root))
-                    "error" -> Error(root.getString("code"), root.getString("message"))
-                    "session" -> Session(root.getString("token"))
+                    "error" -> Error(
+                        root.getString("code"),
+                        root.getString("message"),
+                        if (root.has("field")) root.optString("field", "") else null,
+                    )
+                    "session" -> Session(
+                        token = root.getString("token"),
+                        username = root.optString("username", ""),
+                        displayName = root.optString("display_name", root.optString("username", "")),
+                        emailVerified = root.optBoolean("email_verified", false),
+                    )
+                    "session_resumed" -> SessionResumed(
+                        root.optString("username", ""),
+                        root.optBoolean("email_verified", false),
+                    )
+                    "password_reset_requested" -> PasswordResetRequested
+                    "password_reset" -> PasswordReset
+                    "email_verification_requested" -> EmailVerificationRequested
+                    "email_verified" -> EmailVerified(root.optBoolean("email_verified", true))
                     "profile_updated" -> ProfileUpdated
                     "session_ok" -> SessionOk
                     else -> throw OnlineProtocolError.UnknownType(type)
@@ -433,10 +494,18 @@ object OnlineCodec {
     /** `{"v":1,"type":"register","username":"...","password":"...",` +
      * `"device_id":"..."}` — `device_id` links the account to this device
      * and is omitted only when unknown (spec "client links the device"). */
-    fun encodeRegister(username: String, password: String, deviceId: String? = null): String {
+    fun encodeRegister(
+        username: String,
+        email: String,
+        password: String,
+        deviceId: String? = null,
+    ): String {
         val message = base("register")
             .put("username", username)
             .put("password", password)
+        if (email.isNotEmpty()) {
+            message.put("email", email)
+        }
         if (deviceId != null) {
             message.put("device_id", deviceId)
         }
@@ -445,15 +514,52 @@ object OnlineCodec {
 
     /** `{"v":1,"type":"login","username":"...","password":"...",` +
      * `"device_id":"..."}` (same `device_id` rules as [encodeRegister]). */
-    fun encodeLogin(username: String, password: String, deviceId: String? = null): String {
+    fun encodeLogin(identifier: String, password: String, deviceId: String? = null): String {
         val message = base("login")
-            .put("username", username)
+            // The identifier is sent twice: as `identifier` for a server that
+            // knows it, and as the legacy `username` for a server that does
+            // not. An old server requires the field, and a frame it cannot
+            // decode costs the connection.
+            .put("identifier", identifier)
+            .put("username", identifier)
             .put("password", password)
         if (deviceId != null) {
             message.put("device_id", deviceId)
         }
         return message.toString()
     }
+
+    /** `{"v":1,"type":"resume_session","token":"..."}` (spec "Session
+     * Resumption"). */
+    fun encodeResumeSession(token: String): String =
+        base("resume_session").put("token", token).toString()
+
+    /** `{"v":1,"type":"forgot_password","email":"..."}` (spec "Password Reset
+     * by Email"). */
+    fun encodeForgotPassword(email: String): String =
+        base("forgot_password").put("email", email).toString()
+
+    /** `{"v":1,"type":"reset_password","token":"...","password":"..."}`. */
+    fun encodeResetPassword(token: String, password: String): String =
+        base("reset_password")
+            .put("token", token)
+            .put("password", password)
+            .toString()
+
+    /** `{"v":1,"type":"verify_email","token":"..."}`. */
+    fun encodeVerifyEmail(token: String): String =
+        base("verify_email").put("token", token).toString()
+
+    /** `{"v":1,"type":"resend_verification","token":"..."}`. */
+    fun encodeResendVerification(token: String): String =
+        base("resend_verification").put("token", token).toString()
+
+    /** `{"v":1,"type":"change_email","token":"...","email":"..."}`. */
+    fun encodeChangeEmail(token: String, email: String): String =
+        base("change_email")
+            .put("token", token)
+            .put("email", email)
+            .toString()
 
     /** `{"v":1,"type":"logout","token":"..."}` */
     fun encodeLogout(token: String): String =

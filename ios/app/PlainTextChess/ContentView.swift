@@ -100,6 +100,32 @@ struct ContentView: View {
 
     @State private var path: [Route] = []
 
+    /// The reset link the player followed, when one arrives (spec "Client
+    /// offers password reset": "A reset link opens the app").
+    @State private var resetLink: ResetLink?
+
+    /// The token an emailed reset link carries, when the link is one.
+    static func resetToken(from url: URL) -> String? {
+        token(in: url, path: "reset-password")
+    }
+
+    /// The token an emailed confirmation link carries, when the link is one.
+    static func verificationToken(from url: URL) -> String? {
+        token(in: url, path: "verify-email")
+    }
+
+    /// The token a link of this path carries.
+    private static func token(in url: URL, path: String) -> String? {
+        guard url.path.contains(path),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let token = components.queryItems?.first(where: { $0.name == "token" })?.value,
+              !token.isEmpty
+        else {
+            return nil
+        }
+        return token
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             LoginView(vm: vm, effectiveOnlineURL: effectiveOnlineURL,
@@ -130,6 +156,20 @@ struct ContentView: View {
                     startDebugScriptIfNeeded()
                     #endif
                 }
+        }
+        .onOpenURL { url in
+            // The link an emailed reset carries opens the reset screen with
+            // the token already filled in; the confirmation link confirms
+            // the address right away.
+            if let token = Self.resetToken(from: url) {
+                resetLink = ResetLink(token: token)
+            } else if let token = Self.verificationToken(from: url) {
+                vm.doVerifyEmail(token: token, serverURLString: effectiveOnlineURL)
+            }
+        }
+        .sheet(item: $resetLink) { link in
+            ResetPasswordView(vm: vm, token: link.token,
+                              effectiveOnlineURL: effectiveOnlineURL)
         }
         .onChange(of: vm.authToken) { token in
             if token != nil && path.last != .home {
@@ -404,10 +444,11 @@ enum NewGameChoice: Equatable {
     case cpu(CpuDifficulty)
     case onlineCreate(timeControl: String)
     case onlineJoin(code: String)
-    case register(username: String, password: String)
-    case login(username: String, password: String)
+    case register(username: String, email: String, password: String)
+    case login(identifier: String, password: String)
     case logout
     case setProfile(displayName: String)
+    case resendVerification
 }
 
 /// New-game setup sheet (design D4 + add-online-multiplayer D4): choose the
@@ -577,23 +618,23 @@ struct NewGameSetupView: View {
                 .font(.subheadline)
                 .foregroundColor(.secondary)
             if let authToken {
-                HStack(alignment: .top, spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
                         Text("Signed in")
                             .font(.callout.bold())
-                        Text(authToken)
-                            .font(.caption.monospaced())
-                            .textSelection(.enabled)
+                        Spacer()
+                        Button("Log out") {
+                            onStart(.logout)
+                        }
+                        .buttonStyle(.bordered)
                     }
-                    Spacer()
-                    Button("Copy") {
-                        UIPasteboard.general.string = authToken
+                    // The account's display name, and never the token
+                    // itself (spec "Client never displays the session
+                    // token").
+                    if let displayName = authDisplayName {
+                        Text(displayName)
+                            .font(.footnote)
                     }
-                    .buttonStyle(.bordered)
-                    Button("Log out") {
-                        onStart(.logout)
-                    }
-                    .buttonStyle(.bordered)
                 }
                 .padding(10)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
@@ -618,27 +659,20 @@ struct NewGameSetupView: View {
                         .foregroundColor(.red)
                 }
             } else {
-                TextField("Username", text: $authUsername)
+                // One field for the identifier: a username or an email
+                // address (spec "Client can log in").
+                TextField("Username or email", text: $authUsername)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                 SecureField("Password", text: $authPassword)
                     .textFieldStyle(.roundedBorder)
-                HStack(spacing: 8) {
-                    Button(action: {
-                        onStart(.register(username: authUsername,
-                                          password: authPassword))
-                    }) {
-                        Text("Register")
-                            .frame(maxWidth: .infinity)
-                    }
-                    Button(action: {
-                        onStart(.login(username: authUsername,
-                                       password: authPassword))
-                    }) {
-                        Text("Login")
-                            .frame(maxWidth: .infinity)
-                    }
+                Button(action: {
+                    onStart(.login(identifier: authUsername,
+                                   password: authPassword))
+                }) {
+                    Text("Sign in")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(authUsername.isEmpty || authPassword.isEmpty)
@@ -678,41 +712,110 @@ struct LoginView: View {
     let onAuth: () -> Void
     let onGuest: () -> Void
 
+    /// What the screen is asking for (spec "Client offers password reset").
+    enum Mode: Equatable {
+        case signIn
+        case register
+        case forgotPassword
+        case resetPassword
+    }
+
+    @State private var mode: Mode = .signIn
+    @State private var identifier = ""
     @State private var username = ""
+    @State private var email = ""
     @State private var password = ""
+    @State private var passwordConfirmation = ""
+    @State private var resetToken = ""
+    @State private var showsPassword = false
+    @State private var confirmation: String?
 
     var body: some View {
-        VStack(spacing: 16) {
-            Text("PlainTextChess")
-                .font(.largeTitle.bold())
-                .padding(.bottom, 20)
+        ScrollView {
+            VStack(spacing: 16) {
+                Text("PlainTextChess")
+                    .font(.largeTitle.bold())
+                    .padding(.bottom, 20)
 
-            TextField("Username", text: $username)
+                switch mode {
+                case .signIn:
+                    signInForm
+                case .register:
+                    registerForm
+                case .forgotPassword:
+                    forgotPasswordForm
+                case .resetPassword:
+                    resetPasswordForm
+                }
+
+                if let confirmation {
+                    Text(confirmation)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+
+                if let error = vm.authError {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                }
+            }
+            .padding()
+        }
+        .onChange(of: vm.authToken) { token in
+            if token != nil {
+                onAuth()
+            }
+        }
+        .onChange(of: vm.authError) { error in
+            // A refused sign-in keeps what was typed but not the password:
+            // the player corrects the field and tries again (spec "Client
+            // presents authentication errors inline").
+            if error != nil {
+                password = ""
+            }
+        }
+    }
+
+    // MARK: - Sign in
+
+    /// One field for the identifier: the player types a username or an
+    /// email address and the server resolves both (spec "Client can log in").
+    private var signInForm: some View {
+        VStack(spacing: 12) {
+            TextField("Username or email", text: $identifier)
                 .textFieldStyle(.roundedBorder)
-                .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textContentType(.username)
+                .background(vm.authField == "identifier" ? Color.red.opacity(0.15) : Color.clear)
 
-            SecureField("Password", text: $password)
-                .textFieldStyle(.roundedBorder)
+            passwordField
 
-            HStack(spacing: 8) {
-                Button(action: {
-                    vm.doRegister(username: username, password: password, serverURLString: effectiveOnlineURL)
-                }) {
-                    Text("Register")
-                        .frame(maxWidth: .infinity)
-                }
-                .disabled(username.isEmpty || password.isEmpty)
-                .buttonStyle(.borderedProminent)
+            Toggle("Keep me signed in", isOn: $vm.keepSession)
+                .font(.footnote)
 
-                Button(action: {
-                    vm.doLogin(username: username, password: password, serverURLString: effectiveOnlineURL)
-                }) {
-                    Text("Login")
-                        .frame(maxWidth: .infinity)
-                }
-                .disabled(username.isEmpty || password.isEmpty)
-                .buttonStyle(.borderedProminent)
+            Button(action: {
+                vm.doLogin(identifier: identifier, password: password,
+                           serverURLString: effectiveOnlineURL)
+            }) {
+                Text("Sign in")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(identifier.isEmpty || password.isEmpty)
+
+            // The create-account path is only offered when the server can
+            // take the email it needs (spec "Client offers only what the
+            // server supports").
+            if vm.serverSupports("email_verification") {
+                Button("Create an account") { mode = .register }
+                    .font(.footnote)
+            }
+
+            if vm.serverSupports("password_reset") {
+                Button("Forgot your password?") { mode = .forgotPassword }
+                    .font(.footnote)
             }
 
             Button(action: { onGuest() }) {
@@ -720,17 +823,183 @@ struct LoginView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-
-            if let error = vm.authError {
-                Text(error)
-                    .font(.footnote)
-                    .foregroundColor(.red)
-            }
         }
-        .padding()
-        .onChange(of: vm.authToken) { token in
-            if token != nil {
-                onAuth()
+    }
+
+    // MARK: - Create an account
+
+    private var registerForm: some View {
+        VStack(spacing: 12) {
+            TextField("Username", text: $username)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .background(vm.authField == "username" ? Color.red.opacity(0.15) : Color.clear)
+
+            TextField("Email", text: $email)
+                .textFieldStyle(.roundedBorder)
+                .keyboardType(.emailAddress)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textContentType(.emailAddress)
+                .background(vm.authField == "email" ? Color.red.opacity(0.15) : Color.clear)
+
+            passwordField
+
+            Button(action: {
+                vm.doRegister(username: username, email: email, password: password,
+                              serverURLString: effectiveOnlineURL)
+            }) {
+                Text("Create account")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(username.isEmpty || email.isEmpty || password.isEmpty)
+
+            Button("I already have an account") { mode = .signIn }
+                .font(.footnote)
+        }
+    }
+
+    // MARK: - Forgot the password
+
+    private var forgotPasswordForm: some View {
+        VStack(spacing: 12) {
+            Text("Enter the email address of your account and we will send you a link to choose a new password.")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+
+            TextField("Email", text: $email)
+                .textFieldStyle(.roundedBorder)
+                .keyboardType(.emailAddress)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .textContentType(.emailAddress)
+
+            Button(action: {
+                vm.doForgotPassword(email: email, serverURLString: effectiveOnlineURL)
+                confirmation = "If that address has an account, a reset link is on its way."
+            }) {
+                Text("Send the link")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(email.isEmpty)
+
+            Button("I have a reset code") { mode = .resetPassword }
+                .font(.footnote)
+            Button("Back to sign in") { mode = .signIn }
+                .font(.footnote)
+        }
+    }
+
+    // MARK: - Set a new password
+
+    private var resetPasswordForm: some View {
+        VStack(spacing: 12) {
+            Text("Paste the code from your reset email, then choose a new password.")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+
+            TextField("Reset code", text: $resetToken)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            passwordField
+
+            SecureField("Repeat the new password", text: $passwordConfirmation)
+                .textFieldStyle(.roundedBorder)
+
+            Button(action: {
+                vm.doResetPassword(token: resetToken, password: password,
+                                  serverURLString: effectiveOnlineURL)
+            }) {
+                Text("Set the new password")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(resetToken.isEmpty || password.isEmpty || password != passwordConfirmation)
+
+            Button("Back to sign in") { mode = .signIn }
+                .font(.footnote)
+        }
+    }
+
+    // MARK: - The password field
+
+    private var passwordField: some View {
+        HStack {
+            Group {
+                if showsPassword {
+                    TextField("Password", text: $password)
+                } else {
+                    SecureField("Password", text: $password)
+                }
+            }
+            .textFieldStyle(.roundedBorder)
+            .textContentType(.password)
+            .background(vm.authField == "password" ? Color.red.opacity(0.15) : Color.clear)
+
+            Button {
+                showsPassword.toggle()
+            } label: {
+                Image(systemName: showsPassword ? "eye.slash" : "eye")
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel(showsPassword ? "Hide the password" : "Show the password")
+        }
+    }
+}
+
+/// A reset link that arrived from outside the app.
+struct ResetLink: Identifiable {
+    let id = UUID()
+    let token: String
+}
+
+/// The screen an emailed reset link opens (spec "Client offers password
+/// reset").
+struct ResetPasswordView: View {
+    @ObservedObject var vm: GameViewModel
+    let token: String
+    let effectiveOnlineURL: String?
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var password = ""
+    @State private var confirmation = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                Text("Choose a new password")
+                    .font(.headline)
+                SecureField("New password", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                SecureField("Repeat the new password", text: $confirmation)
+                    .textFieldStyle(.roundedBorder)
+                Button(action: {
+                    vm.doResetPassword(token: token, password: password,
+                                      serverURLString: effectiveOnlineURL)
+                }) {
+                    Text("Set the new password")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(password.isEmpty || password != confirmation)
+                if let error = vm.authError {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                }
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Reset password")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
             }
         }
     }
@@ -758,6 +1027,23 @@ struct HomeView: View {
                 if vm.authToken != nil {
                     Text("Signed in")
                         .font(.headline)
+                    // The account's name and its verification state, and
+                    // never the token itself (spec "Client never displays
+                    // the session token").
+                    if let name = vm.authAccountName {
+                        Text(name)
+                            .font(.footnote)
+                    }
+                    if !vm.authEmailVerified {
+                        Text("This email address is not confirmed yet.")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                        Button("Send the confirmation again") {
+                            vm.doResendVerification(serverURLString: effectiveOnlineURL)
+                        }
+                        .font(.footnote)
+                        .buttonStyle(.borderless)
+                    }
                     if let name = vm.authDisplayName {
                         Text("Display name: \(name)")
                             .font(.footnote)

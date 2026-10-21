@@ -64,3 +64,8 @@ data/
 # Database backups written by the runbook's backup step
 # (docs/deploy-docker.md section 6).
 backups/
+
+# The provider's credential (the mail transport reads it from here). The
+# example is tracked so a fresh checkout knows what to copy.
+secrets/*
+!secrets/resend_key.example

@@ -3,6 +3,8 @@ package com.hectoralejandrg.plaintextchess
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -39,7 +41,12 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -94,15 +101,53 @@ class MainActivity : ComponentActivity() {
             return intent.getStringExtra("online_url")?.trim()?.ifEmpty { null }
         }
 
+    /** The reset token an emailed link carries, when the link is one
+     * (spec "Client offers password reset": "A reset link opens the app"). */
+    private fun resetTokenFrom(intent: Intent?): String? =
+        tokenFrom(intent, "reset-password")
+
+    /** The confirmation token an emailed link carries, when the link is one. */
+    private fun verificationTokenFrom(intent: Intent?): String? =
+        tokenFrom(intent, "verify-email")
+
+    /** The token a link of this path carries. */
+    private fun tokenFrom(intent: Intent?, path: String): String? {
+        val data: Uri = intent?.data ?: return null
+        if (!data.path.orEmpty().contains(path)) return null
+        return data.getQueryParameter("token")?.takeIf { it.isNotEmpty() }
+    }
+
+    /** The reset token an emailed link carried, if any. It is state, so a
+     * link that arrives while the app is running opens the reset screen
+     * too (spec "Client offers password reset"). */
+    private var resetToken by mutableStateOf<String?>(null)
+
+    /** The confirmation token an emailed link carried, if any. */
+    private var verificationToken by mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        resetToken = resetTokenFrom(intent)
+        verificationToken = verificationTokenFrom(intent)
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    AppNavHost(debugCpuDelayMs = debugCpuDelayMs, onlineUrl = onlineUrl)
+                    AppNavHost(
+                        debugCpuDelayMs = debugCpuDelayMs,
+                        onlineUrl = onlineUrl,
+                        resetToken = resetToken,
+                        verificationToken = verificationToken,
+                    )
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        resetToken = resetTokenFrom(intent)
+        verificationToken = verificationTokenFrom(intent)
     }
 }
 
@@ -846,7 +891,12 @@ private fun MoveList(vm: GameViewModel) {
 }
 
 @Composable
-fun AppNavHost(debugCpuDelayMs: Long = 0L, onlineUrl: String? = null) {
+fun AppNavHost(
+    debugCpuDelayMs: Long = 0L,
+    onlineUrl: String? = null,
+    resetToken: String? = null,
+    verificationToken: String? = null,
+) {
     val navController = rememberNavController()
     val context = LocalContext.current
     val vm = remember {
@@ -886,7 +936,23 @@ fun AppNavHost(debugCpuDelayMs: Long = 0L, onlineUrl: String? = null) {
             GameDestination(vm = vm)
         }
     }
+
+    // The link an emailed reset carries opens the app on the reset screen
+    // (spec "Client offers password reset").
+    resetToken?.let { token ->
+        ResetPasswordDialog(vm = vm, token = token)
+    }
+    // The link an emailed confirmation carries confirms the address.
+    LaunchedEffect(verificationToken) {
+        verificationToken?.let { token ->
+            vm.doVerifyEmail(token)
+        }
+    }
 }
+
+/** What the sign-in screen is asking for (spec "Client offers password
+ * reset"). */
+private enum class AuthScreenMode { SignIn, Register, ForgotPassword, ResetPassword }
 
 @Composable
 fun LoginScreen(
@@ -894,8 +960,15 @@ fun LoginScreen(
     onLoginSuccess: () -> Unit,
     onGuest: () -> Unit
 ) {
+    var mode by remember { mutableStateOf(AuthScreenMode.SignIn) }
+    var identifier by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var passwordConfirmation by remember { mutableStateOf("") }
+    var resetToken by remember { mutableStateOf("") }
+    var showsPassword by remember { mutableStateOf(false) }
+    var confirmation by remember { mutableStateOf<String?>(null) }
 
     Column(
         modifier = Modifier
@@ -909,38 +982,160 @@ fun LoginScreen(
             style = MaterialTheme.typography.headlineLarge,
             modifier = Modifier.padding(bottom = 32.dp)
         )
-        OutlinedTextField(
-            value = username,
-            onValueChange = { username = it },
-            label = { Text("Username") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = password,
-            onValueChange = { password = it },
-            label = { Text("Password") },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(16.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Button(
-                onClick = { vm.doRegister(username, password) },
-                enabled = username.isNotBlank() && password.isNotEmpty(),
-                modifier = Modifier.weight(1f)
-            ) { Text("Register") }
-            Button(
-                onClick = { vm.doLogin(username, password) },
-                enabled = username.isNotBlank() && password.isNotEmpty(),
-                modifier = Modifier.weight(1f)
-            ) { Text("Login") }
+
+        when (mode) {
+            AuthScreenMode.SignIn -> {
+                // One field for the identifier: the player types a username
+                // or an email address and the server resolves both (spec
+                // "Client can log in").
+                OutlinedTextField(
+                    value = identifier,
+                    onValueChange = { identifier = it },
+                    label = { Text("Username or email") },
+                    singleLine = true,
+                    isError = vm.authField == "identifier",
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                PasswordField(
+                    password = password,
+                    onPasswordChange = { password = it },
+                    showsPassword = showsPassword,
+                    onToggle = { showsPassword = !showsPassword },
+                    isError = vm.authField == "password",
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = vm.keepSession, onCheckedChange = { vm.updateKeepSession(it) })
+                    Text("Keep me signed in", style = MaterialTheme.typography.bodySmall)
+                }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = { vm.doLogin(identifier, password) },
+                    enabled = identifier.isNotBlank() && password.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Sign in") }
+                // The create-account path is only offered when the server can
+                // take the email it needs (spec "Client offers only what the
+                // server supports").
+                if (vm.serverSupports("email_verification")) {
+                    TextButton(onClick = { mode = AuthScreenMode.Register }) { Text("Create an account") }
+                }
+                if (vm.serverSupports("password_reset")) {
+                    TextButton(onClick = { mode = AuthScreenMode.ForgotPassword }) {
+                        Text("Forgot your password?")
+                    }
+                }
+            }
+            AuthScreenMode.Register -> {
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text("Username") },
+                    singleLine = true,
+                    isError = vm.authField == "username",
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = email,
+                    onValueChange = { email = it },
+                    label = { Text("Email") },
+                    singleLine = true,
+                    isError = vm.authField == "email",
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                PasswordField(
+                    password = password,
+                    onPasswordChange = { password = it },
+                    showsPassword = showsPassword,
+                    onToggle = { showsPassword = !showsPassword },
+                    isError = vm.authField == "password",
+                )
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = { vm.doRegister(username, email, password) },
+                    enabled = username.isNotBlank() && email.isNotBlank() && password.isNotEmpty(),
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Create account") }
+                TextButton(onClick = { mode = AuthScreenMode.SignIn }) { Text("I already have an account") }
+            }
+            AuthScreenMode.ForgotPassword -> {
+                Text(
+                    "Enter the email address of your account and we will send you a link to choose a new password.",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                OutlinedTextField(
+                    value = email,
+                    onValueChange = { email = it },
+                    label = { Text("Email") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = {
+                        vm.doForgotPassword(email)
+                        confirmation = "If that address has an account, a reset link is on its way."
+                    },
+                    enabled = email.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Send the link") }
+                TextButton(onClick = { mode = AuthScreenMode.ResetPassword }) { Text("I have a reset code") }
+                TextButton(onClick = { mode = AuthScreenMode.SignIn }) { Text("Back to sign in") }
+            }
+            AuthScreenMode.ResetPassword -> {
+                Text(
+                    "Paste the code from your reset email, then choose a new password.",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                OutlinedTextField(
+                    value = resetToken,
+                    onValueChange = { resetToken = it },
+                    label = { Text("Reset code") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                PasswordField(
+                    password = password,
+                    onPasswordChange = { password = it },
+                    showsPassword = showsPassword,
+                    onToggle = { showsPassword = !showsPassword },
+                    isError = vm.authField == "password",
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = passwordConfirmation,
+                    onValueChange = { passwordConfirmation = it },
+                    label = { Text("Repeat the new password") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = { vm.doResetPassword(resetToken, password) },
+                    enabled = resetToken.isNotBlank() &&
+                        password.isNotEmpty() &&
+                        password == passwordConfirmation,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Set the new password") }
+                TextButton(onClick = { mode = AuthScreenMode.SignIn }) { Text("Back to sign in") }
+            }
         }
+
+        confirmation?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(it, style = MaterialTheme.typography.bodySmall)
+        }
+
         Spacer(Modifier.height(8.dp))
         OutlinedButton(
             onClick = { onGuest() },
@@ -961,6 +1156,95 @@ fun LoginScreen(
             onLoginSuccess()
         }
     }
+    // A refused sign-in keeps what was typed but not the password: the
+    // player corrects the field and tries again (spec "Client presents
+    // authentication errors inline").
+    LaunchedEffect(vm.authError) {
+        if (vm.authError != null) {
+            password = ""
+        }
+    }
+}
+
+/** The screen an emailed reset link opens (spec "Client offers password
+ * reset"). */
+@Composable
+private fun ResetPasswordDialog(vm: GameViewModel, token: String) {
+    var password by remember { mutableStateOf("") }
+    var confirmation by remember { mutableStateOf("") }
+    var dismissed by remember { mutableStateOf(false) }
+    if (dismissed) return
+
+    AlertDialog(
+        onDismissRequest = { dismissed = true },
+        title = { Text("Choose a new password") },
+        text = {
+            Column {
+                PasswordField(
+                    password = password,
+                    onPasswordChange = { password = it },
+                    showsPassword = false,
+                    onToggle = { },
+                    isError = vm.authField == "password",
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = confirmation,
+                    onValueChange = { confirmation = it },
+                    label = { Text("Repeat the new password") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                vm.authError?.let { error ->
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { vm.doResetPassword(token, password) },
+                enabled = password.isNotEmpty() && password == confirmation,
+            ) { Text("Set the new password") }
+        },
+        dismissButton = {
+            TextButton(onClick = { dismissed = true }) { Text("Close") }
+        },
+    )
+}
+
+/** The password field, with a button that shows what was typed. */
+@Composable
+private fun PasswordField(
+    password: String,
+    onPasswordChange: (String) -> Unit,
+    showsPassword: Boolean,
+    onToggle: () -> Unit,
+    isError: Boolean,
+) {
+    OutlinedTextField(
+        value = password,
+        onValueChange = onPasswordChange,
+        label = { Text("Password") },
+        singleLine = true,
+        isError = isError,
+        visualTransformation = if (showsPassword) {
+            VisualTransformation.None
+        } else {
+            PasswordVisualTransformation()
+        },
+        trailingIcon = {
+            TextButton(onClick = onToggle) {
+                Text(if (showsPassword) "Hide" else "Show")
+            }
+        },
+        modifier = Modifier.fillMaxWidth()
+    )
 }
 
 @Composable
@@ -991,6 +1275,20 @@ fun HomeScreen(
         )
         if (vm.authToken != null) {
             Text("Signed in", style = MaterialTheme.typography.titleMedium)
+            // The account's name and its verification state, and never the
+            // token itself (spec "Client never displays the session token").
+            vm.authAccountName?.let {
+                Text(it, style = MaterialTheme.typography.bodyMedium)
+            }
+            if (!vm.authEmailVerified) {
+                Text(
+                    "This email address is not confirmed yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextButton(onClick = { vm.doResendVerification() }) {
+                    Text("Send the confirmation again")
+                }
+            }
             vm.userName?.let {
                 Text("Display name: $it", style = MaterialTheme.typography.bodyMedium)
             }

@@ -54,6 +54,21 @@ class OnlineConnectionManager(
     /** Auth result (add-auth-ui-clients): `true` carries the token on
      * register/login success; `false` carries the error message. */
     var onAuthResult: ((Boolean, String?) -> Unit)? = null
+    /** The field a refused request named, so the form can mark the right
+     * input (spec "Authentication Error Codes"). */
+    var onAuthField: ((String?) -> Unit)? = null
+    /** Whether the server refused the request (as opposed to the
+     * connection going away). */
+    var onAuthRefused: ((Boolean) -> Unit)? = null
+    /** Whether a reply is expected: only then is an error an authentication
+     * failure, and not a dropped connection (spec "Client keeps the session
+     * across launches"). */
+    private var awaitingAuthResult = false
+    /** Whether the signed-in account's email address is confirmed (spec
+     * "Email Verification"). */
+    var emailVerified: Boolean = false
+    /** The signed-in account's name, as the server reports it. */
+    var accountName: String = ""
 
     @Volatile var phase: OnlinePhase = OnlinePhase.Idle
         private set
@@ -153,22 +168,66 @@ class OnlineConnectionManager(
     }
 
     /** Send a register request and wait for a "session" (token) or error. */
-    fun startRegister(username: String, password: String) {
-        send(OnlineCodec.encodeRegister(username, password, deviceID))
+    fun startRegister(username: String, email: String, password: String) {
+        awaitingAuthResult = true
+        send(OnlineCodec.encodeRegister(username, email, password, deviceID))
     }
 
-    /** Send a login request and wait for a "session" (token) or error. */
-    fun startLogin(username: String, password: String) {
-        send(OnlineCodec.encodeLogin(username, password, deviceID))
+    /** Send a login request and wait for a "session" (token) or error.
+     *
+     * The identifier is what the player typed: a username or an email
+     * address (spec "Login and Session Issuance"). */
+    fun startLogin(identifier: String, password: String) {
+        awaitingAuthResult = true
+        send(OnlineCodec.encodeLogin(identifier, password, deviceID))
+    }
+
+    /** Resume the session the client stored earlier (spec "Session
+     * Resumption"). The reply is "session_resumed", which carries no token. */
+    fun startResumeSession(token: String) {
+        awaitingAuthResult = true
+        send(OnlineCodec.encodeResumeSession(token))
+    }
+
+    /** Ask for a password-reset link (spec "Password Reset by Email"). */
+    fun startForgotPassword(email: String) {
+        awaitingAuthResult = true
+        send(OnlineCodec.encodeForgotPassword(email))
+    }
+
+    /** Set a new password with a reset token. */
+    fun startResetPassword(token: String, password: String) {
+        awaitingAuthResult = true
+        send(OnlineCodec.encodeResetPassword(token, password))
+    }
+
+    /** Confirm an email address with the token the player received. */
+    fun startVerifyEmail(token: String) {
+        awaitingAuthResult = true
+        send(OnlineCodec.encodeVerifyEmail(token))
+    }
+
+    /** Ask for another verification message. */
+    fun startResendVerification(token: String) {
+        awaitingAuthResult = true
+        send(OnlineCodec.encodeResendVerification(token))
+    }
+
+    /** Ask for a different email address (spec "Email Change"). */
+    fun startChangeEmail(token: String, email: String) {
+        awaitingAuthResult = true
+        send(OnlineCodec.encodeChangeEmail(token, email))
     }
 
     /** Send a logout request and wait for "session_ok". */
     fun startLogout(token: String) {
+        awaitingAuthResult = true
         send(OnlineCodec.encodeLogout(token))
     }
 
     /** Send a set_profile request and wait for "profile_updated". */
     fun startSetProfile(token: String, displayName: String) {
+        awaitingAuthResult = true
         send(OnlineCodec.encodeSetProfile(token, displayName))
     }
 
@@ -367,12 +426,42 @@ class OnlineConnectionManager(
                     // Transient in-game error: surface it, keep the session.
                     onError?.invoke(code, message.message)
                 }
-                // Also inform auth consumers for register/login failures
-                onAuthResult?.invoke(false, message.message)
+                // Also inform auth consumers for register/login failures.
+                // The field the refusal named travels with it, so the form
+                // can mark the right input (spec "Authentication Error
+                // Codes").
+                if (awaitingAuthResult) {
+                    awaitingAuthResult = false
+                    onAuthRefused?.invoke(true)
+                    onAuthField?.invoke(message.field)
+                    onAuthResult?.invoke(false, message.message)
+                }
             }
             is ServerMessage.Session -> {
                 // register/login success: invoke auth callback with token
+                emailVerified = message.emailVerified
+                accountName = message.displayName.ifEmpty { message.username }
                 onAuthResult?.invoke(true, message.token)
+            }
+            is ServerMessage.SessionResumed -> {
+                // The stored session is still good: the account is reported
+                // and no new token is issued.
+                emailVerified = message.emailVerified
+                accountName = message.username
+                onAuthResult?.invoke(true, null)
+            }
+            is ServerMessage.PasswordResetRequested -> {
+                onAuthResult?.invoke(true, null)
+            }
+            is ServerMessage.PasswordReset -> {
+                onAuthResult?.invoke(true, null)
+            }
+            is ServerMessage.EmailVerificationRequested -> {
+                onAuthResult?.invoke(true, null)
+            }
+            is ServerMessage.EmailVerified -> {
+                emailVerified = message.emailVerified
+                onAuthResult?.invoke(true, null)
             }
             is ServerMessage.ProfileUpdated -> {
                 // set_profile success
@@ -387,6 +476,9 @@ class OnlineConnectionManager(
 
     /** The socket went away (failure, close frame, or a malformed frame). */
     private fun handleSocketDrop() {
+        // The exchange is over: a later error is a game error, not an
+        // authentication failure.
+        awaitingAuthResult = false
         // Late events after teardown or a definitive failure: ignore.
         if (phase is OnlinePhase.Idle) return
         if (phase is OnlinePhase.Failed) return

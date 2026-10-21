@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::application::tournament_actor::TournamentHooks;
-use crate::domain::account::{Account, Identity, Profile, Session};
+use crate::domain::account::{
+    Account, Identity, Profile, ResetToken, Session, VerificationToken,
+};
 use crate::domain::game_record::FinishedGame;
 
 pub use crate::domain::rating::RatingState;
@@ -178,6 +180,9 @@ pub enum AuthError {
     DuplicateUsername,
     /// An account with this `account_id` already exists.
     DuplicateAccount,
+    /// The case-folded email address already belongs to an account (spec
+    /// "Email Identity").
+    DuplicateEmail,
 }
 
 impl std::fmt::Display for AuthError {
@@ -185,6 +190,7 @@ impl std::fmt::Display for AuthError {
         match self {
             AuthError::DuplicateUsername => write!(f, "that username is taken"),
             AuthError::DuplicateAccount => write!(f, "that account already exists"),
+            AuthError::DuplicateEmail => write!(f, "that email address is taken"),
         }
     }
 }
@@ -198,8 +204,11 @@ pub trait Accounts: Send + Sync {
     /// `Ana` and `ana` one account (design D3).
     fn account_by_username(&self, username: &str) -> Option<Account>;
     fn account_by_id(&self, account_id: &str) -> Option<Account>;
-    /// Insert a new account, refusing a username or `account_id` that is
-    /// already taken.
+    /// Look up by the *case-folded* email address, so a player can sign in
+    /// with the address they registered (spec "Email Identity").
+    fn account_by_email(&self, email: &str) -> Option<Account>;
+    /// Insert a new account, refusing a username, an `account_id`, or an
+    /// email address that is already taken.
     fn insert_account(&self, account: Account) -> Result<(), AuthError>;
     /// The account a device is currently bound to, if any.
     fn account_id_of_device(&self, device_id: &str) -> Option<String>;
@@ -209,6 +218,22 @@ pub trait Accounts: Send + Sync {
     fn link_device(&self, device_id: &str, account_id: &str);
     /// Set the account's display name (spec "Profile Display Name").
     fn set_display_name(&self, account_id: &str, display_name: &str);
+    /// Record that the account's email address has been confirmed (spec
+    /// "Email Verification").
+    fn set_email_verified(&self, account_id: &str, verified: bool);
+    /// Replace the account's password hash (spec "Password Reset by Email").
+    fn set_password_hash(&self, account_id: &str, password_hash: &str);
+    /// Start moving the account to a different address. The current address
+    /// stays in force until the new one is confirmed (spec "Email Change").
+    fn set_pending_email(
+        &self,
+        account_id: &str,
+        email: &str,
+        email_key: &str,
+    ) -> Result<(), AuthError>;
+    /// Confirm the pending address: it becomes the account's address and is
+    /// marked verified (spec "Email Change").
+    fn confirm_pending_email(&self, account_id: &str) -> Option<String>;
 }
 
 /// The result of resolving a presented session token (design D7).
@@ -253,6 +278,33 @@ pub trait ProfileStore: Send + Sync {
     fn create_profile(&self, profile: Profile);
 }
 
+/// The one-time tokens the email flows use (spec "Password Reset by Email",
+/// "Email Verification").
+///
+/// Only hashes are stored, both in memory and in the database: the token
+/// itself exists exactly once, in the message that carries it.
+pub trait AuthTokens: Send + Sync {
+    /// Store the token that confirms an account's address, replacing the
+    /// token that account had before. Asking again therefore retires the
+    /// previous token (spec "Email Verification").
+    fn insert_verification_token(&self, token: VerificationToken);
+    /// The token with this hash, when it can still be used.
+    fn verification_token_by_hash(&self, token_hash: &str, now_ms: i64) -> Option<VerificationToken>;
+    /// Take the token with this hash and mark it used, when it can still be
+    /// used. Returns `None` for an unknown, expired, or already used token.
+    fn consume_verification_token(&self, token_hash: &str, now_ms: i64) -> Option<VerificationToken>;
+    /// Store a password-reset token.
+    fn insert_reset_token(&self, token: ResetToken);
+    /// The reset token with this hash, when it can still be used.
+    fn reset_token_by_hash(&self, token_hash: &str, now_ms: i64) -> Option<ResetToken>;
+    /// Take the reset token with this hash and mark it used, when it can
+    /// still be used.
+    fn consume_reset_token(&self, token_hash: &str, now_ms: i64) -> Option<ResetToken>;
+    /// Drop every token that expired at or before `now_ms`, returning how
+    /// many went.
+    fn purge_expired_tokens(&self, now_ms: i64) -> usize;
+}
+
 /// Durable recording of authentication state (spec "Credential and Session
 /// Data Protection", design D4): every method is one idempotent write, and a
 /// failure is logged by the caller and never blocks play.
@@ -285,13 +337,116 @@ pub trait AuthRecorder: Send + Sync {
         token_hash: &'a str,
         revoked_at_ms: i64,
     ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Persist whether the account's address has been confirmed (spec "Email
+    /// Verification").
+    fn record_email_verified<'a>(
+        &'a self,
+        account_id: &'a str,
+        verified: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Persist the token that confirms an address, replacing the one the
+    /// account had before.
+    fn record_verification_token<'a>(
+        &'a self,
+        token: &'a VerificationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Persist a password-reset token.
+    fn record_reset_token<'a>(
+        &'a self,
+        token: &'a ResetToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Mark a token as used, so it cannot be used again.
+    fn record_token_used<'a>(
+        &'a self,
+        token_hash: &'a str,
+        used_at_ms: i64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Persist the account's new password hash (spec "Password Reset by
+    /// Email").
+    fn record_password_changed<'a>(
+        &'a self,
+        account_id: &'a str,
+        password_hash: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Persist the address the account is moving to, while the current one
+    /// stays in force (spec "Email Change").
+    fn record_pending_email<'a>(
+        &'a self,
+        account_id: &'a str,
+        email: &'a str,
+        email_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+
+    /// Persist the confirmed address, which replaces the pending one (spec
+    /// "Email Change").
+    fn record_pending_email_confirmed<'a>(
+        &'a self,
+        account_id: &'a str,
+        email: &'a str,
+        email_key: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RecorderError>> + Send + 'a>>;
+}
+
+/// A transactional email to deliver (spec "Pluggable Email Delivery").
+///
+/// Pure data: the port does not know how a message is rendered, where it
+/// goes, or what a provider's API looks like. That is the transport's job,
+/// which is what lets the account, verification, and reset logic stay
+/// identical whether the message is written to a log or sent for real.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailMessage {
+    /// The recipient's address.
+    pub to: String,
+    /// The subject line.
+    pub subject: String,
+    /// The plain-text body.
+    pub text_body: String,
+    /// The HTML body.
+    pub html_body: String,
+}
+
+/// Why an email could not be delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmailError {
+    /// The transport is selected but has no usable credential, so nothing was
+    /// sent (spec "Pluggable Email Delivery").
+    NotConfigured,
+    /// The provider refused the message or could not be reached.
+    Transport(String),
+}
+
+impl std::fmt::Display for EmailError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmailError::NotConfigured => write!(f, "the email transport is not configured"),
+            EmailError::Transport(reason) => write!(f, "the email transport failed: {reason}"),
+        }
+    }
+}
+
+/// Delivery of transactional email (spec "Pluggable Email Delivery").
+///
+/// Object-safe, like the other ports, so a transport can be held behind an
+/// `Arc<dyn EmailSender>` and the flow that sends a message never learns
+/// which transport it is talking to.
+pub trait EmailSender: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        message: &'a EmailMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EmailError>> + Send + 'a>>;
 }
 
 /// The single authentication port `RoomServices` carries (design D4): one
 /// field instead of three, so the construction fan-out is edited once.
-pub trait PlayerAuth: Accounts + Sessions + ProfileStore {}
+pub trait PlayerAuth: Accounts + Sessions + ProfileStore + AuthTokens {}
 
-impl<T: Accounts + Sessions + ProfileStore> PlayerAuth for T {}
+impl<T: Accounts + Sessions + ProfileStore + AuthTokens> PlayerAuth for T {}
 
 /// The room actor's view of the three authentication ports.
 pub type SharedAuth = Arc<dyn PlayerAuth>;

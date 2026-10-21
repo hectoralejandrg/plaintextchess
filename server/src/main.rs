@@ -5,6 +5,7 @@
 //! SIGTERM (spec: "Server Health and Configuration").
 
 use std::future::{Future, IntoFuture};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use chess_server::domain::time_control::TimeControl;
@@ -77,11 +78,14 @@ async fn main() {
     );
 
     let router = axum::Router::new()
-        .route("/healthz", axum::routing::get(ws::healthz))
+        .route("/healthz", axum::routing::get(ws::healthz_with_features))
         .route("/ws", axum::routing::get(ws::ws_upgrade))
         .with_state(app);
 
-    let server = axum::serve(listener, router).into_future();
+    // The peer address is what the rate limit keys on, so the server is
+    // served with connect info (spec "Authentication Rate Limiting").
+    let server = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
+        .into_future();
     shutdown_on_signal(server).await;
     tracing::info!("chess-server stopped");
 }

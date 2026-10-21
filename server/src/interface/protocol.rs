@@ -86,6 +86,9 @@ pub enum ErrorCode {
     /// The username is taken, compared case-insensitively (spec "Player
     /// Account Registration").
     UsernameTaken,
+    /// The email address is taken, compared case-insensitively (spec "Email
+    /// Identity").
+    EmailTaken,
     /// The username does not exist or the password is wrong. One code and one
     /// message for both, so a caller cannot learn which usernames are
     /// registered (spec "Login and Session Issuance").
@@ -99,7 +102,9 @@ pub enum ErrorCode {
     /// (spec "Session Lifetime, Reuse, and Revocation").
     SessionExpired,
     /// A field failed its format check. The message names the offending field
-    /// (spec "Player Account Registration", "Profile Display Name").
+    /// (spec "Player Account Registration", "Profile Display Name"), and the
+    /// error carries the field's name in a machine-readable field (spec
+    /// "Authentication Error Codes").
     InvalidRequest,
     /// The display name is outside 1 to 32 trimmed characters or contains a
     /// control character (spec "Profile Display Name").
@@ -110,6 +115,21 @@ pub enum ErrorCode {
     AlreadyInTournament,
     /// The tournament exists but its window hasn't started or has ended.
     TournamentNotRunning,
+    /// The attempt was refused because too many were made (spec
+    /// "Authentication Rate Limiting"). The message says when the player may
+    /// try again.
+    TooManyAttempts,
+    /// The password-reset token is unknown, expired, or already used (spec
+    /// "Password Reset by Email").
+    InvalidResetToken,
+    /// The confirmation token is unknown, expired, already used, or belongs
+    /// to another address (spec "Email Verification").
+    InvalidVerificationToken,
+    /// The account's email address is not confirmed (spec "Email
+    /// Verification").
+    EmailNotVerified,
+    /// The message could not be delivered (spec "Pluggable Email Delivery").
+    EmailUnavailable,
 }
 
 impl ErrorCode {
@@ -125,6 +145,7 @@ impl ErrorCode {
             ErrorCode::NotConnected => "not_connected",
             ErrorCode::Forfeit => "forfeit",
             ErrorCode::UsernameTaken => "username_taken",
+            ErrorCode::EmailTaken => "email_taken",
             ErrorCode::InvalidCredentials => "invalid_credentials",
             ErrorCode::NotAuthenticated => "not_authenticated",
             ErrorCode::SessionExpired => "session_expired",
@@ -133,6 +154,11 @@ impl ErrorCode {
             ErrorCode::TournamentNotFound => "tournament_not_found",
             ErrorCode::AlreadyInTournament => "already_in_tournament",
             ErrorCode::TournamentNotRunning => "tournament_not_running",
+            ErrorCode::TooManyAttempts => "too_many_attempts",
+            ErrorCode::InvalidResetToken => "invalid_reset_token",
+            ErrorCode::InvalidVerificationToken => "invalid_verification_token",
+            ErrorCode::EmailNotVerified => "email_not_verified",
+            ErrorCode::EmailUnavailable => "email_unavailable",
         }
     }
 
@@ -154,6 +180,7 @@ impl ErrorCode {
             ErrorCode::NotConnected => "The game has not started yet",
             ErrorCode::Forfeit => "The opponent did not reconnect in time",
             ErrorCode::UsernameTaken => "That username is already registered",
+            ErrorCode::EmailTaken => "That email address is already registered",
             ErrorCode::InvalidCredentials => Self::GENERIC_CREDENTIAL_MESSAGE,
             ErrorCode::NotAuthenticated => "This connection is not signed in",
             ErrorCode::SessionExpired => "This session has expired; log in again",
@@ -164,6 +191,11 @@ impl ErrorCode {
             ErrorCode::TournamentNotFound => "No tournament has that id",
             ErrorCode::AlreadyInTournament => "This player is already in a tournament",
             ErrorCode::TournamentNotRunning => "This tournament is not currently running",
+            ErrorCode::TooManyAttempts => "Too many attempts; try again later",
+            ErrorCode::InvalidResetToken => "That reset link is no longer valid",
+            ErrorCode::InvalidVerificationToken => "That confirmation link is no longer valid",
+            ErrorCode::EmailNotVerified => "This email address is not confirmed yet",
+            ErrorCode::EmailUnavailable => "The message could not be sent; try again later",
         }
     }
 
@@ -175,6 +207,19 @@ impl ErrorCode {
             v: VERSION,
             code: self.as_str().to_string(),
             message: message.into(),
+            field: None,
+        }
+    }
+
+    /// An error with a custom message *and* the name of the field that was
+    /// refused, so a client can mark the right input without reading the
+    /// message text (spec "Authentication Error Codes").
+    pub fn with_field(self, field: &str, message: impl Into<String>) -> ServerMessage {
+        ServerMessage::Error {
+            v: VERSION,
+            code: self.as_str().to_string(),
+            message: message.into(),
+            field: Some(field.to_string()),
         }
     }
 }
@@ -220,6 +265,12 @@ pub enum ClientMessage {
     Register {
         v: u32,
         username: String,
+        /// The account's private identity (spec "Email Identity"). Optional
+        /// on the wire so a client built before the email existed is
+        /// answered with a validation error naming the field, rather than
+        /// having its connection closed for a malformed frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
         password: String,
         /// The device to bind to the new account (spec "Device-to-Account
         /// Profile Linkage"). Optional: absent, the device is bound by the
@@ -229,11 +280,19 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
     },
-    /// Exchange a username and password for a session (spec "Login and
-    /// Session Issuance").
+    /// Exchange an identifier and a password for a session (spec "Login and
+    /// Session Issuance"). The identifier is the account's username or its
+    /// email address.
     Login {
         v: u32,
-        username: String,
+        /// The legacy field: the account's username. Kept so a client built
+        /// before the identifier existed still signs in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        /// What the player typed: a username or an email address. The
+        /// server resolves it against both.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identifier: Option<String>,
         password: String,
         /// The device to bind to the account, with the same meaning and the
         /// same fallback as on `Register`.
@@ -253,6 +312,48 @@ pub enum ClientMessage {
         /// The session being used; a display-name change is
         /// authenticated-only.
         token: String,
+    },
+    /// Resume a session the client stored earlier (spec "Session
+    /// Resumption").
+    ResumeSession {
+        v: u32,
+        /// The stored session token.
+        token: String,
+    },
+    /// Ask for a password-reset link (spec "Password Reset by Email").
+    ForgotPassword {
+        v: u32,
+        /// The address the player typed.
+        email: String,
+    },
+    /// Set a new password with a reset token (spec "Password Reset by
+    /// Email").
+    ResetPassword {
+        v: u32,
+        /// The reset token the player received.
+        token: String,
+        /// The new password.
+        password: String,
+    },
+    /// Confirm an email address with the token the player received (spec
+    /// "Email Verification").
+    VerifyEmail {
+        v: u32,
+        token: String,
+    },
+    /// Ask for another verification message (spec "Email Verification").
+    ResendVerification {
+        v: u32,
+        /// The session of the account whose address is unconfirmed.
+        token: String,
+    },
+    /// Ask for a different email address (spec "Email Change").
+    ChangeEmail {
+        v: u32,
+        /// The session of the account whose address is changing.
+        token: String,
+        /// The new address.
+        email: String,
     },
     /// Join an Arena tournament's waiting pool (add-tournaments phase 1): the
     /// server pairs this connection with another waiting player and delivers
@@ -290,6 +391,12 @@ impl ClientMessage {
             | ClientMessage::Login { v, .. }
             | ClientMessage::Logout { v, .. }
             | ClientMessage::SetProfile { v, .. }
+            | ClientMessage::ResumeSession { v, .. }
+            | ClientMessage::ForgotPassword { v, .. }
+            | ClientMessage::ResetPassword { v, .. }
+            | ClientMessage::VerifyEmail { v, .. }
+            | ClientMessage::ResendVerification { v, .. }
+            | ClientMessage::ChangeEmail { v, .. }
             | ClientMessage::JoinTournament { v, .. }
             | ClientMessage::LeaveTournament { v, .. }
             | ClientMessage::ListTournaments { v, .. } => *v,
@@ -333,6 +440,11 @@ pub enum ServerMessage {
         v: u32,
         code: String,
         message: String,
+        /// The field that was refused, when the refusal was about one field
+        /// (spec "Authentication Error Codes"). `None` for a refusal that is
+        /// not about a field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
     },
     /// A newly issued session (spec "Login and Session Issuance"). Carries
     /// the token exactly once: the server stores only its hash, so this
@@ -345,6 +457,9 @@ pub enum ServerMessage {
         display_name: String,
         token: String,
         expires_at_ms: i64,
+        /// Whether the account's email address is confirmed (spec "Email
+        /// Verification").
+        email_verified: bool,
     },
     /// A session that ended without a replacement (spec "Session Lifetime,
     /// Reuse, and Revocation"). Carries no token so a client cannot mistake
@@ -355,6 +470,43 @@ pub enum ServerMessage {
         username: String,
         display_name: String,
         expires_at_ms: i64,
+    },
+    /// The acknowledgement of a password-reset request. The answer is the
+    /// same whether or not the address belongs to an account, so it reveals
+    /// nothing (spec "Password Reset by Email").
+    PasswordResetRequested {
+        v: u32,
+    },
+    /// The password was changed. It carries no session: a reset does not
+    /// sign the player in (spec "Password Reset by Email").
+    PasswordReset {
+        v: u32,
+        account_id: String,
+    },
+    /// The acknowledgement of a verification request (spec "Email
+    /// Verification").
+    EmailVerificationRequested {
+        v: u32,
+    },
+    /// The account's email address is confirmed (spec "Email Verification").
+    EmailVerified {
+        v: u32,
+        account_id: String,
+        email_verified: bool,
+    },
+    /// The session a stored token resumed (spec "Session Resumption").
+    ///
+    /// It carries no token: resuming issues nothing new and extends
+    /// nothing.
+    SessionResumed {
+        v: u32,
+        account_id: String,
+        username: String,
+        /// The account's display name, defaulting to the username.
+        display_name: String,
+        expires_at_ms: i64,
+        /// Whether the account's email address is confirmed.
+        email_verified: bool,
     },
     /// The account's new display name (spec "Profile Display Name").
     ProfileUpdated {
@@ -423,6 +575,7 @@ impl ServerMessage {
             v: VERSION,
             code: code.as_str().to_string(),
             message: code.message().to_string(),
+            field: None,
         }
     }
 }
@@ -439,6 +592,8 @@ pub enum DecodeError {
 const KNOWN_TYPES: &[&str] = &[
     "create_room", "join_room", "move", "resign", "leave",
     "register", "login", "logout", "set_profile",
+    "resume_session", "forgot_password", "reset_password",
+    "verify_email", "resend_verification", "change_email",
     "join_tournament", "leave_tournament", "list_tournaments",
 ];
 
@@ -512,18 +667,28 @@ mod tests {
             ClientMessage::Register {
                 v: VERSION,
                 username: "Ana".into(),
+                email: Some("ana@example.com".into()),
                 password: "correct horse battery".into(),
                 device_id: Some("device-a".into()),
             },
             ClientMessage::Register {
                 v: VERSION,
                 username: "Bob".into(),
+                email: None,
                 password: "correct horse battery".into(),
                 device_id: None,
             },
             ClientMessage::Login {
                 v: VERSION,
-                username: "Ana".into(),
+                username: Some("Ana".into()),
+                identifier: None,
+                password: "correct horse battery".into(),
+                device_id: None,
+            },
+            ClientMessage::Login {
+                v: VERSION,
+                username: None,
+                identifier: Some("ana@example.com".into()),
                 password: "correct horse battery".into(),
                 device_id: None,
             },
@@ -535,6 +700,32 @@ mod tests {
                 v: VERSION,
                 display_name: "Ana T.".into(),
                 token: "a-token".into(),
+            },
+            ClientMessage::ResumeSession {
+                v: VERSION,
+                token: "a-token".into(),
+            },
+            ClientMessage::ForgotPassword {
+                v: VERSION,
+                email: "ana@example.com".into(),
+            },
+            ClientMessage::ResetPassword {
+                v: VERSION,
+                token: "a-token".into(),
+                password: "a new password".into(),
+            },
+            ClientMessage::VerifyEmail {
+                v: VERSION,
+                token: "a-token".into(),
+            },
+            ClientMessage::ResendVerification {
+                v: VERSION,
+                token: "a-token".into(),
+            },
+            ClientMessage::ChangeEmail {
+                v: VERSION,
+                token: "a-token".into(),
+                email: "new@example.com".into(),
             },
         ] {
             let json = serde_json::to_string(&message).unwrap();
@@ -600,6 +791,26 @@ mod tests {
                 display_name: "Ana".into(),
                 token: "a-token".into(),
                 expires_at_ms: 1_700_000_000_000,
+                email_verified: false,
+            },
+            ServerMessage::SessionResumed {
+                v: VERSION,
+                account_id: "account-1".into(),
+                username: "Ana".into(),
+                display_name: "Ana".into(),
+                expires_at_ms: 1_700_000_000_000,
+                email_verified: true,
+            },
+            ServerMessage::PasswordResetRequested { v: VERSION },
+            ServerMessage::PasswordReset {
+                v: VERSION,
+                account_id: "account-1".into(),
+            },
+            ServerMessage::EmailVerificationRequested { v: VERSION },
+            ServerMessage::EmailVerified {
+                v: VERSION,
+                account_id: "account-1".into(),
+                email_verified: true,
             },
             ServerMessage::SessionOk {
                 v: VERSION,
@@ -653,6 +864,7 @@ mod tests {
             Ok(ClientMessage::Register {
                 v: VERSION,
                 username: "Ana".into(),
+                email: None,
                 password: "passw0rd".into(),
                 device_id: None,
             })
@@ -663,7 +875,8 @@ mod tests {
             ),
             Ok(ClientMessage::Login {
                 v: VERSION,
-                username: "Ana".into(),
+                username: Some("Ana".into()),
+                identifier: None,
                 password: "passw0rd".into(),
                 device_id: Some("d1".into()),
             })
@@ -831,12 +1044,14 @@ mod tests {
             serde_json::to_value(&ClientMessage::Register {
                 v: VERSION,
                 username: "Ana".into(),
+                email: Some("ana@example.com".into()),
                 password: "correct horse battery".into(),
                 device_id: Some("device-a".into()),
             })
             .unwrap();
         assert_eq!(value["type"], "register");
         assert_eq!(value["username"], "Ana");
+        assert_eq!(value["email"], "ana@example.com");
         assert_eq!(value["password"], "correct horse battery");
         assert_eq!(value["device_id"], "device-a");
 
@@ -844,6 +1059,7 @@ mod tests {
             serde_json::to_value(&ClientMessage::Register {
                 v: VERSION,
                 username: "Ana".into(),
+                email: None,
                 password: "correct horse battery".into(),
                 device_id: None,
             })
@@ -852,11 +1068,19 @@ mod tests {
             value.get("device_id").is_none(),
             "the device is optional: a client that has not chosen one omits it"
         );
+        assert!(
+            value.get("email").is_none(),
+            "the email is optional on the wire, so a client built before it existed is answered with a validation error instead of a closed connection"
+        );
 
+        // The sign-in message carries the identifier the player typed. The
+        // legacy `username` field stays on the wire, so a client built
+        // before the identifier existed still signs in.
         let value: serde_json::Value =
             serde_json::to_value(&ClientMessage::Login {
                 v: VERSION,
-                username: "Ana".into(),
+                username: Some("Ana".into()),
+                identifier: None,
                 password: "correct horse battery".into(),
                 device_id: Some("device-a".into()),
             })
@@ -864,6 +1088,68 @@ mod tests {
         assert_eq!(value["type"], "login");
         assert_eq!(value["username"], "Ana");
         assert_eq!(value["device_id"], "device-a");
+
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::Login {
+                v: VERSION,
+                username: None,
+                identifier: Some("ana@example.com".into()),
+                password: "correct horse battery".into(),
+                device_id: None,
+            })
+            .unwrap();
+        assert_eq!(value["identifier"], "ana@example.com");
+        assert!(
+            value.get("username").is_none(),
+            "a client that sends the identifier omits the legacy field"
+        );
+
+        // The email flows are ordinary client messages: `type` tag + `v` +
+        // fields, inline.
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::ResumeSession {
+                v: VERSION,
+                token: "a-token".into(),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "resume_session");
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::ForgotPassword {
+                v: VERSION,
+                email: "ana@example.com".into(),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "forgot_password");
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::ResetPassword {
+                v: VERSION,
+                token: "a-token".into(),
+                password: "a new password".into(),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "reset_password");
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::VerifyEmail {
+                v: VERSION,
+                token: "a-token".into(),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "verify_email");
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::ResendVerification {
+                v: VERSION,
+                token: "a-token".into(),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "resend_verification");
+        let value: serde_json::Value =
+            serde_json::to_value(&ClientMessage::ChangeEmail {
+                v: VERSION,
+                token: "a-token".into(),
+                email: "new@example.com".into(),
+            })
+            .unwrap();
+        assert_eq!(value["type"], "change_email");
 
         let value: serde_json::Value = serde_json::to_value(&ClientMessage::Logout {
             v: VERSION,
@@ -1031,6 +1317,7 @@ mod tests {
             display_name: "Ana".into(),
             token: "a-token".into(),
             expires_at_ms: 1_700_000_000_000i64,
+            email_verified: false,
         })
         .unwrap();
         assert_eq!(value["type"], "session");
