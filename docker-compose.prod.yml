@@ -1,0 +1,106 @@
+# Production deployment for a single basic server (change deploy-server-docker).
+#
+# Topology (design D1): ONE authoritative server process (TIER=all monolith)
+# plus ONE TLS-terminating reverse proxy (Caddy, automatic ACME). There is no
+# Redis service on purpose: on one box the split tier only adds a per-move
+# network hop and competes for CPU/RAM. The local/CI multi-node lab stays in
+# docker-compose.yml and is not used here.
+#
+# Distinct project name so this stack never shares containers/volumes with the
+# local `docker compose up` (docker-compose.yml) stack: both live in the same
+# directory, so the default project name would otherwise collide.
+name: plaintextchess-prod
+
+# Start:  docker compose -f docker-compose.prod.yml up -d --build
+# Stop:   docker compose -f docker-compose.prod.yml down
+# Logs:   docker compose -f docker-compose.prod.yml logs -f
+# Env:    copy .env.example to .env and edit (see docs/deploy-docker.md).
+
+services:
+  # Authoritative game server (monolith). Binds its listener only after
+  # migrations + ratings/auth load, so a TCP/HTTP success means "ready".
+  ws-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      TIER: all
+      BIND: ${BIND:-0.0.0.0}
+      PORT: ${PORT:-3000}
+      DATABASE_URL: ${DATABASE_URL:-sqlite:/data/app.db}
+      RECONNECT_GRACE_SECS: ${RECONNECT_GRACE_SECS:-30}
+      SESSION_TTL_SECS: ${SESSION_TTL_SECS:-2592000}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Persistent state (design D5): ratings, games, accounts, sessions.
+      - server-data:/data
+    # Restart behavior and a stop grace period long enough for a clean
+    # shutdown of in-flight requests (spec "Operational Lifecycle").
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # Health probe on the real readiness endpoint. The multi-failure tolerance
+    # (retries) is deliberate: a setup burst can starve /healthz transiently
+    # (see design D3 and docs/support/qa-performance-findings.md), and a
+    # single missed probe must not mark the container unhealthy.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    # Resource envelope (design D7). The values are ceilings, not
+    # reservations, and they are environment-driven so the same file fits a
+    # 1 GB box and a 8 GB box: see "Sizing for the box" in
+    # docs/deploy-docker.md. Defaults match the 4 GB+ row of that table.
+    # Tune on the real host after the creation-burst smoke.
+    mem_limit: ${SERVER_MEM_LIMIT:-1g}
+    ulimits:
+      nofile:
+        soft: ${NOFILE:-65536}
+        hard: ${NOFILE:-65536}
+    expose:
+      - "3000"
+
+  # TLS terminator and reverse proxy. Caddy obtains and renews certificates
+  # automatically (design D2). Its /data volume holds ACME state so
+  # certificates survive container replacement (design D2, spec "Persistent
+  # State Survives Restarts").
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      - ws-server
+    environment:
+      # Site address. Use a real public domain for ACME, or `localhost` for
+      # the no-domain path (Caddy issues a locally-trusted internal cert).
+      # NEVER put a real-but-unowned placeholder domain here: ACME issuance
+      # would fail at boot and risk rate limits (design D2 "No-domain mode").
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      # The HTTP-only test path (`http://:8080` site in config/Caddyfile) is
+      # NOT published by default: publishing it would expose a plaintext
+      # surface, which the "TLS-Only Public Surface" requirement forbids. The
+      # in-container listener stays up; to use it before a domain exists,
+      # uncomment this line (it is a test path, not a production one):
+      # - "8080:8080"
+    volumes:
+      - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+    # Memory cap (design D7). Caddy's RSS scales with concurrent sockets (a
+    # burst measured ~1.7 GiB at 14k simultaneous connections, i.e. ~120 KB
+    # per connection) and it has no default limit. On a basic box an unbounded
+    # proxy can starve the game server; capping it means a memory spike costs
+    # the proxy, not the server. The proxy is the first thing to hit the RAM
+    # wall, so it usually gets the smaller share of the box.
+    mem_limit: ${CADDY_MEM_LIMIT:-1g}
+
+volumes:
+  # SQLite database lives here (design D5). Survives `down` (without -v).
+  server-data:
+  # Caddy ACME account + certificates (design D2).
+  caddy-data:
+  # Caddy autosave/config state (Caddy uses /config).
+  caddy-config:

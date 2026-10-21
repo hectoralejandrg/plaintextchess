@@ -6,7 +6,7 @@
 
 REDIS_URL ?= redis://127.0.0.1:6379
 
-.PHONY: redis-up redis-down test-split multi-node-up multi-node-down multi-node-smoke
+.PHONY: redis-up redis-down test-split multi-node-up multi-node-down multi-node-smoke deploy-up deploy-down deploy-logs deploy-ps deploy-check
 
 redis-up:
 	docker compose up -d redis
@@ -44,3 +44,33 @@ multi-node-smoke:
 	   echo "Round-robin check: same node twice ($$NODE1) — may be OK if only one node healthy yet"; \
 	 fi
 	@echo "Multi-node smoke test passed."
+
+# Production deployment targets (change deploy-server-docker): the single-box
+# monolith + Caddy stack in docker-compose.prod.yml. This is a separate
+# deployment surface from the local multi-node lab above; it uses its own
+# project name and volumes, so the two never collide.
+PROD_COMPOSE ?= docker-compose.prod.yml
+
+deploy-up:
+	docker compose -f $(PROD_COMPOSE) up -d --build
+
+deploy-down:
+	docker compose -f $(PROD_COMPOSE) down
+
+deploy-logs:
+	docker compose -f $(PROD_COMPOSE) logs -f
+
+deploy-ps:
+	docker compose -f $(PROD_COMPOSE) ps
+
+# Show what the box looks like and which limits the prod stack will apply.
+# Use it before the first deploy to pick the sizing row for this box
+# (docs/deploy-docker.md, "Sizing for the box").
+deploy-check:
+	@echo "== host =="
+	@echo "cpus: $$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null)"
+	@echo "ram:  $$(awk '/MemTotal/ {print $$2*1024}' /proc/meminfo 2>/dev/null || sysctl -n hw.memsize 2>/dev/null) bytes"
+	@echo "== effective limits (from .env + docker-compose.prod.yml) =="
+	@docker compose -f $(PROD_COMPOSE) config | grep -E 'mem_limit|soft:|hard:'
+	@echo "== running =="
+	@docker compose -f $(PROD_COMPOSE) ps

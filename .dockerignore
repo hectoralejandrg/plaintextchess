@@ -1,0 +1,46 @@
+# Build context exclusions (change deploy-server-docker).
+#
+# The Dockerfile only needs core/ and server/. Everything else is either
+# generated, per-user, or large, and shipping it to the Docker daemon makes
+# every `docker compose build` slow: without this file the build context is
+# tens of GB (server/target alone is ~24 GB) and the transfer dominates the
+# build time even when the cargo steps are cached.
+
+# Rust build output. Both the workspace-root target/ and the per-crate ones;
+# server/target is the big one.
+target/
+**/target/
+
+# Generated FFI / mobile build artifacts
+uniffi/
+ios/Frameworks/
+android/app/src/main/jniLibs/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
+# Node.js
+node_modules/
+
+# Version control and editor state
+.git/
+.gitignore
+*.swp
+
+# Runtime and per-deployment configuration
+data/
+backups/
+.env
+.env.*
+
+# Local/CI compose and deployment docs are not needed inside the image
+docker-compose.yml
+docker-compose.prod.yml
+.env.example
+
+# Tests, docs, tooling
+docs/
+openspec/
+scripts/
+*.md

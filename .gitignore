@@ -56,3 +56,11 @@ ios/build/
 # Local runtime data (server SQLite lives under ./data by default)
 # ---------------------------------------------------------------------------
 data/
+
+# Per-deployment configuration and secrets (change deploy-server-docker):
+# copy .env.example to .env; never commit the real values.
+.env
+
+# Database backups written by the runbook's backup step
+# (docs/deploy-docker.md section 6).
+backups/

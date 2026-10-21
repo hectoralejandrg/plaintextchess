@@ -1,0 +1,69 @@
+# Caddy configuration for the production single-server deployment
+# (change deploy-server-docker, design D2/D3).
+#
+# Caddy terminates TLS and reverse-proxies to the game server. It is the ONLY
+# production proxy config: config/nginx-lb.conf belongs to the local split-tier
+# stack (docker-compose.yml) and the two never meet in production.
+{
+	# Single box, no external management API.
+	admin off
+
+	# Optional: set an ACME contact email for certificate expiry notices.
+	# Caddy works without it, so it is left commented to avoid an empty value
+	# error. Uncomment and fill in for a public deployment:
+	# email you@example.com
+}
+
+# ---------------------------------------------------------------------------
+# HTTPS site.
+#
+# Set DOMAIN to a real public domain and Caddy obtains/renews a certificate
+# automatically (ACME). Set DOMAIN=localhost for the no-domain path: Caddy
+# then issues a locally-trusted internal certificate, so TLS still works.
+#
+# NEVER set DOMAIN to a real-but-unowned placeholder (e.g. example.com): ACME
+# issuance would fail at boot and could hit Let's Encrypt rate limits
+# (design D2 "No-domain mode").
+# ---------------------------------------------------------------------------
+{$DOMAIN} {
+	# WebSocket endpoint. Caddy forwards the Upgrade/Connection headers
+	# automatically and imposes no response timeout, so long-lived or idle
+	# sockets are not cut. flush_interval -1 disables proxy buffering (the
+	# nginx `proxy_buffering off` analogue) so per-move frames are written
+	# through immediately.
+	reverse_proxy ws-server:3000 {
+		flush_interval -1
+
+		# Readiness-aware routing with a multi-failure tolerance (design D3).
+		# A setup burst can starve /healthz transiently
+		# (docs/support/qa-performance-findings.md), so the upstream must
+		# tolerate a missed probe instead of flapping: fail_duration + max_fails
+		# add passive tolerance on top of the active check.
+		health_uri /healthz
+		health_interval 10s
+		health_timeout 5s
+		fail_duration 30s
+		max_fails 3
+	}
+
+	# Plain HTTP requests to this host are redirected to HTTPS by Caddy's
+	# automatic HTTPS, so a plaintext ws:// upgrade is never served.
+}
+
+# ---------------------------------------------------------------------------
+# HTTP-only test path (design D2). Serves the same proxy without TLS, for the
+# pre-domain/no-domain case. It is only reachable if the host publishes the
+# port (docker-compose.prod.yml ships it commented out so production stays
+# TLS-only); publish `8080:8080` and reach it at http://<host>:8080.
+# NEVER publish this alongside a real public domain.
+# ---------------------------------------------------------------------------
+http://:8080 {
+	reverse_proxy ws-server:3000 {
+		flush_interval -1
+		health_uri /healthz
+		health_interval 10s
+		health_timeout 5s
+		fail_duration 30s
+		max_fails 3
+	}
+}

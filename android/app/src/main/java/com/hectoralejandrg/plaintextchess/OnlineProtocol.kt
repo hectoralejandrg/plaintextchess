@@ -19,10 +19,17 @@ const val ONLINE_PROTOCOL_VERSION = 1
 
 /** Online server configuration (add-online-multiplayer D9): the URL is a
  * build-time constant; DEBUG builds may override it with the `online_url`
- * intent extra. */
+ * intent extra (only passed in debuggable builds, see [MainActivity]). */
 object OnlineConfig {
-    /** Default online server URL. Empty in this change: online play is
-     * verified through the DEBUG override. */
+    /** Default online server URL for release builds.
+     *
+     * Empty means "no server configured": online play is unavailable but the
+     * rest of the app works (deploy-server-docker spec "Release Clients Reach
+     * the Deployment", degraded scenario). Point it at the deployment's TLS
+     * endpoint once a domain exists, for example `"wss://play.example.com/ws"`,
+     * and ship a release. It is intentionally empty until then, and the DEBUG
+     * `online_url` intent extra still wins in debuggable builds (resolved in
+     * [GameViewModel]: `debugOnlineURL ?: OnlineConfig.DEFAULT_URL`). */
     const val DEFAULT_URL: String = ""
 }
 

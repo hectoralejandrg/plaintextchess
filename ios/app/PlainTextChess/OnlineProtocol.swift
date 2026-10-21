@@ -8,8 +8,14 @@ let kOnlineProtocolVersion = 1
 /// build-time constant; DEBUG builds may override it with
 /// `-PLAINTCHESS_ONLINE_URL <url>`.
 enum OnlineConfig {
-    /// Default online server URL. Empty in this change: online play is
-    /// verified through the DEBUG override.
+    /// Default online server URL for release builds.
+    ///
+    /// Empty means "no server configured": online play is unavailable but the
+    /// rest of the app works (deploy-server-docker spec "Release Clients Reach
+    /// the Deployment", degraded scenario). Point it at the deployment's TLS
+    /// endpoint once a domain exists, for example `"wss://play.example.com/ws"`,
+    /// and ship a release. It is intentionally empty until then, and the DEBUG
+    /// launch-arg override still wins in DEBUG builds.
     static let defaultURL = ""
 }
 
